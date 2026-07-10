@@ -1,0 +1,7 @@
+target/
+test-data/
+*.class
+.idea/
+*.iml
+.vscode/
+TODO.md
