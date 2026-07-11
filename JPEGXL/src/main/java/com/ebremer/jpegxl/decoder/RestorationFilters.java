@@ -8,9 +8,13 @@ final class RestorationFilters {
     private RestorationFilters() {
     }
 
-    /** 3x3 gaborish convolution with normalized weights and edge clamping. */
-    static void gaborish(RestorationFilter rf, float[][] planes, int width, int height)
-            throws java.io.IOException {
+    /**
+     * 3x3 gaborish convolution with normalized weights and edge clamping.
+     * Only rows [yFrom, yTo) are produced; a region decode leaves the rest
+     * of the output zero (those rows are never emitted).
+     */
+    static void gaborish(RestorationFilter rf, float[][] planes, int width, int height,
+            int yFrom, int yTo) throws java.io.IOException {
         for (int c = 0; c < planes.length; c++) {
             float w1 = rf.gab1Weights[c];
             float w2 = rf.gab2Weights[c];
@@ -20,7 +24,8 @@ final class RestorationFilters {
             float diagW = w2 * mult;
             float[] in = planes[c];
             float[] out = new float[in.length];
-            JxlDecoder.parallelFor(height, y -> {
+            JxlDecoder.parallelFor(yTo - yFrom, yRel -> {
+                int y = yFrom + yRel;
                 int row = y * width;
                 int rowN = (y == 0 ? y : y - 1) * width;
                 int rowS = (y + 1 == height ? y : y + 1) * width;
@@ -48,10 +53,13 @@ final class RestorationFilters {
     /**
      * Edge-preserving filter. {@code inverseSigma} is per 8x8 block for VarDCT
      * frames, or null for modular frames (a constant sigma is used instead).
+     * Only rows [yFrom, yTo) are produced; with three iterations and a kernel
+     * reach of at most 3 rows, pixels further than 9 rows inside the band are
+     * identical to a full-frame run.
      */
     static void epf(RestorationFilter rf, float[][] planes, int width, int height,
-            float[] inverseSigmaPerBlock, int blockStride, float sigmaForModular)
-            throws java.io.IOException {
+            float[] inverseSigmaPerBlock, int blockStride, float sigmaForModular,
+            int yFrom, int yTo) throws java.io.IOException {
         float stepMultiplier = (float) (1.65 * 4 * (1 - Math.sqrt(0.5)));
         float invModularSigma = 1f / sigmaForModular;
         int colors = planes.length;
@@ -80,7 +88,8 @@ final class RestorationFilters {
             int iterF = iter;
             float[][] src = input;
             float[][] dst = output;
-            JxlDecoder.parallelFor(height, y -> {
+            JxlDecoder.parallelFor(yTo - yFrom, yRel -> {
+                int y = yFrom + yRel;
                 float[] sums = new float[colors];
                 for (int x = 0; x < width; x++) {
                     float invSigma = inverseSigmaPerBlock != null

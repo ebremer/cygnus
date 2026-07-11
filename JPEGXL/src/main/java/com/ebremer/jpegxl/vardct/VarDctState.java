@@ -752,6 +752,10 @@ public final class VarDctState {
                 int lfX = x >> 8;
                 int bX = x & 0xFF;
                 LfGroupData gg = lfGroups[lfY * fh.lfGroupColumns + lfX];
+                if (gg == null) { // LF group skipped by a region decode
+                    inverseSigma[y * bw + x] = 1f;
+                    continue;
+                }
                 int k = bY * gg.width8 + bX;
                 int sharpness = gg.sharpness[k];
                 float sigma = globalScaleF * rf.epfSharpLut[Math.min(Math.max(sharpness, 0), 7)]

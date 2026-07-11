@@ -153,17 +153,41 @@ public final class JXLImageReader extends ImageReader {
 
     @Override
     public BufferedImage read(int imageIndex, ImageReadParam param) throws IOException {
-        checkIndex(imageIndex);
-        JxlImage img = image();
+        java.awt.Rectangle wanted = param != null ? param.getSourceRegion() : null;
+        if (wanted != null) {
+            wanted = wanted.intersection(new java.awt.Rectangle(
+                    info().orientedWidth(), info().orientedHeight()));
+            if (wanted.isEmpty()) {
+                throw new IIOException("source region " + param.getSourceRegion()
+                        + " lies outside the image");
+            }
+        }
+        JxlImage img;
+        java.awt.Rectangle region; // remaining crop, relative to the frame
+        if (decoded == null && wanted != null
+                && (wanted.width < info().orientedWidth()
+                    || wanted.height < info().orientedHeight())) {
+            // group-selective decode of just the requested rectangle; not
+            // cached, the result depends on the parameters
+            img = JxlDecoder.decode(source(), wanted);
+            region = null; // the frames already cover exactly the region
+        } else {
+            checkIndex(imageIndex);
+            img = image();
+            region = wanted;
+        }
+        if (imageIndex < 0 || imageIndex >= img.frames.size()) {
+            throw new IndexOutOfBoundsException("image index " + imageIndex);
+        }
         JxlFrame frame = img.frames.get(imageIndex);
         BufferedImage full = toBufferedImage(img.metadata, frame);
         if (param == null) {
             return full;
         }
-        // honor source region / subsampling by extracting from the full image
-        java.awt.Rectangle region = param.getSourceRegion() != null
-                ? param.getSourceRegion().intersection(new java.awt.Rectangle(full.getWidth(), full.getHeight()))
-                : new java.awt.Rectangle(full.getWidth(), full.getHeight());
+        // honor any remaining source region / subsampling by extraction
+        if (region == null) {
+            region = new java.awt.Rectangle(full.getWidth(), full.getHeight());
+        }
         int sx = Math.max(1, param.getSourceXSubsampling());
         int sy = Math.max(1, param.getSourceYSubsampling());
         if (region.x == 0 && region.y == 0 && region.width == full.getWidth()
@@ -182,6 +206,55 @@ public final class JXLImageReader extends ImageReader {
             }
         }
         return out;
+    }
+
+    // ------------------------------------------------------------- tile API
+
+    private int tileDim = -1;
+
+    /** The codestream's group size in display pixels (the natural tile size). */
+    private int tileDim() throws IOException {
+        if (tileDim < 0) {
+            tileDim = JxlDecoder.readTileDim(source());
+        }
+        return tileDim;
+    }
+
+    @Override
+    public boolean isImageTiled(int imageIndex) throws IOException {
+        if (info().metadata().orientation != 1) {
+            // an oriented tile grid would not line up with codestream groups;
+            // region reads still work, the image just reports a single tile
+            return false;
+        }
+        int td = tileDim();
+        return td < getWidth(imageIndex) || td < getHeight(imageIndex);
+    }
+
+    @Override
+    public int getTileWidth(int imageIndex) throws IOException {
+        return isImageTiled(imageIndex) ? tileDim() : getWidth(imageIndex);
+    }
+
+    @Override
+    public int getTileHeight(int imageIndex) throws IOException {
+        return isImageTiled(imageIndex) ? tileDim() : getHeight(imageIndex);
+    }
+
+    @Override
+    public BufferedImage readTile(int imageIndex, int tileX, int tileY) throws IOException {
+        int tw = getTileWidth(imageIndex);
+        int th = getTileHeight(imageIndex);
+        int cols = (getWidth(imageIndex) + tw - 1) / tw;
+        int rows = (getHeight(imageIndex) + th - 1) / th;
+        if (tileX < 0 || tileY < 0 || tileX >= cols || tileY >= rows) {
+            throw new IllegalArgumentException("tile (" + tileX + ", " + tileY + ") out of range");
+        }
+        ImageReadParam p = getDefaultReadParam();
+        p.setSourceRegion(new java.awt.Rectangle(tileX * tw, tileY * th,
+                Math.min(tw, getWidth(imageIndex) - tileX * tw),
+                Math.min(th, getHeight(imageIndex) - tileY * th)));
+        return read(imageIndex, p);
     }
 
     private static BufferedImage toBufferedImage(ImageMetadata meta, JxlFrame frame) throws IOException {

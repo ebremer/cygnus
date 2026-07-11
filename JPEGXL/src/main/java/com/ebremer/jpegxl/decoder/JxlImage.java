@@ -13,12 +13,26 @@ public final class JxlImage {
     public final List<JxlFrame> frames;
     /** The decoded preview frame, or null when the image has none. */
     public JxlFrame preview;
+    /**
+     * Origin of the decoded frames in oriented image coordinates: (0, 0) for a
+     * full decode; the requested rectangle's origin for a region decode, whose
+     * frames then cover only that rectangle.
+     */
+    public final int regionX;
+    public final int regionY;
 
     public JxlImage(ImageMetadata metadata, int width, int height, List<JxlFrame> frames) {
+        this(metadata, width, height, frames, 0, 0);
+    }
+
+    public JxlImage(ImageMetadata metadata, int width, int height, List<JxlFrame> frames,
+            int regionX, int regionY) {
         this.metadata = metadata;
         this.width = width;
         this.height = height;
         this.frames = frames;
+        this.regionX = regionX;
+        this.regionY = regionY;
     }
 
     public int numColourChannels() {

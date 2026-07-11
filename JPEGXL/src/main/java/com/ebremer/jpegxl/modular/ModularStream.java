@@ -17,6 +17,13 @@ public final class ModularStream {
 
     private final List<ModularChannel> channels;
     private int nbMetaChannels;
+    /**
+     * Set on the frame-global stream when only the groups covering a decode
+     * region were decoded; inverse transforms whose output would depend on the
+     * undecoded (zero) areas then abort with a
+     * {@link com.ebremer.jpegxl.io.RegionUnsupportedException}.
+     */
+    public boolean regionMode;
     private final List<Transform> transforms = new ArrayList<>();
     private final WpState.WpParams wpParams;
     private final MaTree tree;

@@ -15,7 +15,15 @@ final class InverseTransforms {
             switch (transforms.get(i)) {
                 case Transform.Rct rct -> inverseRct(m.channels(), rct);
                 case Transform.Palette pal -> inversePalette(m, pal);
-                case Transform.Squeeze sq -> inverseSqueeze(m.channels(), sq);
+                case Transform.Squeeze sq -> {
+                    if (m.regionMode) {
+                        // the smooth-tendency chain runs along whole rows, so a
+                        // partially decoded channel cannot be unsqueezed soundly
+                        throw new com.ebremer.jpegxl.io.RegionUnsupportedException(
+                                "frame-global squeeze");
+                    }
+                    inverseSqueeze(m.channels(), sq);
+                }
             }
         }
     }
@@ -187,6 +195,12 @@ final class InverseTransforms {
                             }
                             val = (v % 5) * ((1L << bpp) - 1) / 4;
                         }
+                    }
+                    if (m.regionMode && isDelta) {
+                        // delta entries predict from previously reconstructed
+                        // pixels, a chain that may cross undecoded areas
+                        throw new com.ebremer.jpegxl.io.RegionUnsupportedException(
+                                "delta palette entry used");
                     }
                     long vW = x > 0 ? out[row + x - 1] : (y > 0 ? out[row - width + x] : 0);
                     long vN = y > 0 ? out[row - width + x] : vW;

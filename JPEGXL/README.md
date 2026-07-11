@@ -48,6 +48,28 @@ byte[] jxl = JxlEncoder.encode(planes, width, height, /*bits*/ 8,
 `reader.getWidth(0)`/`getHeight(0)` parse only the headers; pixel decoding is
 deferred until `read(...)`.
 
+Windowed reads decode only the 256×256 groups covering the requested
+rectangle (plus a filter margin), so a small read of a large image costs
+group-area work, not image-area work:
+
+```java
+// ImageIO: the standard source-region and tile APIs are group-selective
+ImageReader reader = ImageIO.getImageReadersByFormatName("jxl").next();
+reader.setInput(ImageIO.createImageInputStream(new File("big.jxl")));
+ImageReadParam p = reader.getDefaultReadParam();
+p.setSourceRegion(new Rectangle(4096, 4096, 512, 512));
+BufferedImage window = reader.read(0, p);
+BufferedImage tile = reader.readTile(0, 3, 7);      // tiles = codestream groups
+
+// Direct API: region in oriented image coordinates
+JxlImage part = JxlDecoder.decode(bytes, new Rectangle(4096, 4096, 512, 512));
+```
+
+Streams whose reconstruction is inherently non-local (a frame-global squeeze
+transform, delta-palette entries, patches copied from region-limited
+snapshots) transparently fall back to a full decode and return the same
+cropped result; reference, LF and preview frames always decode whole.
+
 ## What is implemented
 
 **Decoder** — both coding modes of ISO/IEC 18181-1:
@@ -68,6 +90,11 @@ deferred until `read(...)`.
   (binary32/16 and custom float layouts); float images decode bit-exactly
   and surface as `TYPE_FLOAT` rasters in ImageIO; integers wider than 24
   bits round-trip exactly through a dedicated integer canvas path.
+- **Region (windowed) decoding**: `JxlDecoder.decode(bytes, rect)` and the
+  ImageIO source-region/tile APIs entropy-decode only the LF and pass groups
+  covering the rectangle, with a 16-pixel margin so gaborish/EPF, chroma
+  upsampling and extra-channel shifts are bit-identical to a full decode;
+  non-local features fall back to decoding every group automatically.
 - **Colour management**: embedded ICC profiles are reconstructed from the
   encoded ICC stream and applied through `java.awt.color` when possible.
 - **YCbCr frames**: recompressed-JPEG streams (`cjxl in.jpg`) decode to

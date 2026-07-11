@@ -15,6 +15,7 @@ import com.ebremer.jpegxl.features.Splines;
 import com.ebremer.jpegxl.features.Upsampler;
 import com.ebremer.jpegxl.io.Bits;
 import com.ebremer.jpegxl.io.CodestreamSource;
+import com.ebremer.jpegxl.io.RegionUnsupportedException;
 import com.ebremer.jpegxl.modular.MaTree;
 import com.ebremer.jpegxl.modular.ModularChannel;
 import com.ebremer.jpegxl.modular.ModularStream;
@@ -85,6 +86,47 @@ public final class JxlDecoder {
     /** Decodes from an {@link javax.imageio.stream.ImageInputStream} without buffering the file. */
     public static JxlImage decode(javax.imageio.stream.ImageInputStream stream) throws IOException {
         return decode(new CodestreamSource.StreamSource(stream, Container.scanSegments(stream)));
+    }
+
+    /** Decodes only {@code region}; see {@link #decode(CodestreamSource, java.awt.Rectangle)}. */
+    public static JxlImage decode(byte[] file, java.awt.Rectangle region) throws IOException {
+        return decode(new CodestreamSource.ArraySource(Container.extractCodestream(file)), region);
+    }
+
+    /** Decodes only {@code region}; see {@link #decode(CodestreamSource, java.awt.Rectangle)}. */
+    public static JxlImage decode(javax.imageio.stream.ImageInputStream stream,
+            java.awt.Rectangle region) throws IOException {
+        return decode(new CodestreamSource.StreamSource(stream, Container.scanSegments(stream)),
+                region);
+    }
+
+    /**
+     * Decodes only the given rectangle, in oriented image coordinates. The
+     * returned image keeps the full image dimensions but its frames cover just
+     * the rectangle (clamped to the image; its clamped origin is reported by
+     * {@link JxlImage#regionX}/{@link JxlImage#regionY}).
+     *
+     * <p>Only the groups whose sections intersect the region (plus a safety
+     * margin for the restoration filters and upsampling) are entropy-decoded,
+     * so the cost of a windowed read of a large image is proportional to the
+     * covered groups, not the image. Streams whose reconstruction is non-local
+     * (frame-global squeeze, delta palettes, patches from region-limited
+     * snapshots) transparently fall back to decoding every group; the result
+     * is identical either way. A null region decodes everything.
+     */
+    public static JxlImage decode(CodestreamSource src, java.awt.Rectangle region)
+            throws IOException {
+        if (region == null) {
+            return decodeImpl(src, null, false);
+        }
+        try {
+            return decodeImpl(src, region, true);
+        } catch (RegionUnsupportedException e) {
+            if (ModularStream.DEBUG) {
+                System.err.println("[jxl] region fallback: " + e.getMessage());
+            }
+            return decodeImpl(src, region, false);
+        }
     }
 
     /** A header parse that runs over a byte window of the codestream. */
@@ -159,6 +201,18 @@ public final class JxlDecoder {
     }
 
     public static JxlImage decode(CodestreamSource src) throws IOException {
+        return decodeImpl(src, null, false);
+    }
+
+    /**
+     * @param requested region in oriented image coordinates, or null for all
+     * @param selective when true, only the groups covering the region are
+     *        decoded (may throw {@link RegionUnsupportedException}); when
+     *        false with a non-null region, everything is decoded and the
+     *        output is merely cropped
+     */
+    private static JxlImage decodeImpl(CodestreamSource src, java.awt.Rectangle requested,
+            boolean selective) throws IOException {
         Prelude prelude = parsePrelude(src);
         SizeHeader size = prelude.size();
         ImageMetadata meta = prelude.meta();
@@ -166,21 +220,37 @@ public final class JxlDecoder {
             throw new IOException("more than 31 bits per integer sample is not supported");
         }
 
+        boolean transposed = meta.orientation > 4;
+        int orientedWidth = transposed ? size.height : size.width;
+        int orientedHeight = transposed ? size.width : size.height;
+        java.awt.Rectangle oriented = null;
+        java.awt.Rectangle csRegion = null; // in codestream (pre-orientation) coordinates
+        if (requested != null) {
+            oriented = requested.intersection(
+                    new java.awt.Rectangle(orientedWidth, orientedHeight));
+            if (oriented.isEmpty()) {
+                throw new IllegalArgumentException("region " + requested
+                        + " lies outside the " + orientedWidth + "x" + orientedHeight + " image");
+            }
+            csRegion = inverseOrientRect(meta.orientation, size.width, size.height, oriented);
+        }
+
         JxlFrame preview = null;
         FrameEntry entry;
         if (prelude.preview() != null) {
             FrameEntry pe = prelude.preview();
             try {
-                FrameResult r = decodeFrame(src, pe.fh(), pe.toc(), meta, new FrameResult[5]);
+                FrameResult r = decodeFrame(src, pe.fh(), pe.toc(), meta,
+                        new FrameResult[5], null);
                 upsampleFrame(r, meta);
-                applyPatches(r, new FrameResult[4], meta);
+                applyPatches(r, new FrameResult[4], meta, null);
                 if (r.splines != null) {
                     r.splines.render(r.planes, r.width, r.height,
                             r.baseCorrelationX, r.baseCorrelationB);
                 }
                 colourTransform(r, meta);
                 preview = canvasToFrame(r.planes, r.exactInt, r.outColour,
-                        r.width, r.height, meta, 0);
+                        r.width, r.height, meta, 0, null);
             } catch (IOException e) {
                 preview = null; // previews are decorative; keep decoding the image
             }
@@ -198,6 +268,11 @@ public final class JxlDecoder {
         int[][] canvasExact = null; // exact deep-int samples mirroring the canvas
         long visibleFrames = 0;
         long invisibleFrames = 0;
+        // region bookkeeping: the canvas is only maintained within the region
+        // once a frame was partially decoded, and snapshots taken after that
+        // can no longer serve as patch sources
+        boolean canvasTainted = false;
+        boolean[] refRegionLimited = new boolean[4];
         while (true) {
             FrameHeader fh = entry.fh();
             Toc toc = entry.toc();
@@ -212,7 +287,39 @@ public final class JxlDecoder {
                         + " blend=" + fh.blendMode + " lfLevel=" + fh.lfLevel);
             }
 
-            FrameResult r = decodeFrame(src, fh, toc, meta, lfBuffer);
+            boolean visible = (fh.type == FrameHeader.TYPE_REGULAR
+                    || fh.type == FrameHeader.TYPE_SKIP_PROGRESSIVE)
+                    && (fh.duration != 0 || fh.isLast);
+            boolean save = (fh.saveAsReference != 0 || fh.duration == 0)
+                    && !fh.isLast && fh.type != FrameHeader.TYPE_LF;
+            // saved and LF frames stay complete: they may be read at arbitrary
+            // coordinates later (patches, blending sources, LF image)
+            GroupSelection sel = selectGroups(fh, csRegion,
+                    selective && !save && fh.type != FrameHeader.TYPE_LF);
+
+            if (sel != null && sel.empty()) {
+                // the frame does not touch the region: skip its pixel data;
+                // its canvas contribution would land entirely outside
+                canvasTainted = true;
+                if (visible) {
+                    visibleFrames++;
+                    invisibleFrames = 0;
+                } else {
+                    invisibleFrames++;
+                }
+                canvasExact = null; // an intersection-free frame never covers the canvas
+                if (visible) {
+                    frames.add(emitFrame(canvas, canvasExact, canvasColour, size, meta,
+                            fh.duration, csRegion));
+                }
+                if (fh.isLast) {
+                    break;
+                }
+                entry = parseFrame(src, toc.endOffset, meta, size);
+                continue;
+            }
+
+            FrameResult r = decodeFrame(src, fh, toc, meta, lfBuffer, sel);
 
             if (fh.type == FrameHeader.TYPE_LF) {
                 // an LF frame provides the LF image for a lower level
@@ -221,9 +328,6 @@ public final class JxlDecoder {
                 continue;
             }
 
-            boolean visible = (fh.type == FrameHeader.TYPE_REGULAR
-                    || fh.type == FrameHeader.TYPE_SKIP_PROGRESSIVE)
-                    && (fh.duration != 0 || fh.isLast);
             if (visible) {
                 visibleFrames++;
                 invisibleFrames = 0;
@@ -241,12 +345,11 @@ public final class JxlDecoder {
                 noiseField = Noise.initialize(seed0, r.width, r.height, groupDim, cols, cols * rows);
             }
 
-            boolean save = (fh.saveAsReference != 0 || fh.duration == 0)
-                    && !fh.isLast && fh.type != FrameHeader.TYPE_LF;
             if (save && fh.saveBeforeColourTransform) {
                 reference[fh.saveAsReference] = copyResult(r);
+                refRegionLimited[fh.saveAsReference] = false;
             }
-            applyPatches(r, reference, meta);
+            applyPatches(r, reference, meta, selective ? refRegionLimited : null);
             if (r.splines != null) {
                 r.exactInt = null;
                 r.splines.render(r.planes, r.width, r.height,
@@ -261,6 +364,9 @@ public final class JxlDecoder {
 
             if (fh.type == FrameHeader.TYPE_REGULAR || fh.type == FrameHeader.TYPE_SKIP_PROGRESSIVE) {
                 blendOntoCanvas(canvas, canvasColour, size.width, size.height, r, meta, reference);
+                if (sel != null) {
+                    canvasTainted = true; // canvas is now correct only within the region
+                }
                 boolean plainReplace = fh.fullFrame && r.width == size.width
                         && r.height == size.height && fh.blendMode == FrameHeader.BLEND_REPLACE
                         && r.outColour == canvasColour;
@@ -280,22 +386,11 @@ public final class JxlDecoder {
                     snap.planes[i] = canvas[i].clone();
                 }
                 reference[fh.saveAsReference] = snap;
+                refRegionLimited[fh.saveAsReference] = canvasTainted;
             }
             if (visible) {
-                // spot colours are rendered at output only; the canvas and the
-                // reference snapshots stay spot-free
-                float[][] emit = canvas;
-                int[][] emitExact = canvasExact;
-                if (canvasColour >= 3 && hasSpotColours(meta)) {
-                    emit = canvas.clone();
-                    for (int c = 0; c < 3; c++) {
-                        emit[c] = canvas[c].clone();
-                    }
-                    renderSpotColours(emit, canvasColour, meta);
-                    emitExact = null;
-                }
-                frames.add(canvasToFrame(emit, emitExact, canvasColour,
-                        size.width, size.height, meta, fh.duration));
+                frames.add(emitFrame(canvas, canvasExact, canvasColour, size, meta,
+                        fh.duration, csRegion));
             }
             if (fh.isLast) {
                 break;
@@ -305,11 +400,29 @@ public final class JxlDecoder {
         if (frames.isEmpty()) {
             throw new IOException("codestream contains no displayable frames");
         }
-        boolean transposed = meta.orientation > 4;
-        JxlImage image = new JxlImage(meta, transposed ? size.height : size.width,
-                transposed ? size.width : size.height, frames);
+        JxlImage image = new JxlImage(meta, orientedWidth, orientedHeight, frames,
+                oriented != null ? oriented.x : 0, oriented != null ? oriented.y : 0);
         image.preview = preview;
         return image;
+    }
+
+    /** Renders spot colours if any and emits the canvas (cropped to the region). */
+    private static JxlFrame emitFrame(float[][] canvas, int[][] canvasExact, int canvasColour,
+            SizeHeader size, ImageMetadata meta, long duration, java.awt.Rectangle csRegion) {
+        // spot colours are rendered at output only; the canvas and the
+        // reference snapshots stay spot-free
+        float[][] emit = canvas;
+        int[][] emitExact = canvasExact;
+        if (canvasColour >= 3 && hasSpotColours(meta)) {
+            emit = canvas.clone();
+            for (int c = 0; c < 3; c++) {
+                emit[c] = canvas[c].clone();
+            }
+            renderSpotColours(emit, canvasColour, meta);
+            emitExact = null;
+        }
+        return canvasToFrame(emit, emitExact, canvasColour,
+                size.width, size.height, meta, duration, csRegion);
     }
 
     private static FrameResult copyResult(FrameResult r) {
@@ -333,7 +446,7 @@ public final class JxlDecoder {
     }
 
     private static FrameResult decodeFrame(CodestreamSource src, FrameHeader fh, Toc toc,
-            ImageMetadata meta, FrameResult[] lfBuffer) throws IOException {
+            ImageMetadata meta, FrameResult[] lfBuffer, GroupSelection sel) throws IOException {
         requireSupported(fh, meta, fh.displayWidth, fh.displayHeight);
 
         FrameState state = new FrameState();
@@ -362,7 +475,14 @@ public final class JxlDecoder {
             Bits lfg = section(src, toc, toc.lfGlobalIndex());
             decodeLfGlobal(lfg, state);
             lfg.expectEndOfSection();
-            parallelFor(fh.numLfGroups, gg -> {
+            if (sel != null && state.gmodular != null) {
+                // inverse transforms must refuse reconstructions that would
+                // read the groups we are about to skip
+                state.gmodular.regionMode = true;
+            }
+            int[] lfList = sel == null ? sequence(fh.numLfGroups) : sel.lfGroups(fh);
+            parallelFor(lfList.length, i -> {
+                int gg = lfList[i];
                 Bits bits = section(src, toc, toc.lfGroupIndex(gg));
                 decodeLfGroup(bits, state, gg);
                 bits.expectEndOfSection();
@@ -375,7 +495,9 @@ public final class JxlDecoder {
                 throw new IOException("unexpected HfGlobal data in a modular frame");
             }
             // groups are independent; passes accumulate sequentially per group
-            parallelFor(fh.numGroups, g -> {
+            int[] gList = sel == null ? sequence(fh.numGroups) : sel.groups(fh);
+            parallelFor(gList.length, i -> {
+                int g = gList[i];
                 for (int pass = 0; pass < fh.passes.numPasses; pass++) {
                     Bits bits = section(src, toc, toc.passGroupIndex(fh, pass, g));
                     decodePassGroup(bits, state, pass, g);
@@ -392,7 +514,15 @@ public final class JxlDecoder {
         if (cap != null && state.vardct != null && fh.type == FrameHeader.TYPE_REGULAR) {
             cap.accept(state.vardct, fh);
         }
-        return buildResult(state);
+        return buildResult(state, sel);
+    }
+
+    private static int[] sequence(int n) {
+        int[] list = new int[n];
+        for (int i = 0; i < n; i++) {
+            list[i] = i;
+        }
+        return list;
     }
 
     /**
@@ -405,7 +535,8 @@ public final class JxlDecoder {
             new ThreadLocal<>();
 
     /** Decoded samples to normalized float planes, filters applied. */
-    private static FrameResult buildResult(FrameState state) throws IOException {
+    private static FrameResult buildResult(FrameState state, GroupSelection sel)
+            throws IOException {
         FrameHeader fh = state.fh;
         ImageMetadata meta = state.meta;
         int w = fh.width;
@@ -495,12 +626,18 @@ public final class JxlDecoder {
             }
         }
 
+        // a region decode filters only the rows of the selected groups; the
+        // margin keeps every region pixel out of the filters' edge erosion
+        int bandY0 = sel == null ? 0 : Math.min(filterH, sel.gy0() * fh.groupDim);
+        int bandY1 = sel == null ? filterH : Math.min(filterH, sel.gy1() * fh.groupDim);
         if (fh.restorationFilter.gab) {
-            RestorationFilters.gaborish(fh.restorationFilter, colorF, filterW, filterH);
+            RestorationFilters.gaborish(fh.restorationFilter, colorF, filterW, filterH,
+                    bandY0, bandY1);
         }
         if (fh.restorationFilter.epfIterations > 0) {
             RestorationFilters.epf(fh.restorationFilter, colorF, filterW, filterH,
-                    epfSigma, epfBlockStride, fh.restorationFilter.epfSigmaForModular);
+                    epfSigma, epfBlockStride, fh.restorationFilter.epfSigmaForModular,
+                    bandY0, bandY1);
         }
 
         if (filterW != w) { // crop the padded VarDCT grid to the visible frame
@@ -602,8 +739,8 @@ public final class JxlDecoder {
         r.height = fh.displayHeight;
     }
 
-    private static void applyPatches(FrameResult r, FrameResult[] reference, ImageMetadata meta)
-            throws IOException {
+    private static void applyPatches(FrameResult r, FrameResult[] reference, ImageMetadata meta,
+            boolean[] refRegionLimited) throws IOException {
         if (r.patchesDict == null || Boolean.getBoolean("jxl.skipPatches")) {
             return;
         }
@@ -615,6 +752,11 @@ public final class JxlDecoder {
             FrameResult ref = reference[patch.ref()];
             if (ref == null) {
                 continue;
+            }
+            if (refRegionLimited != null && refRegionLimited[patch.ref()]) {
+                // the snapshot is only valid within the region, but the patch
+                // may copy from anywhere in it
+                throw new RegionUnsupportedException("patch from a region-limited snapshot");
             }
             if (patch.y0() + patch.height() > ref.height || patch.x0() + patch.width() > ref.width) {
                 throw new IOException("patch does not fit its reference frame");
@@ -931,9 +1073,16 @@ public final class JxlDecoder {
         }
     }
 
-    /** Converts the canvas to output planes: clamped ints, or floats as-is. */
+    /**
+     * Converts the canvas (or just {@code crop} of it, in codestream
+     * coordinates) to output planes: clamped ints, or floats as-is.
+     */
     private static JxlFrame canvasToFrame(float[][] canvas, int[][] exact, int canvasColour,
-            int width, int height, ImageMetadata meta, long duration) {
+            int width, int height, ImageMetadata meta, long duration, java.awt.Rectangle crop) {
+        int cx = crop == null ? 0 : crop.x;
+        int cy = crop == null ? 0 : crop.y;
+        int cw = crop == null ? width : crop.width;
+        int ch = crop == null ? height : crop.height;
         int[][] intPlanes = new int[canvas.length][];
         float[][] floatPlanes = new float[canvas.length][];
         for (int c = 0; c < canvas.length; c++) {
@@ -941,29 +1090,41 @@ public final class JxlDecoder {
                     ? meta.bitDepth
                     : meta.extraChannels.get(c - canvasColour).bitDepth;
             if (depth.floatingPoint) {
-                floatPlanes[c] = canvas[c].clone();
+                float[] p = new float[cw * ch];
+                for (int y = 0; y < ch; y++) {
+                    System.arraycopy(canvas[c], (cy + y) * width + cx, p, y * cw, cw);
+                }
+                floatPlanes[c] = p;
             } else if (exact != null && depth.bitsPerSample > 24) {
                 // deep integers pass through exactly instead of via float32
                 long max = (1L << depth.bitsPerSample) - 1;
-                int[] p = new int[width * height];
+                int[] p = new int[cw * ch];
                 int[] src = exact[c];
-                for (int i = 0; i < p.length; i++) {
-                    long v = src[i];
-                    p[i] = v < 0 ? 0 : (int) Math.min(v, max);
+                for (int y = 0; y < ch; y++) {
+                    int srcRow = (cy + y) * width + cx;
+                    int dstRow = y * cw;
+                    for (int x = 0; x < cw; x++) {
+                        long v = src[srcRow + x];
+                        p[dstRow + x] = v < 0 ? 0 : (int) Math.min(v, max);
+                    }
                 }
                 intPlanes[c] = p;
             } else {
                 long max = (1L << depth.bitsPerSample) - 1;
                 float[] f = canvas[c];
-                int[] p = new int[width * height];
-                for (int i = 0; i < p.length; i++) {
-                    long v = Math.round((double) f[i] * max);
-                    p[i] = v < 0 ? 0 : (int) Math.min(v, max);
+                int[] p = new int[cw * ch];
+                for (int y = 0; y < ch; y++) {
+                    int srcRow = (cy + y) * width + cx;
+                    int dstRow = y * cw;
+                    for (int x = 0; x < cw; x++) {
+                        long v = Math.round((double) f[srcRow + x] * max);
+                        p[dstRow + x] = v < 0 ? 0 : (int) Math.min(v, max);
+                    }
                 }
                 intPlanes[c] = p;
             }
         }
-        return orient(meta, width, height, duration, intPlanes, floatPlanes);
+        return orient(meta, cw, ch, duration, intPlanes, floatPlanes);
     }
 
     private static Bits section(CodestreamSource src, Toc toc, int index) throws IOException {
@@ -1246,6 +1407,152 @@ public final class JxlDecoder {
                         k, map[0], map[1], map[2], src.pixels[0], src.pixels[1], src.pixels[2]);
             }
         }
+    }
+
+    // ------------------------------------------------------- region decoding
+
+    /**
+     * Safety margin in coded pixels around a decode region: covers the
+     * restoration filters (reach ≤ 9), chroma and up-to-8x upsampling kernels,
+     * and per-group extra-channel shifts (≤ 3). Non-local reconstructions
+     * (frame-global squeeze, delta palettes) are excluded by fallback instead.
+     */
+    private static final int REGION_MARGIN = 16;
+
+    /** End-exclusive HF and LF group grid ranges covering a decode region. */
+    private record GroupSelection(int gx0, int gx1, int gy0, int gy1,
+                                  int lgx0, int lgx1, int lgy0, int lgy1) {
+
+        static final GroupSelection EMPTY = new GroupSelection(0, 0, 0, 0, 0, 0, 0, 0);
+
+        boolean empty() {
+            return gx0 >= gx1 || gy0 >= gy1;
+        }
+
+        int[] groups(FrameHeader fh) {
+            int[] list = new int[(gx1 - gx0) * (gy1 - gy0)];
+            int n = 0;
+            for (int y = gy0; y < gy1; y++) {
+                for (int x = gx0; x < gx1; x++) {
+                    list[n++] = y * fh.groupColumns + x;
+                }
+            }
+            return list;
+        }
+
+        int[] lfGroups(FrameHeader fh) {
+            int[] list = new int[(lgx1 - lgx0) * (lgy1 - lgy0)];
+            int n = 0;
+            for (int y = lgy0; y < lgy1; y++) {
+                for (int x = lgx0; x < lgx1; x++) {
+                    list[n++] = y * fh.lfGroupColumns + x;
+                }
+            }
+            return list;
+        }
+    }
+
+    /**
+     * Chooses the groups to decode for a region, or null to decode everything
+     * (no region, a frame that must stay complete, or a region covering every
+     * group anyway). {@code csRegion} is in codestream canvas coordinates.
+     */
+    private static GroupSelection selectGroups(FrameHeader fh, java.awt.Rectangle csRegion,
+            boolean allow) {
+        if (csRegion == null || !allow) {
+            return null;
+        }
+        // canvas coordinates -> frame display coordinates
+        long ix0 = Math.max(0, (long) csRegion.x - fh.x0);
+        long iy0 = Math.max(0, (long) csRegion.y - fh.y0);
+        long ix1 = Math.min(fh.displayWidth, (long) csRegion.x - fh.x0 + csRegion.width);
+        long iy1 = Math.min(fh.displayHeight, (long) csRegion.y - fh.y0 + csRegion.height);
+        if (ix0 >= ix1 || iy0 >= iy1) {
+            return GroupSelection.EMPTY;
+        }
+        // display -> coded coordinates, expanded by the safety margin
+        int up = fh.upsampling;
+        int px0 = (int) Math.max(0, ix0 / up - REGION_MARGIN);
+        int py0 = (int) Math.max(0, iy0 / up - REGION_MARGIN);
+        int px1 = (int) Math.min(fh.width, (ix1 + up - 1) / up + REGION_MARGIN);
+        int py1 = (int) Math.min(fh.height, (iy1 + up - 1) / up + REGION_MARGIN);
+        int gd = fh.groupDim;
+        int lfd = gd * 8;
+        GroupSelection sel = new GroupSelection(
+                px0 / gd, Math.min(fh.groupColumns, (px1 + gd - 1) / gd),
+                py0 / gd, Math.min(fh.groupRows, (py1 + gd - 1) / gd),
+                px0 / lfd, Math.min(fh.lfGroupColumns, (px1 + lfd - 1) / lfd),
+                py0 / lfd, Math.min(fh.lfGroupRows, (py1 + lfd - 1) / lfd));
+        boolean full = sel.gx0 == 0 && sel.gy0 == 0
+                && sel.gx1 == fh.groupColumns && sel.gy1 == fh.groupRows
+                && sel.lgx0 == 0 && sel.lgy0 == 0
+                && sel.lgx1 == fh.lfGroupColumns && sel.lgy1 == fh.lfGroupRows;
+        return full ? null : sel;
+    }
+
+    /** Maps a rectangle in oriented image coordinates back to codestream coordinates. */
+    private static java.awt.Rectangle inverseOrientRect(int orientation, int csWidth,
+            int csHeight, java.awt.Rectangle r) {
+        if (orientation == 1) {
+            return new java.awt.Rectangle(r.x, r.y, r.width, r.height);
+        }
+        int minX = Integer.MAX_VALUE;
+        int minY = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE;
+        int maxY = Integer.MIN_VALUE;
+        for (int corner = 0; corner < 4; corner++) {
+            int x = (corner & 1) == 0 ? r.x : r.x + r.width - 1;
+            int y = (corner & 2) == 0 ? r.y : r.y + r.height - 1;
+            int sx;
+            int sy;
+            switch (orientation) {
+                case 2 -> {
+                    sx = csWidth - 1 - x;
+                    sy = y;
+                }
+                case 3 -> {
+                    sx = csWidth - 1 - x;
+                    sy = csHeight - 1 - y;
+                }
+                case 4 -> {
+                    sx = x;
+                    sy = csHeight - 1 - y;
+                }
+                case 5 -> {
+                    sx = y;
+                    sy = x;
+                }
+                case 6 -> {
+                    sx = y;
+                    sy = csHeight - 1 - x;
+                }
+                case 7 -> {
+                    sx = csWidth - 1 - y;
+                    sy = csHeight - 1 - x;
+                }
+                case 8 -> {
+                    sx = csWidth - 1 - y;
+                    sy = x;
+                }
+                default -> throw new IllegalStateException("orientation " + orientation);
+            }
+            minX = Math.min(minX, sx);
+            minY = Math.min(minY, sy);
+            maxX = Math.max(maxX, sx);
+            maxY = Math.max(maxY, sy);
+        }
+        return new java.awt.Rectangle(minX, minY, maxX - minX + 1, maxY - minY + 1);
+    }
+
+    /**
+     * The natural tile granularity of the first frame: its group size in
+     * display pixels. Header-only, nothing is decoded.
+     */
+    public static int readTileDim(CodestreamSource src) throws IOException {
+        Prelude p = parsePrelude(src);
+        FrameEntry e = p.firstFrame() != null ? p.firstFrame()
+                : parseFrame(src, p.preview().toc().endOffset, p.meta(), p.size());
+        return e.fh().groupDim * e.fh().upsampling;
     }
 
     /** Applies the EXIF-style orientation to both integer and float planes. */
