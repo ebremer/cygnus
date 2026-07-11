@@ -25,13 +25,13 @@ import java.util.Map;
  */
 public final class JxlEncoder {
 
-    private static final int GROUP_DIM = 256;
+    static final int GROUP_DIM = 256;
     private static final int GROUP_SIZE_SHIFT_BITS = 1; // group_size_shift = 7 + 1 -> 256
     private static final int MAX_PALETTE = 1024;
     private static final int MIN_RUN = 12;
 
     /** One coded modular channel. */
-    private static final class Chan {
+    static final class Chan {
         final int w;
         final int h;
         final int[] px;
@@ -45,7 +45,7 @@ public final class JxlEncoder {
     }
 
     /** A buffered token stream for one section. */
-    private static final class TokenBuf {
+    static final class TokenBuf {
         int[] ctx = new int[1 << 12];
         int[] val = new int[1 << 12];
         int n;
@@ -135,7 +135,7 @@ public final class JxlEncoder {
         out.write(0xff, 8);
         out.write(0x0a, 8);
         new SizeHeader(width, height).write(out);
-        ImageMetadata meta = main.buildMetadata();
+        ImageMetadata meta = buildMetadata(bits, grey, alpha, alphaAssociated);
         meta.previewWidth = previewWidth;
         meta.previewHeight = previewHeight;
         meta.write(out);
@@ -149,7 +149,7 @@ public final class JxlEncoder {
         out.write(0xff, 8);
         out.write(0x0a, 8);
         new SizeHeader(width, height).write(out);
-        buildMetadata().write(out);
+        buildMetadata(bits, grey, alpha, alphaAssociated).write(out);
         writeFrame(out);
         return out.toByteArray();
     }
@@ -295,13 +295,13 @@ public final class JxlEncoder {
         return cost;
     }
 
-    private void choosePredictor(Chan c) {
+    static void choosePredictor(Chan c) {
         long grad = fullGradientCost(c);
         long wp = wpCost(c);
         c.predictor = wp * 20 < grad * 19 ? 6 : 5; // require a 5% win for WP
     }
 
-    private static long fullGradientCost(Chan c) {
+    static long fullGradientCost(Chan c) {
         long cost = 0;
         int[] px = c.px;
         for (int y = 0; y < c.h; y++) {
@@ -322,7 +322,7 @@ public final class JxlEncoder {
     }
 
     /** Applies the inverse of the decoder's RCT: encodes type {@code t}. */
-    private static void forwardRct(int t, int[] p0, int[] p1, int[] p2) {
+    static void forwardRct(int t, int[] p0, int[] p1, int[] p2) {
         int n = p0.length;
         switch (t) {
             case 0 -> {
@@ -486,7 +486,7 @@ public final class JxlEncoder {
         }
 
         // ---- assemble the frame
-        writeFrameHeader(out);
+        writeFrameHeader(out, alpha);
 
         out.writeBool(false); // TOC not permuted
         out.zeroPadToByte();
@@ -531,24 +531,30 @@ public final class JxlEncoder {
             w.write(0, 4);  // d_pred = 0
         } else if (rctType >= 0) {
             w.write(1, 2);  // nb_transforms = 1
-            w.write(0, 2);  // transform id: RCT
-            w.write(0, 2);  // begin_c selector 0
-            w.write(0, 3);  // begin_c = 0
-            if (rctType == 6) {
-                w.write(0, 2);
-            } else if (rctType < 4) {
-                w.write(1, 2);
-                w.write(rctType, 2);
-            } else {
-                w.write(2, 2);
-                w.write(rctType - 2, 4);
-            }
+            writeRctTransform(w, rctType);
         } else {
             w.write(0, 2);  // nb_transforms = 0
         }
     }
 
-    private ImageMetadata buildMetadata() {
+    /** Writes one RCT transform declaration over channels 0..2. */
+    static void writeRctTransform(BitWriter w, int rctType) {
+        w.write(0, 2);  // transform id: RCT
+        w.write(0, 2);  // begin_c selector 0
+        w.write(0, 3);  // begin_c = 0
+        if (rctType == 6) {
+            w.write(0, 2);
+        } else if (rctType < 4) {
+            w.write(1, 2);
+            w.write(rctType, 2);
+        } else {
+            w.write(2, 2);
+            w.write(rctType - 2, 4);
+        }
+    }
+
+    static ImageMetadata buildMetadata(int bits, boolean grey, boolean alpha,
+            boolean alphaAssociated) {
         ImageMetadata meta = new ImageMetadata();
         meta.bitDepth = BitDepth.of(bits);
         meta.modular16BitBuffers = bits <= 12;
@@ -569,7 +575,7 @@ public final class JxlEncoder {
         return meta;
     }
 
-    private void writeFrameHeader(BitWriter out) {
+    static void writeFrameHeader(BitWriter out, boolean alpha) {
         out.zeroPadToByte();
         out.writeBool(false);        // !all_default
         out.write(0, 2);             // frame_type: regular
@@ -596,7 +602,7 @@ public final class JxlEncoder {
         out.writeU64(0);             // frame header extensions
     }
 
-    private static void writeTocEntry(BitWriter out, int size) {
+    static void writeTocEntry(BitWriter out, int size) {
         if (size < 1024) {
             out.write(0, 2);
             out.write(size, 10);
@@ -615,7 +621,7 @@ public final class JxlEncoder {
     // ---------------------------------------------------------------- tokens
 
     /** A node of the encoder's MA tree. */
-    private static final class TNode {
+    static final class TNode {
         int prop = -1;   // -1 for leaves
         int split;
         TNode left;
@@ -625,7 +631,7 @@ public final class JxlEncoder {
         int ctx;         // leaf context id, assigned in BFS order
     }
 
-    private static TNode leafNode(Chan c) {
+    static TNode leafNode(Chan c) {
         TNode n = new TNode();
         n.chan = c;
         n.predictor = c.predictor;
@@ -633,7 +639,7 @@ public final class JxlEncoder {
     }
 
     /** A chain of property-0 splits hanging each channel's learned subtree. */
-    private static TNode chainNode(List<Chan> list, int k, Map<Chan, TNode> subs) {
+    static TNode chainNode(List<Chan> list, int k, Map<Chan, TNode> subs) {
         if (k == 0) {
             return subs.get(list.get(0));
         }
@@ -669,7 +675,7 @@ public final class JxlEncoder {
     }
 
     /** Assigns leaf contexts in the decoder's BFS order; returns the leaf count. */
-    private static int assignCtx(TNode root) {
+    static int assignCtx(TNode root) {
         java.util.ArrayDeque<TNode> queue = new java.util.ArrayDeque<>();
         queue.add(root);
         int ctx = 0;
@@ -689,7 +695,7 @@ public final class JxlEncoder {
      * Emits the tree in the decoder's BFS order. With {@code out == null}
      * histograms are updated instead of writing bits.
      */
-    private void emitTree(TNode root, BitWriter out, EntropyEncoder enc) {
+    static void emitTree(TNode root, BitWriter out, EntropyEncoder enc) {
         java.util.ArrayDeque<TNode> queue = new java.util.ArrayDeque<>();
         queue.add(root);
         while (!queue.isEmpty()) {
@@ -718,7 +724,7 @@ public final class JxlEncoder {
     }
 
     /** Emits a buffered section, collapsing runs into LZ77 copies. */
-    private static void emitBuffer(TokenBuf buf, BitWriter out, EntropyEncoder enc) {
+    static void emitBuffer(TokenBuf buf, BitWriter out, EntropyEncoder enc) {
         int i = 0;
         while (i < buf.n) {
             if (i > 0) {
@@ -751,7 +757,7 @@ public final class JxlEncoder {
      * subtree per pixel and buffering packed residuals under the leaf context.
      * The rectangle is its own little image: neighbours never cross it.
      */
-    private void tokenizeRect(Chan ch, TNode sub, int[] ref, int x0, int y0, int w, int h,
+    static void tokenizeRect(Chan ch, TNode sub, int[] ref, int x0, int y0, int w, int h,
             TokenBuf buf) {
         if (w <= 0 || h <= 0) {
             return;
@@ -924,7 +930,7 @@ public final class JxlEncoder {
      * evenly strided subset of pixels: the residual's hybrid-uint token and
      * every candidate property value.
      */
-    private Samples collectSamples(Chan c, int[] ref, List<int[]> rects, int maxSamples) {
+    private static Samples collectSamples(Chan c, int[] ref, List<int[]> rects, int maxSamples) {
         long total = 0;
         for (int[] r : rects) {
             total += (long) r[2] * r[3];
@@ -978,7 +984,7 @@ public final class JxlEncoder {
         return s;
     }
 
-    private TNode learnTree(Chan c, int[] ref, List<int[]> rects) {
+    private static TNode learnTree(Chan c, int[] ref, List<int[]> rects) {
         return learnTree(c, ref, rects, MAX_SAMPLES, MAX_DEPTH);
     }
 
@@ -988,7 +994,7 @@ public final class JxlEncoder {
      * a sampled pixel subset, stopping when the projected saving no longer
      * covers the tree and histogram overhead.
      */
-    private TNode learnTree(Chan c, int[] ref, List<int[]> rects, int maxSamples,
+    static TNode learnTree(Chan c, int[] ref, List<int[]> rects, int maxSamples,
             int maxDepth) {
         if (Boolean.getBoolean("jxl.enc.simpletree")) {
             return leafNode(c); // debug baseline: fixed one-leaf-per-channel tree
@@ -1017,7 +1023,7 @@ public final class JxlEncoder {
     }
 
     /** One greedy split attempt over the node's samples; recurses on success. */
-    private TNode splitNode(Chan c, Samples s, int[] idx, int depthLeft, double upscale,
+    private static TNode splitNode(Chan c, Samples s, int[] idx, int depthLeft, double upscale,
             double[] xlogx) {
         int m = idx.length;
         if (depthLeft <= 0 || m < 2 * MIN_LEAF_SAMPLES) {
@@ -1176,7 +1182,7 @@ public final class JxlEncoder {
         return v >= 0 ? 2 * v : -2 * v - 1;
     }
 
-    private static int ceilDiv(int a, int b) {
+    static int ceilDiv(int a, int b) {
         return (a + b - 1) / b;
     }
 }

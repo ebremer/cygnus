@@ -142,6 +142,22 @@ cropped result; reference, LF and preview frames always decode whole.
   (`VarDctEncoder.encode(rgb, w, h, distance)`), and an iterative
   rate-control mode (`encodeToTarget`) that refines the quantiser against
   the achieved error; the ImageIO quality knob uses the latter.
+- **Streaming (chunked) lossless encoding**: `JxlStreamingEncoder` consumes
+  rows top to bottom and compresses each 256-row band of groups as it
+  completes, so peak memory is one band plus the compressed sections — the
+  image never has to fit in memory (nor under the 2³¹ samples-per-plane
+  array limit). Each group is a self-contained section with its own RCT,
+  predictors, learned tree and entropy code; files are typically a few
+  percent larger than `JxlEncoder.encode`'s.
+
+```java
+try (var enc = new JxlStreamingEncoder(outputStream, width, height, 8,
+        /*grey*/ false, /*alpha*/ false, /*alphaAssociated*/ false)) {
+    while (moreRows) {
+        enc.writeRows(rowPlanes, rowCount);  // any batch size, top to bottom
+    }
+}   // close() finishes the codestream
+```
 - 256×256 groups with a proper TOC, so large images decode in bounded memory
   and are parallelisable by conforming decoders.
 - Greyscale/RGB, 1–31 bits, optional alpha (lossless).
