@@ -26,14 +26,13 @@ public final class Transfer {
                 }
             }
             case ColourEncoding.TF_BT709 -> {
-                // exact BT.709 constants as used by libjxl
-                double beta = 0.018053968510807;
-                double alpha = 1 + 5.5 * beta;
+                // libjxl uses the classic rounded Rec.709 constants
+                // (0.018 / 1.099 / -0.099), not the exact-continuity variants
                 for (int i = 0; i < plane.length; i++) {
                     float v = plane[i];
                     // negatives take the linear segment (unlike sRGB's mirror)
-                    plane[i] = v < beta ? 4.5f * v
-                            : (float) (alpha * Math.pow(v, 0.45) - (alpha - 1));
+                    plane[i] = v < 0.018f ? 4.5f * v
+                            : (float) (1.099 * Math.pow(v, 0.45) - 0.099);
                 }
             }
             case ColourEncoding.TF_DCI -> {

@@ -252,10 +252,10 @@ final class Transforms {
 
         // 4x8 DCT bottom/top half
         float[] block48 = new float[32];
-        block48[0] = coeffs[cOff] - coeffs[cOff + 256];
+        block48[0] = coeffs[cOff] - coeffs[cOff + cStride];
         for (int iy = 0; iy < 4; iy++) {
             for (int ix = (iy == 0 ? 1 : 0); ix < 8; ix++) {
-                block48[iy * 8 + ix] = coeffs[(ppgY + 1 + iy * 2) * 256 + ppgX + ix];
+                block48[iy * 8 + ix] = coeffs[(ppgY + 1 + iy * 2) * cStride + ppgX + ix];
             }
         }
         float[] idct48 = new float[32];

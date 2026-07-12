@@ -304,7 +304,7 @@ public final class DequantMatrices {
                     continue;
                 }
                 float pos = (AFV_FREQS[y * 4 + x] - low) / (high - low);
-                weight[(2 * x) * 8 + 2 * y] = interpolate(pos, bands);
+                weight[(2 * y) * 8 + 2 * x] = interpolate(pos, bands);
             }
             for (int x = 0; x < 8; x++) {
                 if (x == 0 && y == 0) {

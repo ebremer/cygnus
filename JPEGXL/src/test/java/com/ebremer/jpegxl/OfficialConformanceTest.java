@@ -63,15 +63,13 @@ class OfficialConformanceTest {
     }
 
     /**
-     * Cases with small documented deviations from the strict level-10
-     * thresholds (all three pass the level-5 thresholds; their level-5
-     * variants run and pass below): localized VarDCT residuals of
-     * 1.2-4x the limit, suspected in a rare-transform detail.
+     * Cases with a small documented deviation from the strict level-10
+     * thresholds (the case passes the level-5 thresholds; its level-5
+     * variant runs and passes below): localized VarDCT residuals,
+     * suspected in a rare-transform detail.
      */
     private static final java.util.Set<String> KNOWN_DEVIATIONS = java.util.Set.of(
-            "animation_icos4d",  // f9 rms 1.17e-4 (limit 1e-4), peak 6.9e-3 (limit 5e-3)
-            "bike",              // rms 1.21e-4 (limit 1e-4)
-            "upsampling");       // rms 4.0e-4 (limit 1e-4), peak 2.5e-2 (limit 4e-3)
+            "upsampling");       // rms 4.0e-4 (limit 1e-4), peak 2.6e-2 (limit 4e-3)
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("cases")
