@@ -182,7 +182,7 @@ by Aous Naman (ht_dec.c, as distributed with OpenJPEG).
 ## Design
 
 ```
-com.ebremer.cygnus
+com.ebremer.cygnus.jpeg2000
 ├── codestream   Marker parsing → Codestream model (headers, tile-parts, precedence)
 ├── jp2          JP2 box walk (ihdr/colr/pclr/cmap/cdef, codestream location)
 │                + Jp2Writer (signature/ftyp/jp2h boxes)

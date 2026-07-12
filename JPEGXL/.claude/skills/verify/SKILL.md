@@ -5,7 +5,7 @@ description: Verify JPEGXL codec changes end-to-end — drive the public API fro
 
 # Verifying the JPEG XL codec
 
-The surface is the library boundary: `com.ebremer.jpegxl.*` public APIs
+The surface is the library boundary: `com.ebremer.cygnus.jpegxl.*` public APIs
 (`JxlEncoder`, `JxlStreamingEncoder`, `VarDctEncoder`, `JpegRecompressor`,
 `JxlDecoder`, `JpegReconstructor`, the ImageIO plug-ins).
 
