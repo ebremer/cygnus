@@ -149,6 +149,15 @@ cropped result; reference, LF and preview frames always decode whole.
   array limit). Each group is a self-contained section with its own RCT,
   predictors, learned tree and entropy code; files are typically a few
   percent larger than `JxlEncoder.encode`'s.
+- **JPEG → JPEG XL recompression**: `JpegRecompressor.encode(jpegBytes)`
+  losslessly repacks a JPEG as a JPEG XL container with reconstruction data
+  (`jbrd`), the write-side twin of `JpegReconstructor` — the quantised DCT
+  coefficients become a `doYCbCr` VarDCT frame with the JPEG's own quant
+  tables, and `reconstruct` (or `djxl`) rebuilds the original file byte for
+  byte while the `.jxl` still decodes to pixels normally. Baseline and
+  progressive Huffman JPEGs (grey/YCbCr/RGB, sampling factors 1–2, restart
+  intervals, reset points, extra zero runs); APP/COM markers are carried
+  verbatim. Arithmetic-coded, 12-bit and hierarchical JPEGs are rejected.
 
 ```java
 try (var enc = new JxlStreamingEncoder(outputStream, width, height, 8,
@@ -157,6 +166,13 @@ try (var enc = new JxlStreamingEncoder(outputStream, width, height, 8,
         enc.writeRows(rowPlanes, rowCount);  // any batch size, top to bottom
     }
 }   // close() finishes the codestream
+```
+
+JPEGs recompress losslessly in both directions:
+
+```java
+byte[] jxl = JpegRecompressor.encode(jpegBytes);   // ~20% smaller, decodable
+byte[] jpeg = JpegReconstructor.reconstruct(jxl);  // the original, byte-exact
 ```
 - 256×256 groups with a proper TOC, so large images decode in bounded memory
   and are parallelisable by conforming decoders.
