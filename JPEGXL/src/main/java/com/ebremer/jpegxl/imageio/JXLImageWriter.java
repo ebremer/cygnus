@@ -125,14 +125,12 @@ public final class JXLImageWriter extends ImageWriter {
                         && ("lossy".equals(param.getCompressionType())
                             || param.getCompressionQuality() < 1.0f));
         byte[] encoded;
-        if (lossy && bits == 8 && !alpha) {
+        if (lossy && bits <= 16) {
             // map quality [0,1] to a Butteraugli-like distance in [0.5, 15]
             float quality = param.getCompressionQuality();
             float distance = 0.5f + (1.0f - quality) * 14.5f;
-            int[][] rgb = grey
-                    ? new int[][] {planes[0], planes[0], planes[0]}
-                    : planes;
-            encoded = com.ebremer.jpegxl.encoder.VarDctEncoder.encodeToTarget(rgb, w, h, distance);
+            encoded = com.ebremer.jpegxl.encoder.VarDctEncoder.encodeToTarget(
+                    planes, w, h, bits, grey, alpha, false, distance);
         } else {
             encoded = JxlEncoder.encode(planes, w, h, bits, grey, alpha, false);
         }

@@ -42,6 +42,9 @@ public final class VarDctEncoder {
     private final int height;
     private final int paddedWidth;
     private final int paddedHeight;
+    private final int bits;
+    private final boolean grey;
+    private final int[] alphaPlane; // null without alpha; coded losslessly
     private final int globalScale;
     private final int hfMul;
     private final float[][] xyb = new float[3][];   // padded planes
@@ -55,11 +58,15 @@ public final class VarDctEncoder {
     private int[][] dcQuant;
     private int[][][] hfQuant;  // [channel][origin cell] -> natural coefficients
 
-    private VarDctEncoder(int[][] rgb, int width, int height, float distance) throws IOException {
+    private VarDctEncoder(int[][] planes, int width, int height, int bits,
+            boolean grey, boolean alpha, float distance) throws IOException {
         this.width = width;
         this.height = height;
         this.paddedWidth = (width + 7) & ~7;
         this.paddedHeight = (height + 7) & ~7;
+        this.bits = bits;
+        this.grey = grey;
+        this.alphaPlane = alpha ? planes[grey ? 1 : 3] : null;
         float d = Math.max(0.1f, distance);
         this.globalScale = Math.max(1, Math.min(65535, Math.round(4096f / d)));
         this.hfMul = Math.max(1, Math.min(200, Math.round(32f / d)));
@@ -75,24 +82,43 @@ public final class VarDctEncoder {
                 new Bits(new byte[] {0x01}), 1, 1, null); // all defaults
         weightsOf = dequant.weights;
 
-        toXyb(rgb, meta);
+        toXyb(planes, meta);
     }
 
     /** Encodes 8-bit sRGB planes lossily; grey images pass the same plane thrice. */
     public static byte[] encode(int[][] rgb, int width, int height, float distance)
             throws IOException {
+        return encode(rgb, width, height, 8, false, false, false, distance);
+    }
+
+    /**
+     * Encodes samples lossily through the VarDCT path. Plane layout matches
+     * {@link JxlEncoder#encode}: colour channels first (1 for greyscale, 3
+     * for RGB), then an optional alpha plane; sRGB samples in
+     * [0, 2^bits). The colour channels go through XYB quantisation; alpha is
+     * carried losslessly as a modular extra channel.
+     */
+    public static byte[] encode(int[][] planes, int width, int height, int bits,
+            boolean grey, boolean alpha, boolean alphaAssociated, float distance)
+            throws IOException {
         if (width <= 0 || height <= 0) {
             throw new IllegalArgumentException("bad dimensions");
         }
-        VarDctEncoder enc = new VarDctEncoder(rgb, width, height, distance);
+        if (bits < 1 || bits > 16) {
+            throw new IllegalArgumentException("lossy bits per sample must be in 1..16");
+        }
+        int numInput = (grey ? 1 : 3) + (alpha ? 1 : 0);
+        if (planes.length != numInput) {
+            throw new IllegalArgumentException("expected " + numInput + " planes, got "
+                    + planes.length);
+        }
+        VarDctEncoder enc = new VarDctEncoder(planes, width, height, bits, grey, alpha, distance);
         BitWriter out = new BitWriter();
         out.write(0xff, 8);
         out.write(0x0a, 8);
         new SizeHeader(width, height).write(out);
-        ImageMetadata meta = new ImageMetadata();
+        ImageMetadata meta = JxlEncoder.buildMetadata(bits, grey, alpha, alphaAssociated);
         meta.xybEncoded = true;
-        meta.bitDepth = com.ebremer.jpegxl.codestream.BitDepth.of(8);
-        meta.modular16BitBuffers = true;
         meta.write(out);
         enc.writeFrame(out);
         return out.toByteArray();
@@ -107,6 +133,13 @@ public final class VarDctEncoder {
      */
     public static byte[] encodeToTarget(int[][] rgb, int width, int height, float distance)
             throws IOException {
+        return encodeToTarget(rgb, width, height, 8, false, false, false, distance);
+    }
+
+    /** {@link #encodeToTarget} over the full input space of {@link #encode}. */
+    public static byte[] encodeToTarget(int[][] planes, int width, int height, int bits,
+            boolean grey, boolean alpha, boolean alphaAssociated, float distance)
+            throws IOException {
         float d = Math.max(0.1f, distance);
         // expected weighted mean absolute sRGB error at this distance
         double target = 0.9 * Math.pow(d, 0.9);
@@ -114,8 +147,8 @@ public final class VarDctEncoder {
         double bestMiss = Double.MAX_VALUE;
         float tryD = d;
         for (int round = 0; round < 3; round++) {
-            byte[] jxl = encode(rgb, width, height, tryD);
-            double err = measureError(rgb, width, height, jxl);
+            byte[] jxl = encode(planes, width, height, bits, grey, alpha, alphaAssociated, tryD);
+            double err = measureError(planes, width, height, bits, grey, jxl);
             double miss = Math.abs(Math.log(Math.max(err, 1e-3) / target));
             if (miss < bestMiss) {
                 bestMiss = miss;
@@ -134,25 +167,34 @@ public final class VarDctEncoder {
         return best;
     }
 
-    /** Weighted mean absolute error (G counted twice) after a self-decode. */
-    private static double measureError(int[][] rgb, int width, int height, byte[] jxl)
-            throws IOException {
+    /**
+     * Weighted mean absolute colour error (G counted twice) after a
+     * self-decode, normalised to the 8-bit scale the target model uses.
+     */
+    private static double measureError(int[][] planes, int width, int height, int bits,
+            boolean grey, byte[] jxl) throws IOException {
         com.ebremer.jpegxl.decoder.JxlImage image =
                 com.ebremer.jpegxl.decoder.JxlDecoder.decode(jxl);
         int[][] out = image.frames.get(0).channels;
         long sum = 0;
         int n = width * height;
-        for (int i = 0; i < n; i++) {
-            sum += Math.abs(out[0][i] - rgb[0][i])
-                    + 2L * Math.abs(out[1][i] - rgb[1][i])
-                    + Math.abs(out[2][i] - rgb[2][i]);
+        if (grey) {
+            for (int i = 0; i < n; i++) {
+                sum += 4L * Math.abs(out[0][i] - planes[0][i]);
+            }
+        } else {
+            for (int i = 0; i < n; i++) {
+                sum += Math.abs(out[0][i] - planes[0][i])
+                        + 2L * Math.abs(out[1][i] - planes[1][i])
+                        + Math.abs(out[2][i] - planes[2][i]);
+            }
         }
-        return sum / (4.0 * n);
+        return sum / (4.0 * n) * (255.0 / ((1 << bits) - 1));
     }
 
     // --------------------------------------------------------------- colour
 
-    private void toXyb(int[][] rgb, ImageMetadata meta) {
+    private void toXyb(int[][] planes, ImageMetadata meta) {
         // forward opsin: invert the decoder's (matrix * itScale)
         float itScale = 255f / meta.intensityTarget;
         double[] inv = new double[9];
@@ -163,6 +205,7 @@ public final class VarDctEncoder {
         double[] bias = {meta.opsinBias[0], meta.opsinBias[1], meta.opsinBias[2]};
         double[] cbrtBias = {Math.cbrt(bias[0]), Math.cbrt(bias[1]), Math.cbrt(bias[2])};
 
+        double maxVal = (1 << bits) - 1;
         for (int c = 0; c < 3; c++) {
             xyb[c] = new float[paddedWidth * paddedHeight];
         }
@@ -171,9 +214,9 @@ public final class VarDctEncoder {
             for (int x = 0; x < paddedWidth; x++) {
                 int sx = Math.min(x, width - 1);
                 int i = sy * width + sx;
-                double r = srgbToLinear(rgb[0][i] / 255.0);
-                double g = srgbToLinear(rgb[1][i] / 255.0);
-                double b = srgbToLinear(rgb[2][i] / 255.0);
+                double r = srgbToLinear(planes[0][i] / maxVal);
+                double g = grey ? r : srgbToLinear(planes[1][i] / maxVal);
+                double b = grey ? r : srgbToLinear(planes[2][i] / maxVal);
                 double mixL = fwd[0] * r + fwd[1] * g + fwd[2] * b;
                 double mixM = fwd[3] * r + fwd[4] * g + fwd[5] * b;
                 double mixS = fwd[6] * r + fwd[7] * g + fwd[8] * b;
@@ -472,7 +515,7 @@ public final class VarDctEncoder {
         // ---- sections (bit-contiguous in the single-section case)
         if (single) {
             BitWriter one = new BitWriter();
-            writeLfGlobalBits(one);
+            writeLfGlobalBits(one, true);
             writeLfGroupBits(one, 0, lfCols, w8, h8);
             writeHfGlobalBits(one, hfEnc, numGroups);
             for (int i = 0; i < groupCtx[0].length; i++) {
@@ -490,7 +533,7 @@ public final class VarDctEncoder {
         }
 
         BitWriter lfg = new BitWriter();
-        writeLfGlobalBits(lfg);
+        writeLfGlobalBits(lfg, false);
         lfg.zeroPadToByte();
         byte[] lfGlobalBytes = lfg.toByteArray();
         byte[][] lfGroupBytes = new byte[numLfGroups][];
@@ -510,6 +553,9 @@ public final class VarDctEncoder {
             // no hf preset bits with a single preset
             for (int i = 0; i < groupCtx[g].length; i++) {
                 hfEnc.write(gw, groupCtx[g][i], groupVal[g][i]);
+            }
+            if (alphaPlane != null) {
+                writeGroupAlpha(gw, g, groupColumns);
             }
             gw.zeroPadToByte();
             passBytes[g] = gw.toByteArray();
@@ -620,7 +666,7 @@ public final class VarDctEncoder {
         }
     }
 
-    private void writeLfGlobalBits(BitWriter w) {
+    private void writeLfGlobalBits(BitWriter w, boolean single) {
         w.writeBool(true);   // LfChannelDequantization.all_default
         if (globalScale <= 2048) {
             w.write(0, 2);
@@ -643,7 +689,98 @@ public final class VarDctEncoder {
         w.write(0, 16);      // base correlation B = 0 (no implicit Y contribution)
         w.write(128, 8);     // x factor LF
         w.write(128, 8);     // b factor LF
-        w.writeBool(false);  // no global MA tree
+        if (alphaPlane == null) {
+            w.writeBool(false); // no global MA tree; no modular channels either
+            return;
+        }
+        w.writeBool(true);   // global tree present
+        if (single) {
+            // the alpha channel fits the global stream: a learned tree and
+            // real code here, the tokens right after the stream header
+            AlphaCode a = buildAlphaCode(alphaPlane, width, height);
+            EntropyEncoder treeEnc = new EntropyEncoder(6, false, false, true);
+            JxlEncoder.emitTree(a.tree, null, treeEnc);
+            EntropyEncoder litProbe = new EntropyEncoder(a.numCtx, true, true);
+            JxlEncoder.countLiterals(a.buf, litProbe);
+            litProbe.prepareCosts();
+            JxlEncoder.findMatches(a.buf, width, litProbe);
+            EntropyEncoder dataEnc = new EntropyEncoder(a.numCtx, true, true, true);
+            JxlEncoder.emitBuffer(a.buf, null, dataEnc, width);
+            treeEnc.writeSpec(w);
+            JxlEncoder.emitTree(a.tree, w, treeEnc);
+            treeEnc.finishSection(w);
+            dataEnc.writeSpec(w);
+            w.writeBool(true);  // use_global_tree
+            w.writeBool(true);  // default weighted-predictor parameters
+            w.write(0, 2);      // nb_transforms = 0
+            JxlEncoder.emitBuffer(a.buf, w, dataEnc, width);
+            dataEnc.finishSection(w);
+        } else {
+            // alpha is bigger than a group: nothing is coded globally, so a
+            // trivial one-leaf tree and an empty code satisfy the reader
+            JxlEncoder.TNode leaf = new JxlEncoder.TNode();
+            leaf.predictor = 5; // gradient
+            EntropyEncoder treeEnc = new EntropyEncoder(6, false);
+            JxlEncoder.emitTree(leaf, null, treeEnc);
+            treeEnc.writeSpec(w);
+            JxlEncoder.emitTree(leaf, w, treeEnc);
+            EntropyEncoder dataEnc = new EntropyEncoder(1, true, true);
+            dataEnc.writeSpec(w); // nothing is coded against it
+            w.writeBool(true);  // use_global_tree
+            w.writeBool(true);  // default weighted-predictor parameters
+            w.write(0, 2);      // nb_transforms = 0
+        }
+    }
+
+    /** A learned modular code for one alpha rectangle. */
+    private static final class AlphaCode {
+        JxlEncoder.TNode tree;
+        int numCtx;
+        JxlEncoder.TokenBuf buf;
+    }
+
+    private static AlphaCode buildAlphaCode(int[] px, int aw, int ah) {
+        JxlEncoder.Chan c = new JxlEncoder.Chan(aw, ah, px);
+        JxlEncoder.choosePredictor(c);
+        java.util.List<int[]> rect = java.util.List.of(new int[] {0, 0, aw, ah});
+        JxlEncoder.TNode sub = JxlEncoder.learnTree(c, null, rect, 1 << 14, 4);
+        JxlEncoder.refineLeaves(c, sub, null, rect);
+        AlphaCode a = new AlphaCode();
+        a.tree = sub;
+        a.numCtx = JxlEncoder.assignCtx(sub);
+        a.buf = new JxlEncoder.TokenBuf();
+        JxlEncoder.tokenizeRect(c, sub, null, 0, 0, aw, ah, a.buf);
+        return a;
+    }
+
+    /** Writes one group's alpha crop as a self-contained modular sub-stream. */
+    private void writeGroupAlpha(BitWriter gw, int g, int groupColumns) {
+        int x0 = (g % groupColumns) * GROUP_DIM;
+        int y0 = (g / groupColumns) * GROUP_DIM;
+        int w = Math.min(GROUP_DIM, width - x0);
+        int h = Math.min(GROUP_DIM, height - y0);
+        int[] px = new int[w * h];
+        for (int y = 0; y < h; y++) {
+            System.arraycopy(alphaPlane, (y0 + y) * width + x0, px, y * w, w);
+        }
+        AlphaCode a = buildAlphaCode(px, w, h);
+        gw.writeBool(false); // use_global_tree = false: the section is standalone
+        gw.writeBool(true);  // default weighted-predictor parameters
+        gw.write(0, 2);      // nb_transforms = 0
+        EntropyEncoder treeEnc = new EntropyEncoder(6, false, false, true);
+        JxlEncoder.emitTree(a.tree, null, treeEnc);
+        treeEnc.writeSpec(gw);
+        JxlEncoder.emitTree(a.tree, gw, treeEnc);
+        treeEnc.finishSection(gw);
+        EntropyEncoder litProbe = new EntropyEncoder(a.numCtx, true, true);
+        JxlEncoder.countLiterals(a.buf, litProbe);
+        litProbe.prepareCosts();
+        JxlEncoder.findMatches(a.buf, w, litProbe);
+        EntropyEncoder dataEnc = new EntropyEncoder(a.numCtx, true, true, true);
+        JxlEncoder.emitBuffer(a.buf, null, dataEnc, w);
+        dataEnc.writeSpec(gw);
+        JxlEncoder.emitBuffer(a.buf, gw, dataEnc, w);
+        dataEnc.finishSection(gw);
     }
 
     private void writeLfGroupBits(BitWriter w, int gg, int lfCols, int w8, int h8) {
@@ -716,11 +853,17 @@ public final class VarDctEncoder {
         out.writeU64(128);           // flags: skip adaptive LF smoothing
         // xyb encoded => no do_YCbCr bit
         out.write(0, 2);             // log upsampling
+        if (alphaPlane != null) {
+            out.write(0, 2);         // extra channel upsampling
+        }
         out.write(2, 3);             // x_qm_scale = 2
         out.write(2, 3);             // b_qm_scale = 2
         out.write(0, 2);             // num_passes = 1
         out.writeBool(false);        // have_crop
-        out.write(0, 2);             // blend mode: replace
+        int blendEntries = 1 + (alphaPlane != null ? 1 : 0);
+        for (int i = 0; i < blendEntries; i++) {
+            out.write(0, 2);         // blend mode: replace (full frame -> no source)
+        }
         out.writeBool(true);         // is_last
         out.write(0, 2);             // name length
         out.writeBool(false);        // RestorationFilter not all_default

@@ -57,6 +57,81 @@ class VarDctEncoderTest {
     }
 
     @Test
+    void greyThroughVarDct() throws Exception {
+        int w = 300;
+        int h = 260;
+        int[][] grey = new int[1][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                grey[0][y * w + x] = (int) (120 + 80 * Math.sin(x * 0.04) * Math.cos(y * 0.03));
+            }
+        }
+        byte[] jxl = VarDctEncoder.encode(grey, w, h, 8, true, false, false, 1.0f);
+        JxlImage image = JxlDecoder.decode(jxl);
+        JxlFrame frame = image.frames.get(0);
+        assertEquals(1, frame.channels.length, "grey output has one channel");
+        long sum = 0;
+        for (int i = 0; i < w * h; i++) {
+            sum += Math.abs(frame.channels[0][i] - grey[0][i]);
+        }
+        assertTrue(sum / (double) (w * h) <= 1.5, "mean diff " + sum / (double) (w * h));
+    }
+
+    @Test
+    void sixteenBitThroughVarDct() throws Exception {
+        int w = 300;
+        int h = 260;
+        int[][] rgb = photo(w, h);
+        int[][] wide = new int[3][w * h];
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < w * h; i++) {
+                wide[c][i] = rgb[c][i] * 257; // 8-bit values widened to 16
+            }
+        }
+        byte[] jxl = VarDctEncoder.encode(wide, w, h, 16, false, false, false, 1.0f);
+        JxlImage image = JxlDecoder.decode(jxl);
+        JxlFrame frame = image.frames.get(0);
+        long sum = 0;
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < w * h; i++) {
+                sum += Math.abs(frame.channels[c][i] - wide[c][i]);
+            }
+        }
+        double mean8 = sum / (double) (w * h * 3) / 257.0;
+        assertTrue(mean8 <= 1.5, "mean diff (8-bit scale) " + mean8);
+    }
+
+    @Test
+    void alphaRidesLosslesslyBothLayouts() throws Exception {
+        for (int[] dims : new int[][] {{200, 160}, {640, 400}}) { // single- and multi-group
+            int w = dims[0];
+            int h = dims[1];
+            int[][] rgb = photo(w, h);
+            int[][] planes = {rgb[0], rgb[1], rgb[2], new int[w * h]};
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    planes[3][y * w + x] = x < w / 3 ? 255 : (x < 2 * w / 3 ? 128 : (y & 63));
+                }
+            }
+            byte[] jxl = VarDctEncoder.encode(planes, w, h, 8, false, true, false, 1.0f);
+            JxlImage image = JxlDecoder.decode(jxl);
+            JxlFrame frame = image.frames.get(0);
+            assertEquals(4, frame.channels.length, "colour + alpha");
+            for (int i = 0; i < w * h; i++) {
+                assertEquals(planes[3][i], frame.channels[3][i],
+                        w + "x" + h + " alpha sample " + i);
+            }
+            long sum = 0;
+            for (int c = 0; c < 3; c++) {
+                for (int i = 0; i < w * h; i++) {
+                    sum += Math.abs(frame.channels[c][i] - rgb[c][i]);
+                }
+            }
+            assertTrue(sum / (double) (w * h * 3) <= 1.5, "mean colour diff at " + w + "x" + h);
+        }
+    }
+
+    @Test
     void djxlDecodesOurLossyOutput() throws Exception {
         assumeTrue(JxlTools.available(), "djxl not available");
         int w = 200;
