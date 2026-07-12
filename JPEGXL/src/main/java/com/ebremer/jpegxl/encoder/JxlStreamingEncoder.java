@@ -135,14 +135,49 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         return Math.min(JxlEncoder.GROUP_DIM, height - bandIndex * JxlEncoder.GROUP_DIM);
     }
 
-    /** Compresses every group of the completed band, in parallel. */
+    /**
+     * Compresses every group of the completed band, in parallel — but with
+     * the worker count bounded by the heap: each in-flight group holds
+     * roughly 10-20 MB of transients (pixel copies, transform candidates,
+     * token buffers), so unbounded fan-out would break the bounded-memory
+     * contract on small heaps.
+     */
     private void encodeBand(int bandH) {
         int gRow = bandIndex;
-        java.util.stream.IntStream.range(0, groupColumns).parallel().forEach(gc -> {
+        int workers = bandWorkers();
+        java.util.function.IntConsumer one = gc -> {
             int x0 = gc * JxlEncoder.GROUP_DIM;
             int w = Math.min(JxlEncoder.GROUP_DIM, width - x0);
             sections[gRow * groupColumns + gc] = encodeGroup(x0, w, bandH);
-        });
+        };
+        if (workers <= 1 || groupColumns == 1) {
+            for (int gc = 0; gc < groupColumns; gc++) {
+                one.accept(gc);
+            }
+            return;
+        }
+        if (workers >= Runtime.getRuntime().availableProcessors()) {
+            java.util.stream.IntStream.range(0, groupColumns).parallel().forEach(one);
+            return;
+        }
+        java.util.concurrent.ForkJoinPool pool = new java.util.concurrent.ForkJoinPool(workers);
+        try {
+            pool.submit(() ->
+                    java.util.stream.IntStream.range(0, groupColumns).parallel().forEach(one))
+                    .join();
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    /** Parallelism that keeps band + per-worker transients inside the heap. */
+    private int bandWorkers() {
+        long perWorker = 20L << 20;
+        long bandBytes = 4L * numInput * width * Math.min(JxlEncoder.GROUP_DIM, height);
+        long reserve = (64L << 20) + bandBytes;
+        long budget = Runtime.getRuntime().maxMemory() - reserve;
+        int byMemory = (int) Math.max(1, Math.min(Integer.MAX_VALUE, budget / perWorker));
+        return Math.min(Runtime.getRuntime().availableProcessors(), byMemory);
     }
 
     /** One self-contained pass-group section from the current band. */

@@ -144,9 +144,12 @@ cropped result; reference, LF and preview frames always decode whole.
   the achieved error; the ImageIO quality knob uses the latter.
 - **Streaming (chunked) lossless encoding**: `JxlStreamingEncoder` consumes
   rows top to bottom and compresses each 256-row band of groups as it
-  completes, so peak memory is one band plus the compressed sections — the
-  image never has to fit in memory (nor under the 2³¹ samples-per-plane
-  array limit). Each group is a self-contained section with its own RCT,
+  completes, so peak memory is one band plus the compressed sections and a
+  bounded set of per-group working buffers (encoding parallelism adapts to
+  the available heap) — the image never has to fit in memory (nor under
+  the 2³¹ samples-per-plane array limit): an 8192×8192 RGB image (768 MB
+  of samples) streams through a 200 MB heap. Each group is a
+  self-contained section with its own RCT,
   predictors, learned tree and entropy code; files are typically a few
   percent larger than `JxlEncoder.encode`'s.
 - **JPEG → JPEG XL recompression**: `JpegRecompressor.encode(jpegBytes)`
