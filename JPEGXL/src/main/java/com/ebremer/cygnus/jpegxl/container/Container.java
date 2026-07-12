@@ -251,6 +251,91 @@ public final class Container {
         return found ? out.toByteArray() : null;
     }
 
+    /**
+     * Wraps a codestream with optional metadata boxes: an {@code Exif} box
+     * (the payload is the raw TIFF stream; the 4-byte zero tiff-header
+     * offset required by 18181-2 is prepended here), an {@code xml } box
+     * carrying an XMP packet, or both. With {@code compressMetadata} each
+     * metadata box is wrapped in a {@code brob} box; this library's Brotli
+     * writer emits uncompressed metablocks, so that trades a few header
+     * bytes for exercising the standard compressed-box path, not for size.
+     */
+    public static byte[] wrap(byte[] codestream, byte[] exif, byte[] xmp,
+            boolean compressMetadata) {
+        return wrap(codestream, exif, xmp, null, compressMetadata);
+    }
+
+    /** {@link #wrap(byte[], byte[], byte[], boolean)} plus a gain-map box. */
+    public static byte[] wrap(byte[] codestream, byte[] exif, byte[] xmp,
+            GainMap gainMap, boolean compressMetadata) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.writeBytes(SIGNATURE_BOX);
+        out.writeBytes(FTYP_BOX);
+        if (exif != null) {
+            byte[] payload = new byte[exif.length + 4]; // tiff header offset 0
+            System.arraycopy(exif, 0, payload, 4, exif.length);
+            writeMetaBox(out, "Exif", payload, compressMetadata);
+        }
+        if (xmp != null) {
+            writeMetaBox(out, "xml ", xmp, compressMetadata);
+        }
+        if (gainMap != null) {
+            try {
+                writeBox(out, "jhgm", gainMap.toBytes());
+            } catch (IOException e) {
+                throw new IllegalArgumentException("unserialisable gain map", e);
+            }
+        }
+        writeBox(out, "jxlc", codestream);
+        return out.toByteArray();
+    }
+
+    private static void writeMetaBox(ByteArrayOutputStream out, String type, byte[] payload,
+            boolean compress) {
+        if (!compress) {
+            writeBox(out, type, payload);
+            return;
+        }
+        byte[] compressed = com.ebremer.cygnus.jpegxl.brotli.Brotli.encodeRaw(payload);
+        byte[] inner = new byte[compressed.length + 4];
+        inner[0] = (byte) type.charAt(0);
+        inner[1] = (byte) type.charAt(1);
+        inner[2] = (byte) type.charAt(2);
+        inner[3] = (byte) type.charAt(3);
+        System.arraycopy(compressed, 0, inner, 4, compressed.length);
+        writeBox(out, "brob", inner);
+    }
+
+    private static void writeBox(ByteArrayOutputStream out, String type, byte[] payload) {
+        long size = payload.length + 8L;
+        out.write((int) (size >>> 24));
+        out.write((int) (size >>> 16));
+        out.write((int) (size >>> 8));
+        out.write((int) size);
+        out.write(type.charAt(0));
+        out.write(type.charAt(1));
+        out.write(type.charAt(2));
+        out.write(type.charAt(3));
+        out.writeBytes(payload);
+    }
+
+    /**
+     * The Exif TIFF stream of a container ({@code Exif} box payload with its
+     * tiff-header offset applied), or null.
+     */
+    public static byte[] exifPayload(byte[] data) throws IOException {
+        byte[] raw = findBox(data, "Exif");
+        if (raw == null || raw.length < 4) {
+            return null;
+        }
+        long offset = u32be(raw, 0);
+        long start = 4 + offset;
+        if (start > raw.length) {
+            return null;
+        }
+        return java.util.Arrays.copyOfRange(raw, (int) start, raw.length);
+    }
+
     /** Wraps a bare codestream into a minimal box container (jxlc). */
     public static byte[] wrap(byte[] codestream) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();

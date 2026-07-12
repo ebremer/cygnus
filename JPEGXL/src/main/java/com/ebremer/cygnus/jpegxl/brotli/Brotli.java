@@ -32,6 +32,33 @@ public final class Brotli {
         return lastPartial;
     }
 
+    /**
+     * Encodes {@code data} as a valid RFC 7932 stream of uncompressed
+     * metablocks (no actual compression): the standard wrapper for payloads
+     * this library writes into {@code brob} boxes and jbrd blobs.
+     */
+    public static byte[] encodeRaw(byte[] data) {
+        com.ebremer.cygnus.jpegxl.io.BitWriter w = new com.ebremer.cygnus.jpegxl.io.BitWriter();
+        w.write(0, 1); // WBITS = 16
+        int pos = 0;
+        while (pos < data.length) {
+            int chunk = Math.min(data.length - pos, 1 << 16);
+            w.write(0, 1);          // ISLAST = 0
+            w.write(0, 2);          // MNIBBLES code 0 -> 4 nibbles
+            w.write(chunk - 1, 16); // MLEN - 1
+            w.write(1, 1);          // ISUNCOMPRESSED
+            w.zeroPadToByte();
+            for (int i = 0; i < chunk; i++) {
+                w.write(data[pos + i] & 0xff, 8);
+            }
+            pos += chunk;
+        }
+        w.write(1, 1); // ISLAST
+        w.write(1, 1); // ISLASTEMPTY
+        w.zeroPadToByte();
+        return w.toByteArray();
+    }
+
     public static byte[] decode(byte[] data, int maxOutput) throws IOException {
         return decode(data, 0, data.length, maxOutput);
     }

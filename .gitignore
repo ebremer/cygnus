@@ -5,3 +5,4 @@ test-data/
 *.iml
 .vscode/
 TODO.md
+.claude

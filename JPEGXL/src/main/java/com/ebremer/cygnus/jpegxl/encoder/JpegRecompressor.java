@@ -600,25 +600,7 @@ public final class JpegRecompressor {
 
     /** RFC 7932 stream of uncompressed metablocks (bit-packed LSB first). */
     static byte[] brotliRaw(byte[] data) {
-        BitWriter w = new BitWriter();
-        w.write(0, 1); // WBITS = 16
-        int pos = 0;
-        while (pos < data.length) {
-            int chunk = Math.min(data.length - pos, 1 << 16);
-            w.write(0, 1);          // ISLAST = 0
-            w.write(0, 2);          // MNIBBLES code 0 -> 4 nibbles
-            w.write(chunk - 1, 16); // MLEN - 1
-            w.write(1, 1);          // ISUNCOMPRESSED
-            w.zeroPadToByte();
-            for (int i = 0; i < chunk; i++) {
-                w.write(data[pos + i] & 0xff, 8);
-            }
-            pos += chunk;
-        }
-        w.write(1, 1); // ISLAST
-        w.write(1, 1); // ISLASTEMPTY
-        w.zeroPadToByte();
-        return w.toByteArray();
+        return com.ebremer.cygnus.jpegxl.brotli.Brotli.encodeRaw(data);
     }
 
     // --------------------------------------------------------------- helpers

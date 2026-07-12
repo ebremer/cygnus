@@ -31,6 +31,9 @@ public final class VarDctEncoder {
     private static final int NUM_BLOCK_CLUSTERS = 15;
     private static final int[] C_MAP = {1, 0, 2};
 
+    private static final boolean NO_FILTERS = Boolean.getBoolean("jxl.enc.nofilters");
+    private static final boolean NO_CFL = Boolean.getBoolean("jxl.enc.nocfl");
+
     private static final TransformType DCT8 = TransformType.byType(0);
     private static final TransformType DCT16 = TransformType.byType(4);
 
@@ -51,6 +54,12 @@ public final class VarDctEncoder {
     private final float[] scaledDequant = new float[3];
     private final float[] baseSfc = new float[3];   // before the block multiplier
     private final float[][][] weightsOf;            // [parameterIndex][channel]
+
+    // chroma-from-luma tile factors (64x64 pixel tiles, decoder scale /84)
+    private int tilesX;
+    private int tilesY;
+    private int[] xFromY;
+    private int[] bFromY;
 
     // decided by quantiseAll()
     private byte[] blockType;   // per 8x8 cell: transform type at origins, -1 covered
@@ -83,6 +92,103 @@ public final class VarDctEncoder {
         weightsOf = dequant.weights;
 
         toXyb(planes, meta);
+        inverseGaborish();
+    }
+
+    /**
+     * Pre-sharpens the XYB planes so the decoder's gaborish convolution
+     * lands back on the source: x is refined so gab(x) = original, three
+     * fixed-point steps of x += original - gab(x). Kernel and edge clamping
+     * mirror the decoder's.
+     */
+    private void inverseGaborish() {
+        if (NO_FILTERS) {
+            return;
+        }
+        float w1 = 0.115169525f;
+        float w2 = 0.061248592f;
+        float mult = 1f / (1f + 4f * (w1 + w2));
+        float base = mult;
+        float adjW = w1 * mult;
+        float diagW = w2 * mult;
+        int w = paddedWidth;
+        int h = paddedHeight;
+        int lastX = w - 1;
+        float[] g = new float[w * h];
+        for (int c = 0; c < 3; c++) {
+            float[] target = xyb[c];
+            float[] x = target.clone();
+            for (int iter = 0; iter < 3; iter++) {
+                for (int y = 0; y < h; y++) {
+                    int row = y * w;
+                    int rowN = (y == 0 ? y : y - 1) * w;
+                    int rowS = (y + 1 >= h ? y : y + 1) * w;
+                    for (int px = 0; px < w; px++) {
+                        int wx = px == 0 ? px : px - 1;
+                        int ex = px == lastX ? px : px + 1;
+                        float adj = x[row + wx] + x[row + ex] + x[rowN + px] + x[rowS + px];
+                        float diag = x[rowN + wx] + x[rowN + ex] + x[rowS + wx] + x[rowS + ex];
+                        g[row + px] = base * x[row + px] + adjW * adj + diagW * diag;
+                    }
+                }
+                for (int i = 0; i < x.length; i++) {
+                    x[i] += target[i] - g[i];
+                }
+            }
+            xyb[c] = x;
+        }
+    }
+
+    /**
+     * Per-64x64-tile chroma-from-luma factors from pixel-domain covariance
+     * (the DCT is linear, so the coefficient-domain relation matches): the
+     * least-squares k of chroma = k * luma with tile means removed, on the
+     * decoder's /84 scale.
+     */
+    private void computeCfl() {
+        tilesX = ceilDiv(paddedWidth, 64);
+        tilesY = ceilDiv(paddedHeight, 64);
+        xFromY = new int[tilesY * tilesX];
+        bFromY = new int[tilesY * tilesX];
+        if (NO_CFL) {
+            return;
+        }
+        for (int ty = 0; ty < tilesY; ty++) {
+            for (int tx = 0; tx < tilesX; tx++) {
+                int y1 = Math.min((ty + 1) * 64, paddedHeight);
+                int x1 = Math.min((tx + 1) * 64, paddedWidth);
+                double sy = 0;
+                double sx = 0;
+                double sb = 0;
+                double syy = 0;
+                double sxy = 0;
+                double syb = 0;
+                int n = 0;
+                for (int y = ty * 64; y < y1; y++) {
+                    int row = y * paddedWidth;
+                    for (int x = tx * 64; x < x1; x++) {
+                        double vy = xyb[1][row + x];
+                        double vx = xyb[0][row + x];
+                        double vb = xyb[2][row + x];
+                        sy += vy;
+                        sx += vx;
+                        sb += vb;
+                        syy += vy * vy;
+                        sxy += vy * vx;
+                        syb += vy * vb;
+                        n++;
+                    }
+                }
+                double varY = syy - sy * sy / n;
+                int t = ty * tilesX + tx;
+                if (varY > 1e-9) {
+                    double kx = (sxy - sy * sx / n) / varY;
+                    double kb = (syb - sy * sb / n) / varY;
+                    xFromY[t] = Math.max(-128, Math.min(127, (int) Math.round(kx * 84)));
+                    bFromY[t] = Math.max(-128, Math.min(127, (int) Math.round(kb * 84)));
+                }
+            }
+        }
     }
 
     /** Encodes 8-bit sRGB planes lossily; grey images pass the same plane thrice. */
@@ -301,6 +407,7 @@ public final class VarDctEncoder {
 
     /** Chooses transforms and multipliers and quantises every block. */
     private void quantiseAll(int w8, int h8) {
+        computeCfl();
         blockType = new byte[w8 * h8];
         java.util.Arrays.fill(blockType, (byte) -1);
         blockMul = new int[w8 * h8];
@@ -335,26 +442,44 @@ public final class VarDctEncoder {
         }
     }
 
-    /** Quantises one 8x8 block in every channel. */
+    private static final int[] Y_FIRST = {1, 0, 2};
+
+    /** The chroma-from-luma factor of visual channel {@code c} at a block. */
+    private float cflFactor(int c, int by, int bx) {
+        if (c == 1) {
+            return 0f;
+        }
+        int t = (by >> 3) * tilesX + (bx >> 3);
+        return (c == 0 ? xFromY[t] : bFromY[t]) / 84f;
+    }
+
+    /** Quantises one 8x8 block in every channel, luma first for CfL. */
     private void quantiseDct8(int by, int bx, int w8, float[] factor,
             float[] block, float[] coeffs, float[] s0, float[] s1) {
         int k = by * w8 + bx;
         int mul = clampMul(Math.round(hfMul * factor[k]));
         blockType[k] = 0;
         blockMul[k] = mul;
-        for (int c = 0; c < 3; c++) {
+        float[] dqY = new float[64];
+        for (int ci = 0; ci < 3; ci++) {
+            int c = Y_FIRST[ci];
             for (int y = 0; y < 8; y++) {
                 System.arraycopy(xyb[c], (by * 8 + y) * paddedWidth + bx * 8, block, y * 8, 8);
             }
             Dct.forward2D(block, 0, 8, coeffs, 0, 8, 8, 8, s0, s1);
             dcQuant[c][k] = Math.round(coeffs[0] / scaledDequant[c]);
             float sfc = baseSfc[c] / mul;
+            float cfl = cflFactor(c, by, bx);
             int[] q = new int[64];
             float[] wc = weightsOf[DCT8.parameterIndex][c];
             for (int j = 1; j < 64; j++) {
                 // natural coefficient (y,x) pairs with the transposed weight
                 int wIdx = (j & 7) * 8 + (j >> 3);
-                q[j] = Math.round(coeffs[j] / (sfc * wc[wIdx]));
+                float step = sfc * wc[wIdx];
+                q[j] = Math.round((coeffs[j] - cfl * dqY[j]) / step);
+                if (c == 1) {
+                    dqY[j] = q[j] * step;
+                }
             }
             hfQuant[c][k] = q;
         }
@@ -384,7 +509,11 @@ public final class VarDctEncoder {
         int[][][] q8 = new int[3][4][];
         int[][] dc8 = new int[3][4];
         int[][] dc16 = new int[3][4];
-        for (int c = 0; c < 3; c++) {
+        float[] dqY16 = new float[256];
+        float[][] dqY8 = new float[4][64];
+        for (int ci = 0; ci < 3; ci++) {
+            int c = Y_FIRST[ci];
+            float cfl = cflFactor(c, by, bx);
             // 16x16 candidate
             for (int y = 0; y < 16; y++) {
                 System.arraycopy(xyb[c], (by * 8 + y) * paddedWidth + bx * 8, block, y * 16, 16);
@@ -399,7 +528,11 @@ public final class VarDctEncoder {
                         continue; // LLF comes from the DC image
                     }
                     int j = y * 16 + x;
-                    q[j] = Math.round(c16[j] / (sfc16 * w16[x * 16 + y]));
+                    float step = sfc16 * w16[x * 16 + y];
+                    q[j] = Math.round((c16[j] - cfl * dqY16[j]) / step);
+                    if (c == 1) {
+                        dqY16[j] = q[j] * step;
+                    }
                     cost16 += tokenCost(q[j]);
                 }
             }
@@ -428,7 +561,11 @@ public final class VarDctEncoder {
                 int[] qq = new int[64];
                 for (int j = 1; j < 64; j++) {
                     int wIdx = (j & 7) * 8 + (j >> 3);
-                    qq[j] = Math.round(c8[i][j] / (sfc * wc[wIdx]));
+                    float step = sfc * wc[wIdx];
+                    qq[j] = Math.round((c8[i][j] - cfl * dqY8[i][j]) / step);
+                    if (c == 1) {
+                        dqY8[i][j] = qq[j] * step;
+                    }
                     cost8 += tokenCost(qq[j]);
                 }
                 q8[c][i] = qq;
@@ -831,6 +968,17 @@ public final class VarDctEncoder {
             metaPx[2][i] = types.get(i);
             metaPx[2][nbBlocks + i] = muls.get(i);
         }
+        for (int ty = 0; ty < tileH; ty++) {
+            for (int tx = 0; tx < tileW; tx++) {
+                int gt = (row * 32 + ty) * tilesX + col * 32 + tx;
+                metaPx[0][ty * tileW + tx] = xFromY[gt];
+                metaPx[1][ty * tileW + tx] = bFromY[gt];
+            }
+        }
+        if (!NO_FILTERS) {
+            // mid sharpness activates the decoder's EPF with distance-scaled sigma
+            java.util.Arrays.fill(metaPx[3], 4);
+        }
         ModularSub.write(w, metaPx,
                 new int[] {tileW, tileW, nbBlocks, bw},
                 new int[] {tileH, tileH, 2, bh});
@@ -866,10 +1014,14 @@ public final class VarDctEncoder {
         }
         out.writeBool(true);         // is_last
         out.write(0, 2);             // name length
-        out.writeBool(false);        // RestorationFilter not all_default
-        out.writeBool(false);        // gaborish off
-        out.write(0, 2);             // epf iterations = 0
-        out.writeU64(0);             // restoration filter extensions
+        if (NO_FILTERS) {
+            out.writeBool(false);    // RestorationFilter not all_default
+            out.writeBool(false);    // gaborish off
+            out.write(0, 2);         // epf iterations = 0
+            out.writeU64(0);         // restoration filter extensions
+        } else {
+            out.writeBool(true);     // RestorationFilter all_default: gaborish + EPF
+        }
         out.writeU64(0);             // frame header extensions
     }
 

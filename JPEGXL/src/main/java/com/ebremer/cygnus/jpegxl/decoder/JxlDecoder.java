@@ -80,7 +80,20 @@ public final class JxlDecoder {
     }
 
     public static JxlImage decode(byte[] file) throws IOException {
-        return decode(new CodestreamSource.ArraySource(Container.extractCodestream(file)));
+        JxlImage image = decode(new CodestreamSource.ArraySource(Container.extractCodestream(file)));
+        attachContainerMetadata(image, file);
+        return image;
+    }
+
+    private static void attachContainerMetadata(JxlImage image, byte[] file) throws IOException {
+        if (Container.isContainer(file)) {
+            image.exif = Container.exifPayload(file);
+            image.xmp = Container.findBox(file, "xml ");
+            byte[] jhgm = Container.findBox(file, "jhgm");
+            if (jhgm != null) {
+                image.gainMap = com.ebremer.cygnus.jpegxl.container.GainMap.parse(jhgm);
+            }
+        }
     }
 
     /** Decodes from an {@link javax.imageio.stream.ImageInputStream} without buffering the file. */
@@ -138,7 +151,10 @@ public final class JxlDecoder {
      * exact deep integers.
      */
     public static JxlImage decodeToFloats(byte[] file) throws IOException {
-        return decodeToFloats(new CodestreamSource.ArraySource(Container.extractCodestream(file)));
+        JxlImage image = decodeToFloats(
+                new CodestreamSource.ArraySource(Container.extractCodestream(file)));
+        attachContainerMetadata(image, file);
+        return image;
     }
 
     /** See {@link #decodeToFloats(byte[])}. */

@@ -13,6 +13,13 @@ public final class JxlImage {
     public final List<JxlFrame> frames;
     /** The decoded preview frame, or null when the image has none. */
     public JxlFrame preview;
+
+    /** Exif TIFF stream from the container, when decoded from bytes; else null. */
+    public byte[] exif;
+    /** XMP packet from the container's {@code xml } box, when present. */
+    public byte[] xmp;
+    /** Gain-map bundle from the container's {@code jhgm} box, when present. */
+    public com.ebremer.cygnus.jpegxl.container.GainMap gainMap;
     /**
      * Origin of the decoded frames in oriented image coordinates: (0, 0) for a
      * full decode; the requested rectangle's origin for a region decode, whose
