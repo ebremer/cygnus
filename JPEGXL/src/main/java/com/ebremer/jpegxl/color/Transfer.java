@@ -30,7 +30,8 @@ public final class Transfer {
                 double beta = 0.018053968510807;
                 double alpha = 1 + 5.5 * beta;
                 for (int i = 0; i < plane.length; i++) {
-                    float v = Math.max(plane[i], 0f);
+                    float v = plane[i];
+                    // negatives take the linear segment (unlike sRGB's mirror)
                     plane[i] = v < beta ? 4.5f * v
                             : (float) (alpha * Math.pow(v, 0.45) - (alpha - 1));
                 }
@@ -60,8 +61,9 @@ public final class Transfer {
     }
 
     public static float srgbFromLinear(float v) {
-        if (v <= 0f) {
-            return 0f;
+        if (v < 0f) {
+            // out-of-gamut values encode through the sign-mirrored curve
+            return -srgbFromLinear(-v);
         }
         if (v <= 0.0031308f) {
             return 12.92f * v;

@@ -42,6 +42,19 @@ anything that fans groups out in parallel must bound workers by heap
 heaps. Peak streaming-encode memory = band + compressed sections + 
 workers x ~20 MB.
 
+## Conformance corpus
+
+`test-data/conformance/` holds all 40 official testcases (655MB cache);
+`OfficialConformanceTest` validates against the corpus's own reference data
+(npy + ICC + reconstructed JPEGs) — no djxl needed. Objects download from
+`https://storage.googleapis.com/jxl-conformance/objects/<sha>` (shas listed
+in each test.json). For fast iteration on failures, write a standalone
+sweep (see the CorpusRun/DiffCase pattern: per-case pass/fail line, coarse
+error maps, per-phase RMS) instead of driving maven each cycle. References
+keep spot colours un-composited (`-Djxl.skipSpot=true`) and XYB-with-ICC
+images linear. Three cases have documented small deviations
+(KNOWN_DEVIATIONS in the test).
+
 ## Gotchas
 
 - `TYPE_BYTE_GRAY` is a linear colorspace: compare `raster.getSample`,

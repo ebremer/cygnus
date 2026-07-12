@@ -268,6 +268,12 @@ public final class ModularStream {
             steps.add(new Transform.Squeeze(true, false, first + 1, 2));
             steps.add(new Transform.Squeeze(false, false, first + 1, 2));
         }
+        // horizontal first on wide images; vertical first on tall AND square
+        // ones (libjxl DefaultSqueezeParameters: wide = w > h)
+        if (w <= h && h > 8) {
+            steps.add(new Transform.Squeeze(false, true, first, count));
+            h = (h + 1) / 2;
+        }
         while (w > 8 || h > 8) {
             if (w > 8) {
                 steps.add(new Transform.Squeeze(true, true, first, count));

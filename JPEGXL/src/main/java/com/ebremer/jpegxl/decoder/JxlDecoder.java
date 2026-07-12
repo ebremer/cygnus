@@ -117,16 +117,33 @@ public final class JxlDecoder {
     public static JxlImage decode(CodestreamSource src, java.awt.Rectangle region)
             throws IOException {
         if (region == null) {
-            return decodeImpl(src, null, false);
+            return decodeImpl(src, null, false, false);
         }
         try {
-            return decodeImpl(src, region, true);
+            return decodeImpl(src, region, true, false);
         } catch (RegionUnsupportedException e) {
             if (ModularStream.DEBUG) {
                 System.err.println("[jxl] region fallback: " + e.getMessage());
             }
-            return decodeImpl(src, region, false);
+            return decodeImpl(src, region, false, false);
         }
+    }
+
+    /**
+     * Decodes with every channel delivered as floats in
+     * {@link JxlFrame#floatChannels} (nominal range [0, 1] for integer
+     * images), skipping the final integer quantisation. Meant for
+     * conformance testing and QA against float references; integer images
+     * deeper than 24 bits lose precision here — use {@link #decode} for
+     * exact deep integers.
+     */
+    public static JxlImage decodeToFloats(byte[] file) throws IOException {
+        return decodeToFloats(new CodestreamSource.ArraySource(Container.extractCodestream(file)));
+    }
+
+    /** See {@link #decodeToFloats(byte[])}. */
+    public static JxlImage decodeToFloats(CodestreamSource src) throws IOException {
+        return decodeImpl(src, null, false, true);
     }
 
     /** A header parse that runs over a byte window of the codestream. */
@@ -201,7 +218,7 @@ public final class JxlDecoder {
     }
 
     public static JxlImage decode(CodestreamSource src) throws IOException {
-        return decodeImpl(src, null, false);
+        return decodeImpl(src, null, false, false);
     }
 
     /**
@@ -210,9 +227,10 @@ public final class JxlDecoder {
      *        decoded (may throw {@link RegionUnsupportedException}); when
      *        false with a non-null region, everything is decoded and the
      *        output is merely cropped
+     * @param floatOut deliver every output channel as floats
      */
     private static JxlImage decodeImpl(CodestreamSource src, java.awt.Rectangle requested,
-            boolean selective) throws IOException {
+            boolean selective, boolean floatOut) throws IOException {
         Prelude prelude = parsePrelude(src);
         SizeHeader size = prelude.size();
         ImageMetadata meta = prelude.meta();
@@ -250,7 +268,7 @@ public final class JxlDecoder {
                 }
                 colourTransform(r, meta);
                 preview = canvasToFrame(r.planes, r.exactInt, r.outColour,
-                        r.width, r.height, meta, 0, null);
+                        r.width, r.height, meta, 0, null, false);
             } catch (IOException e) {
                 preview = null; // previews are decorative; keep decoding the image
             }
@@ -310,7 +328,7 @@ public final class JxlDecoder {
                 canvasExact = null; // an intersection-free frame never covers the canvas
                 if (visible) {
                     frames.add(emitFrame(canvas, canvasExact, canvasColour, size, meta,
-                            fh.duration, csRegion));
+                            fh.duration, csRegion, floatOut));
                 }
                 if (fh.isLast) {
                     break;
@@ -390,7 +408,7 @@ public final class JxlDecoder {
             }
             if (visible) {
                 frames.add(emitFrame(canvas, canvasExact, canvasColour, size, meta,
-                        fh.duration, csRegion));
+                        fh.duration, csRegion, floatOut));
             }
             if (fh.isLast) {
                 break;
@@ -408,7 +426,8 @@ public final class JxlDecoder {
 
     /** Renders spot colours if any and emits the canvas (cropped to the region). */
     private static JxlFrame emitFrame(float[][] canvas, int[][] canvasExact, int canvasColour,
-            SizeHeader size, ImageMetadata meta, long duration, java.awt.Rectangle csRegion) {
+            SizeHeader size, ImageMetadata meta, long duration, java.awt.Rectangle csRegion,
+            boolean floatOut) {
         // spot colours are rendered at output only; the canvas and the
         // reference snapshots stay spot-free
         float[][] emit = canvas;
@@ -422,7 +441,7 @@ public final class JxlDecoder {
             emitExact = null;
         }
         return canvasToFrame(emit, emitExact, canvasColour,
-                size.width, size.height, meta, duration, csRegion);
+                size.width, size.height, meta, duration, csRegion, floatOut);
     }
 
     private static FrameResult copyResult(FrameResult r) {
@@ -506,6 +525,9 @@ public final class JxlDecoder {
             });
         }
 
+        if (state.vardct != null) {
+            state.vardct.adaptiveSmoothAll();
+        }
         if (state.gmodular != null) {
             state.gmodular.applyInverseTransforms();
         }
@@ -627,16 +649,17 @@ public final class JxlDecoder {
         }
 
         // a region decode filters only the rows of the selected groups; the
-        // margin keeps every region pixel out of the filters' edge erosion
+        // margin keeps every region pixel out of the filters' edge erosion.
+        // Filters mirror at the visible frame bounds, not the padded edge.
         int bandY0 = sel == null ? 0 : Math.min(filterH, sel.gy0() * fh.groupDim);
         int bandY1 = sel == null ? filterH : Math.min(filterH, sel.gy1() * fh.groupDim);
         if (fh.restorationFilter.gab) {
             RestorationFilters.gaborish(fh.restorationFilter, colorF, filterW, filterH,
-                    bandY0, bandY1);
+                    w, h, bandY0, bandY1);
         }
         if (fh.restorationFilter.epfIterations > 0) {
             RestorationFilters.epf(fh.restorationFilter, colorF, filterW, filterH,
-                    epfSigma, epfBlockStride, fh.restorationFilter.epfSigmaForModular,
+                    w, h, epfSigma, epfBlockStride, fh.restorationFilter.epfSigmaForModular,
                     bandY0, bandY1);
         }
 
@@ -921,20 +944,10 @@ public final class JxlDecoder {
         }
         new XybConverter(meta).invertXYB(r.planes[0], r.planes[1], r.planes[2]);
         if (meta.iccProfile != null) {
-            float[][] device = com.ebremer.jpegxl.color.IccApplier.fromLinearSrgb(
-                    r.planes[0], r.planes[1], r.planes[2], r.width, r.height, meta.iccProfile);
-            if (device != null) {
-                if (device.length == 1) {
-                    r.planes[0] = device[0];
-                    r.planes[1] = device[0];
-                    r.planes[2] = device[0];
-                } else {
-                    r.planes[0] = device[0];
-                    r.planes[1] = device[1];
-                    r.planes[2] = device[2];
-                }
-                return;
-            }
+            // XYB with an arbitrary embedded ICC: libjxl leaves the samples in
+            // linear sRGB primaries and attaches the profile as metadata (the
+            // conformance references are linear), so do the same
+            return;
         }
         for (int c = 0; c < 3; c++) {
             Transfer.fromLinear(meta.colourEncoding, r.planes[c]);
@@ -1009,6 +1022,17 @@ public final class JxlDecoder {
                     && ref.height == canvasHeight && ref.planes.length == canvas.length;
             float[] old = refIsCanvas ? ref.planes[c] : null;
 
+            // the canvas becomes the source reference frame (empty slots are
+            // black) with this frame's rectangle blended on top; only full
+            // frames may keep the running canvas implicitly
+            if (!fh.fullFrame && old != dst) {
+                if (old != null) {
+                    System.arraycopy(old, 0, dst, 0, dst.length);
+                } else {
+                    java.util.Arrays.fill(dst, 0f);
+                }
+            }
+
             int mode = info.mode();
             if (mode == FrameHeader.BLEND_REPLACE || (old == null && mode == FrameHeader.BLEND_ADD)) {
                 for (int y = 0; y < bh; y++) {
@@ -1078,7 +1102,8 @@ public final class JxlDecoder {
      * coordinates) to output planes: clamped ints, or floats as-is.
      */
     private static JxlFrame canvasToFrame(float[][] canvas, int[][] exact, int canvasColour,
-            int width, int height, ImageMetadata meta, long duration, java.awt.Rectangle crop) {
+            int width, int height, ImageMetadata meta, long duration, java.awt.Rectangle crop,
+            boolean floatOut) {
         int cx = crop == null ? 0 : crop.x;
         int cy = crop == null ? 0 : crop.y;
         int cw = crop == null ? width : crop.width;
@@ -1089,7 +1114,7 @@ public final class JxlDecoder {
             var depth = c < canvasColour
                     ? meta.bitDepth
                     : meta.extraChannels.get(c - canvasColour).bitDepth;
-            if (depth.floatingPoint) {
+            if (floatOut || depth.floatingPoint) {
                 float[] p = new float[cw * ch];
                 for (int y = 0; y < ch; y++) {
                     System.arraycopy(canvas[c], (cy + y) * width + cx, p, y * cw, cw);

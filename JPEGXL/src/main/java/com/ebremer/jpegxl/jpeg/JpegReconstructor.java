@@ -52,8 +52,10 @@ public final class JpegReconstructor {
         }
 
         JpegData jpg = JpegData.parse(jbrd, image.metadata.iccProfile, exif, xmp);
-        jpg.width = image.width;
-        jpg.height = image.height;
+        // JPEG dimensions are pre-orientation: use the frame's coded size,
+        // not the oriented image size (they differ for orientations 5-8)
+        jpg.width = capturedFh[0].width;
+        jpg.height = capturedFh[0].height;
         fillComponents(jpg, captured[0], capturedFh[0]);
         return new JpegWriter(jpg).write();
     }

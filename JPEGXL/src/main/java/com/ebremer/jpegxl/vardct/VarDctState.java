@@ -243,9 +243,8 @@ public final class VarDctState {
                 gg.lfDeq[2][k] += kB * y;
             }
         }
-        if (adaptiveSmoothing) {
-            adaptiveSmooth(gg);
-        }
+        // adaptive smoothing runs once all LF groups are in (it crosses
+        // LF-group boundaries); see adaptiveSmoothAll
         // LF context index per block
         gg.lfIndex = new int[gg.height8 * gg.width8];
         for (int by = 0; by < gg.height8; by++) {
@@ -270,25 +269,73 @@ public final class VarDctState {
         }
     }
 
-    private void adaptiveSmooth(LfGroupData gg) {
-        int w = gg.width8;
-        int h = gg.height8;
-        float[][] weighted = new float[3][w * h];
-        float[] gap = new float[w * h];
+    /**
+     * Adaptive DC smoothing over the whole DC image (libjxl semantics: the
+     * kernel crosses LF-group boundaries; only the image edges pass through).
+     * LF groups skipped by a region decode are left untouched, and pixels
+     * whose neighbourhood reaches into one are passed through.
+     */
+    public void adaptiveSmoothAll() {
+        if (fh.isSubsampled || (fh.flags & FrameHeader.FLAG_SKIP_ADAPTIVE_LF_SMOOTHING) != 0
+                || (fh.flags & FrameHeader.FLAG_USE_LF_FRAME) != 0) {
+            return;
+        }
+        int dcW = fh.paddedWidth >> 3;
+        int dcH = fh.paddedHeight >> 3;
+        if (dcW <= 2 || dcH <= 2) {
+            return;
+        }
+        // assemble the full DC planes (null where a region decode skipped)
+        float[][] dc = new float[3][];
+        boolean missing = false;
+        for (LfGroupData g : lfGroups) {
+            missing |= g == null || g.lfDeq[0] == null;
+        }
+        for (int c = 0; c < 3; c++) {
+            float[] full = new float[dcW * dcH];
+            if (missing) {
+                java.util.Arrays.fill(full, Float.NaN);
+            }
+            for (int gg = 0; gg < lfGroups.length; gg++) {
+                LfGroupData g = lfGroups[gg];
+                if (g == null || g.lfDeq[c] == null) {
+                    continue;
+                }
+                int gy = (gg / fh.lfGroupColumns) << 8;
+                int gx = (gg % fh.lfGroupColumns) << 8;
+                for (int y = 0; y < g.height8; y++) {
+                    System.arraycopy(g.lfDeq[c], y * g.width8, full,
+                            (gy + y) * dcW + gx, g.width8);
+                }
+            }
+            dc[c] = full;
+        }
+
+        float[][] smoothed = new float[3][dcW * dcH];
+        float[] gap = new float[dcW * dcH];
         java.util.Arrays.fill(gap, 0.5f);
-        for (int i = 0; i < 3; i++) {
-            float[] co = gg.lfDeq[i];
-            float sd = scaledDequant[i];
-            float[] wi = weighted[i];
-            for (int y = 1; y < h - 1; y++) {
-                for (int x = 1; x < w - 1; x++) {
-                    int k = y * w + x;
+        boolean[] pass = missing ? new boolean[dcW * dcH] : null;
+        for (int c = 0; c < 3; c++) {
+            float[] co = dc[c];
+            float sd = scaledDequant[c];
+            float[] sm = smoothed[c];
+            for (int y = 1; y < dcH - 1; y++) {
+                for (int x = 1; x < dcW - 1; x++) {
+                    int k = y * dcW + x;
                     float sample = co[k];
-                    float adjacent = co[k - 1] + co[k + 1] + co[k - w] + co[k + w];
-                    float diag = co[k - w - 1] + co[k - w + 1] + co[k + w - 1] + co[k + w + 1];
-                    wi[k] = 0.05226273532324128f * sample + 0.20345139757231578f * adjacent
+                    float adjacent = co[k - 1] + co[k + 1] + co[k - dcW] + co[k + dcW];
+                    float diag = co[k - dcW - 1] + co[k - dcW + 1]
+                            + co[k + dcW - 1] + co[k + dcW + 1];
+                    float wi = 0.05226273532324128f * sample
+                            + 0.20345139757231578f * adjacent
                             + 0.0334829185968739f * diag;
-                    float g = Math.abs(sample - wi[k]) * sd;
+                    if (pass != null && (wi != wi || sample != sample)) {
+                        pass[k] = true;
+                        continue;
+                    }
+                    sm[k] = wi;
+                    // the gap is measured in quantisation-step units
+                    float g = Math.abs(sample - wi) / sd;
                     if (g > gap[k]) {
                         gap[k] = g;
                     }
@@ -298,23 +345,36 @@ public final class VarDctState {
         for (int k = 0; k < gap.length; k++) {
             gap[k] = Math.max(0f, 3f - 4f * gap[k]);
         }
-        for (int i = 0; i < 3; i++) {
-            float[] co = gg.lfDeq[i];
-            float[] wi = weighted[i];
-            float[] out = new float[w * h];
-            for (int y = 0; y < h; y++) {
-                for (int x = 0; x < w; x++) {
-                    int k = y * w + x;
-                    if (y == 0 || y + 1 == h || x == 0 || x + 1 == w) {
-                        out[k] = co[k];
-                    } else {
-                        out[k] = (co[k] - wi[k]) * gap[k] + wi[k];
+        // interpolate and scatter back into the LF groups
+        for (int gg = 0; gg < lfGroups.length; gg++) {
+            LfGroupData g = lfGroups[gg];
+            if (g == null || g.lfDeq[0] == null) {
+                continue;
+            }
+            int gy = (gg / fh.lfGroupColumns) << 8;
+            int gx = (gg % fh.lfGroupColumns) << 8;
+            for (int c = 0; c < 3; c++) {
+                float[] co = dc[c];
+                float[] sm = smoothed[c];
+                float[] out = g.lfDeq[c];
+                for (int y = 0; y < g.height8; y++) {
+                    int fy = gy + y;
+                    for (int x = 0; x < g.width8; x++) {
+                        int fx = gx + x;
+                        int k = fy * dcW + fx;
+                        if (fy == 0 || fy + 1 == dcH || fx == 0 || fx + 1 == dcW
+                                || (pass != null && pass[k])) {
+                            continue; // image edges (and region borders) pass through
+                        }
+                        // smooth areas move toward the filtered value; large
+                        // gaps (edges) keep the coded DC
+                        out[y * g.width8 + x] = (sm[k] - co[k]) * gap[k] + co[k];
                     }
                 }
             }
-            gg.lfDeq[i] = out;
         }
     }
+
 
     /** Reads HF metadata (after the modular LF-group sub-stream). */
     public void readHfMetadata(Bits in, int ggIdx, ModularReader modularReader) throws IOException {
