@@ -303,7 +303,10 @@ public final class DequantMatrices {
                 if (x < 2 && y < 2) {
                     continue;
                 }
-                float pos = (AFV_FREQS[y * 4 + x] - low) / (high - low);
+                // interpolate() takes a band-scaled position: x(len-1)/max,
+                // with libjxl's +1e-6 keeping the top freq inside the last band
+                float pos = (AFV_FREQS[y * 4 + x] - low) * (bands.length - 1)
+                        / (high - low + 1e-6f);
                 weight[(2 * y) * 8 + 2 * x] = interpolate(pos, bands);
             }
             for (int x = 0; x < 8; x++) {

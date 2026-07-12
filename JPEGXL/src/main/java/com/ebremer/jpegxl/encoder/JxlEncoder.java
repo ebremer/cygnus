@@ -28,7 +28,6 @@ public final class JxlEncoder {
     static final int GROUP_DIM = 256;
     private static final int GROUP_SIZE_SHIFT_BITS = 1; // group_size_shift = 7 + 1 -> 256
     private static final int MAX_PALETTE = 1024;
-    private static final int MIN_RUN = 12;
 
     /** One coded modular channel. */
     static final class Chan {
@@ -50,6 +49,13 @@ public final class JxlEncoder {
         int[] val = new int[1 << 12];
         int n;
 
+        // LZ77 segmentation, computed once by findMatches
+        boolean matched;
+        int[] mPos = new int[0];
+        int[] mLen = new int[0];
+        int[] mVal = new int[0]; // distance token values
+        int nMatches;
+
         void add(int c, int v) {
             if (n == val.length) {
                 ctx = java.util.Arrays.copyOf(ctx, n * 2);
@@ -58,6 +64,19 @@ public final class JxlEncoder {
             ctx[n] = c;
             val[n] = v;
             n++;
+        }
+
+        void addMatch(int pos, int len, int distValue) {
+            if (nMatches == mPos.length) {
+                int cap = Math.max(16, nMatches * 2);
+                mPos = java.util.Arrays.copyOf(mPos, cap);
+                mLen = java.util.Arrays.copyOf(mLen, cap);
+                mVal = java.util.Arrays.copyOf(mVal, cap);
+            }
+            mPos[nMatches] = pos;
+            mLen[nMatches] = len;
+            mVal[nMatches] = distValue;
+            nMatches++;
         }
     }
 
@@ -74,8 +93,9 @@ public final class JxlEncoder {
     private final List<Chan> chans = new ArrayList<>();
     private int nbMeta;
     private int rctType = -1;    // coded RCT type, or -1 for none
-    private int[] paletteData;   // 3 x paletteSize colour components, or null
+    private int[] paletteData;   // paletteNumC x paletteSize components, or null
     private int paletteSize;
+    private int paletteNumC;     // channels folded into the palette
     private boolean prepared;
 
     private JxlEncoder(int[][] planes, int width, int height, int bits,
@@ -162,19 +182,24 @@ public final class JxlEncoder {
             return;
         }
         prepared = true;
-        if (!grey && tryPalette()) {
-            // palette meta channel + index channel (+ alpha)
+        paletteNumC = tryPalette();
+        if (paletteNumC > 0) {
+            // palette meta channel + index channel (+ channels left outside)
             nbMeta = 1;
             int[] index = input[0]; // reused as the index plane by tryPalette
-            chans.add(new Chan(paletteSize, 3, paletteData));
+            chans.add(new Chan(paletteSize, paletteNumC, paletteData));
             chans.add(new Chan(width, height, index));
-            if (alpha) {
-                chans.add(new Chan(width, height, input[3]));
+            for (int c = paletteNumC; c < numInput; c++) {
+                chans.add(new Chan(width, height, input[c]));
             }
         } else {
             if (!grey) {
-                rctType = selectRct();
-                forwardRct(rctType, input[0], input[1], input[2]);
+                int[][] rgb = {input[0], input[1], input[2]};
+                rctType = selectRct(rgb, width, height);
+                applyForwardRct(rctType, rgb);
+                input[0] = rgb[0];
+                input[1] = rgb[1];
+                input[2] = rgb[2];
                 if (rctType == 0) {
                     rctType = -1; // nothing to code
                 }
@@ -189,60 +214,105 @@ public final class JxlEncoder {
     }
 
     /**
-     * Builds a global palette when the image has few distinct colours.
-     * On success {@code input[0]} becomes the index plane.
+     * Builds a global palette when the image has few distinct sample tuples,
+     * folding as many channels as pay off: all channels first (so alpha or a
+     * grey plane rides along), colour-only as the fallback. Returns the
+     * number of folded channels (0 for no palette); on success
+     * {@code input[0]} becomes the index plane.
      */
-    private boolean tryPalette() {
+    private int tryPalette() {
+        if (bits > 16) {
+            return 0; // colour keys pack 16 bits per channel
+        }
+        if (tryPalette(numInput)) {
+            return numInput;
+        }
+        if (!grey && alpha && tryPalette(3)) {
+            return 3;
+        }
+        return 0;
+    }
+
+    private boolean tryPalette(int m) {
         Map<Long, Integer> colours = new HashMap<>();
-        int[] r = input[0];
-        int[] g = input[1];
-        int[] b = input[2];
-        for (int i = 0; i < r.length; i++) {
-            long key = ((long) r[i] << 32) | ((long) g[i] << 16) | b[i];
+        int n = width * height;
+        for (int i = 0; i < n; i++) {
+            long key = 0;
+            for (int c = 0; c < m; c++) {
+                key |= (long) input[c][i] << (16 * c);
+            }
             if (colours.size() >= MAX_PALETTE && !colours.containsKey(key)) {
                 return false;
             }
             colours.putIfAbsent(key, colours.size());
         }
-        if (colours.size() < 2 || colours.size() >= r.length / 4) {
+        if (colours.size() < 2 || colours.size() >= n / 4) {
             return false;
         }
         // sort by luma-ish value so neighbouring indices have similar colours
+        int lumaChannels = Math.min(m, 3);
         Long[] sorted = colours.keySet().toArray(Long[]::new);
-        java.util.Arrays.sort(sorted, (x, y) -> {
-            long lx = 2 * ((x >>> 16) & 0xffff) + (x >>> 32) + (x & 0xffff);
-            long ly = 2 * ((y >>> 16) & 0xffff) + (y >>> 32) + (y & 0xffff);
-            return Long.compare(lx, ly);
-        });
+        java.util.Arrays.sort(sorted, (x, y) -> Long.compare(lumaKey(x, lumaChannels),
+                lumaKey(y, lumaChannels)));
         paletteSize = sorted.length;
-        paletteData = new int[3 * paletteSize];
+        paletteData = new int[m * paletteSize];
         for (int i = 0; i < paletteSize; i++) {
             long key = sorted[i];
-            paletteData[i] = (int) (key >>> 32);
-            paletteData[paletteSize + i] = (int) ((key >>> 16) & 0xffff);
-            paletteData[2 * paletteSize + i] = (int) (key & 0xffff);
+            for (int c = 0; c < m; c++) {
+                paletteData[c * paletteSize + i] = (int) ((key >>> (16 * c)) & 0xffff);
+            }
             colours.put(key, i);
         }
-        for (int i = 0; i < r.length; i++) {
-            long key = ((long) r[i] << 32) | ((long) g[i] << 16) | b[i];
-            r[i] = colours.get(key);
+        int[] index = input[0];
+        for (int i = 0; i < n; i++) {
+            long key = 0;
+            for (int c = 0; c < m; c++) {
+                key |= (long) input[c][i] << (16 * c);
+            }
+            index[i] = colours.get(key);
         }
         return true;
     }
 
-    /** Picks the cheapest RCT type among the unpermuted ones (0..6). */
-    private int selectRct() {
+    private static long lumaKey(long key, int lumaChannels) {
+        if (lumaChannels < 3) {
+            return key & 0xffff;
+        }
+        return (key & 0xffff) + 2 * ((key >>> 16) & 0xffff) + ((key >>> 32) & 0xffff);
+    }
+
+    /** The decoder's RCT channel permutations, indexed by {@code type / 7}. */
+    static final int[][] RCT_PERMUTATIONS = {
+        {0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {1, 0, 2}, {2, 1, 0},
+    };
+
+    /**
+     * Picks the cheapest RCT type over all permuted variants (0..41) by a
+     * row-sampled gradient-cost estimate. Pure permutations (type % 7 == 0,
+     * type > 0) are skipped: the per-channel cost sum is permutation-invariant,
+     * so they can never beat type 0.
+     */
+    static int selectRct(int[][] rgb, int width, int height) {
+        int stride = height > 512 ? 3 : 1; // sample rows on large images
         int best = 0;
         long bestCost = Long.MAX_VALUE;
-        int[] c0 = new int[width * height];
-        int[] c1 = new int[width * height];
-        int[] c2 = new int[width * height];
-        for (int type = 0; type <= 6; type++) {
-            System.arraycopy(input[0], 0, c0, 0, c0.length);
-            System.arraycopy(input[1], 0, c1, 0, c1.length);
-            System.arraycopy(input[2], 0, c2, 0, c2.length);
-            forwardRct(type, c0, c1, c2);
-            long cost = gradientCost(c0) + gradientCost(c1) + gradientCost(c2);
+        int[][] cur = {new int[width], new int[width], new int[width]};
+        int[][] prev = {new int[width], new int[width], new int[width]};
+        for (int type = 0; type < 42; type++) {
+            if (type > 0 && type % 7 == 0) {
+                continue;
+            }
+            long cost = 0;
+            for (int y = 0; y < height; y += stride) {
+                transformRow(type, rgb, y, width, cur);
+                boolean hasN = y > 0;
+                if (hasN) {
+                    transformRow(type, rgb, y - 1, width, prev);
+                }
+                for (int c = 0; c < 3; c++) {
+                    cost += rowGradientCost(cur[c], hasN ? prev[c] : null, width);
+                }
+            }
             if (cost < bestCost) {
                 bestCost = cost;
                 best = type;
@@ -251,25 +321,44 @@ public final class JxlEncoder {
         return best;
     }
 
-    /** Approximate coded size of a plane under the gradient predictor. */
-    private long gradientCost(int[] px) {
+    /** Copies row {@code y} of the permuted channels and applies the pointwise RCT. */
+    private static void transformRow(int type, int[][] rgb, int y, int width, int[][] out) {
+        int[] perm = RCT_PERMUTATIONS[type / 7];
+        int off = y * width;
+        for (int c = 0; c < 3; c++) {
+            System.arraycopy(rgb[perm[c]], off, out[c], 0, width);
+        }
+        forwardRct(type % 7, out[0], out[1], out[2]);
+    }
+
+    private static long rowGradientCost(int[] row, int[] rowN, int width) {
         long cost = 0;
-        int stride = height > 512 ? 3 : 1; // sample rows on large images
-        for (int y = 0; y < height; y += stride) {
-            int row = y * width;
-            int rowN = row - width;
-            for (int x = 0; x < width; x++) {
-                long vW = x > 0 ? px[row + x - 1] : (y > 0 ? px[rowN + x] : 0);
-                long vN = y > 0 ? px[rowN + x] : vW;
-                long vNW = (x > 0 && y > 0) ? px[rowN + x - 1] : vW;
-                long lo = Math.min(vW, vN);
-                long hi = Math.max(vW, vN);
-                long pred = Math.min(Math.max(lo, vW + vN - vNW), hi);
-                int packed = packSigned((int) (px[row + x] - pred));
-                cost += 32 - Integer.numberOfLeadingZeros(packed + 1);
-            }
+        for (int x = 0; x < width; x++) {
+            long vW = x > 0 ? row[x - 1] : (rowN != null ? rowN[x] : 0);
+            long vN = rowN != null ? rowN[x] : vW;
+            long vNW = (x > 0 && rowN != null) ? rowN[x - 1] : vW;
+            long lo = Math.min(vW, vN);
+            long hi = Math.max(vW, vN);
+            long pred = Math.min(Math.max(lo, vW + vN - vNW), hi);
+            int packed = packSigned((int) (row[x] - pred));
+            cost += 32 - Integer.numberOfLeadingZeros(packed + 1);
         }
         return cost;
+    }
+
+    /**
+     * Applies the full coded RCT (permutation then arithmetic) in place:
+     * {@code planes[0..2]} become the coded channels in coded order.
+     */
+    static void applyForwardRct(int type, int[][] planes) {
+        int[] perm = RCT_PERMUTATIONS[type / 7];
+        int[] a = planes[perm[0]];
+        int[] b = planes[perm[1]];
+        int[] c = planes[perm[2]];
+        forwardRct(type % 7, a, b, c);
+        planes[0] = a;
+        planes[1] = b;
+        planes[2] = c;
     }
 
     /** Approximate coded size of a channel under the weighted predictor. */
@@ -405,10 +494,38 @@ public final class JxlEncoder {
             List<int[]> rects = i < numGlobal
                     ? List.of(new int[] {0, 0, c.w, c.h})
                     : groupRects(c, groupColumns, numGroups);
-            subs.put(c, learnTree(c, refPlane(refOf, i), rects));
+            TNode sub = learnTree(c, refPlane(refOf, i), rects);
+            refineLeaves(c, sub, refPlane(refOf, i), rects);
+            subs.put(c, sub);
         }
         TNode tree = buildTree(numGlobal, subs);
         int numCtx = assignCtx(tree);
+
+        // LZ77 distance multipliers, mirroring the decoder's per-stream rule
+        int globalDistMult = 0;
+        for (int i = 0; i < chans.size(); i++) {
+            Chan c = chans.get(i);
+            if (i >= nbMeta && (c.w > GROUP_DIM || c.h > GROUP_DIM)) {
+                break;
+            }
+            if (c.w > 0 && c.h > 0) {
+                globalDistMult = Math.max(globalDistMult, c.w);
+            }
+        }
+        globalDistMult = Math.min(globalDistMult, 1 << 21);
+        int[] groupDistMult = new int[single ? 0 : numGroups];
+        for (int g = 0; g < groupDistMult.length; g++) {
+            int gx = (g % groupColumns) * GROUP_DIM;
+            int gy = (g / groupColumns) * GROUP_DIM;
+            for (int i = numGlobal; i < chans.size(); i++) {
+                Chan c = chans.get(i);
+                int w = Math.min(GROUP_DIM, c.w - gx);
+                int h = Math.min(GROUP_DIM, c.h - gy);
+                if (w > 0 && h > 0) {
+                    groupDistMult[g] = Math.max(groupDistMult[g], w);
+                }
+            }
+        }
 
         // ---- tokenize all sections
         TokenBuf globalBuf = new TokenBuf();
@@ -429,31 +546,42 @@ public final class JxlEncoder {
             groupBufs[g] = buf;
         }
 
+        // ---- LZ77 match search against literal-only statistics
+        EntropyEncoder litProbe = new EntropyEncoder(numCtx, true, true);
+        countLiterals(globalBuf, litProbe);
+        for (TokenBuf b : groupBufs) {
+            countLiterals(b, litProbe);
+        }
+        litProbe.prepareCosts();
+        findMatches(globalBuf, globalDistMult, Boolean.getBoolean("jxl.enc.lz77legacy") ? null : litProbe);
+        java.util.stream.IntStream.range(0, groupBufs.length).parallel()
+                .forEach(g -> findMatches(groupBufs[g], groupDistMult[g], Boolean.getBoolean("jxl.enc.lz77legacy") ? null : litProbe));
+
         // ---- per-group local trees where they beat the global code
         byte[][] localBytes = new byte[groupBufs.length][];
         if (groupBufs.length >= 2 && chans.size() > numGlobal
                 && !Boolean.getBoolean("jxl.enc.simpletree")) {
             EntropyEncoder probe = new EntropyEncoder(numCtx, true, true);
-            emitBuffer(globalBuf, null, probe);
-            for (TokenBuf buf : groupBufs) {
-                emitBuffer(buf, null, probe);
+            emitBuffer(globalBuf, null, probe, globalDistMult);
+            for (int g = 0; g < groupBufs.length; g++) {
+                emitBuffer(groupBufs[g], null, probe, groupDistMult[g]);
             }
             probe.prepareCosts();
             List<Chan> groupChans = List.copyOf(chans.subList(numGlobal, chans.size()));
             int numGlobalF = numGlobal;
             java.util.stream.IntStream.range(0, groupBufs.length).parallel().forEach(g ->
                     localBytes[g] = tryLocalGroup(g, groupColumns, numGlobalF, groupChans,
-                            refOf, groupBufs[g], probe));
+                            refOf, groupBufs[g], probe, groupDistMult[g]));
         }
 
         // ---- pass 1: histograms (local groups keep their own code)
-        EntropyEncoder treeEnc = new EntropyEncoder(6, false);
+        EntropyEncoder treeEnc = new EntropyEncoder(6, false, false, true);
         emitTree(tree, null, treeEnc);
-        EntropyEncoder dataEnc = new EntropyEncoder(numCtx, true, true);
-        emitBuffer(globalBuf, null, dataEnc);
+        EntropyEncoder dataEnc = new EntropyEncoder(numCtx, true, true, true);
+        emitBuffer(globalBuf, null, dataEnc, globalDistMult);
         for (int g = 0; g < groupBufs.length; g++) {
             if (localBytes[g] == null) {
-                emitBuffer(groupBufs[g], null, dataEnc);
+                emitBuffer(groupBufs[g], null, dataEnc, groupDistMult[g]);
             }
         }
 
@@ -463,9 +591,11 @@ public final class JxlEncoder {
         lfGlobal.writeBool(true); // global tree present
         treeEnc.writeSpec(lfGlobal);
         emitTree(tree, lfGlobal, treeEnc);
+        treeEnc.finishSection(lfGlobal);
         dataEnc.writeSpec(lfGlobal);
         writeGroupHeader(lfGlobal);
-        emitBuffer(globalBuf, lfGlobal, dataEnc);
+        emitBuffer(globalBuf, lfGlobal, dataEnc, globalDistMult);
+        dataEnc.finishSection(lfGlobal);
         lfGlobal.zeroPadToByte();
         byte[] lfGlobalBytes = lfGlobal.toByteArray();
 
@@ -480,7 +610,8 @@ public final class JxlEncoder {
             gw.writeBool(true); // use_global_tree
             gw.writeBool(true); // default wp
             gw.write(0, 2);     // nb_transforms = 0
-            emitBuffer(groupBufs[g], gw, dataEnc);
+            emitBuffer(groupBufs[g], gw, dataEnc, groupDistMult[g]);
+            dataEnc.finishSection(gw);
             gw.zeroPadToByte();
             groupBytes[g] = gw.toByteArray();
         }
@@ -505,6 +636,10 @@ public final class JxlEncoder {
         for (byte[] g : groupBytes) {
             out.writeBytes(g);
         }
+        if (LZ_STATS) {
+            System.err.printf("[lz] matches=%d copiedTokens=%d estSavedBits=%d%n",
+                    statMatches.get(), statCopied.get(), statSaved.get());
+        }
     }
 
     /** GroupHeader of the global modular stream, including the transforms. */
@@ -516,7 +651,15 @@ public final class JxlEncoder {
             w.write(1, 2);  // transform id: palette
             w.write(0, 2);  // begin_c selector 0
             w.write(0, 3);  // begin_c = 0
-            w.write(1, 2);  // num_c selector 1 -> 3
+            switch (paletteNumC) { // num_c: U32(1, 3, 4, 1 + u(13))
+                case 1 -> w.write(0, 2);
+                case 3 -> w.write(1, 2);
+                case 4 -> w.write(2, 2);
+                default -> {
+                    w.write(3, 2);
+                    w.write(paletteNumC - 1, 13);
+                }
+            }
             if (paletteSize < 256) {
                 w.write(0, 2);
                 w.write(paletteSize, 8);
@@ -547,9 +690,12 @@ public final class JxlEncoder {
         } else if (rctType < 4) {
             w.write(1, 2);
             w.write(rctType, 2);
-        } else {
+        } else if (rctType < 18) {
             w.write(2, 2);
             w.write(rctType - 2, 4);
+        } else {
+            w.write(3, 2);
+            w.write(rctType - 10, 6);
         }
     }
 
@@ -629,6 +775,8 @@ public final class JxlEncoder {
         Chan chan;       // leaf channel
         int predictor;   // leaf predictor
         int ctx;         // leaf context id, assigned in BFS order
+        int offset;      // leaf residual offset
+        int multiplier = 1; // leaf residual multiplier
     }
 
     static TNode leafNode(Chan c) {
@@ -708,9 +856,10 @@ public final class JxlEncoder {
             } else {
                 emitToken(out, enc, 1, 0); // leaf marker
                 emitToken(out, enc, 2, n.predictor);
-                emitToken(out, enc, 3, 0); // offset
-                emitToken(out, enc, 4, 0); // multiplier log
-                emitToken(out, enc, 5, 0); // multiplier bits
+                emitToken(out, enc, 3, packSigned(n.offset));
+                int shift = Integer.numberOfTrailingZeros(n.multiplier);
+                emitToken(out, enc, 4, shift);
+                emitToken(out, enc, 5, (n.multiplier >>> shift) - 1);
             }
         }
     }
@@ -723,31 +872,185 @@ public final class JxlEncoder {
         }
     }
 
-    /** Emits a buffered section, collapsing runs into LZ77 copies. */
-    static void emitBuffer(TokenBuf buf, BitWriter out, EntropyEncoder enc) {
+    /** Counts every token of a buffer as a literal (LZ77 cost probing). */
+    static void countLiterals(TokenBuf buf, EntropyEncoder enc) {
+        for (int i = 0; i < buf.n; i++) {
+            enc.count(buf.ctx[i], buf.val[i]);
+        }
+    }
+
+    /** Emits a buffered section, replaying its LZ77 segmentation. */
+    static void emitBuffer(TokenBuf buf, BitWriter out, EntropyEncoder enc, int distMult) {
+        findMatches(buf, distMult, null);
+        int m = 0;
         int i = 0;
         while (i < buf.n) {
-            if (i > 0) {
-                int prev = buf.val[i - 1];
-                int r = 0;
-                while (i + r < buf.n && buf.val[i + r] == prev) {
-                    r++;
+            if (m < buf.nMatches && buf.mPos[m] == i) {
+                if (out == null) {
+                    enc.countCopy(buf.ctx[i], buf.mLen[m], buf.mVal[m]);
+                } else {
+                    enc.writeCopy(out, buf.ctx[i], buf.mLen[m], buf.mVal[m]);
                 }
-                if (r >= MIN_RUN) {
-                    if (out == null) {
-                        enc.countCopy(buf.ctx[i], r);
-                    } else {
-                        enc.writeCopy(out, buf.ctx[i], r);
-                    }
-                    i += r;
-                    continue;
-                }
+                i += buf.mLen[m];
+                m++;
+                continue;
             }
             if (out == null) {
                 enc.count(buf.ctx[i], buf.val[i]);
             } else {
                 enc.write(out, buf.ctx[i], buf.val[i]);
             }
+            i++;
+        }
+    }
+
+    static final boolean LZ_STATS = Boolean.getBoolean("jxl.enc.lzstats");
+    static final java.util.concurrent.atomic.AtomicLong statMatches = new java.util.concurrent.atomic.AtomicLong();
+    static final java.util.concurrent.atomic.AtomicLong statCopied = new java.util.concurrent.atomic.AtomicLong();
+    static final java.util.concurrent.atomic.AtomicLong statSaved = new java.util.concurrent.atomic.AtomicLong();
+
+    private static final int LZ_WINDOW = 1 << 20;
+    private static final int LZ_HASH_BITS = 16;
+    private static final int LZ_MAX_CHAIN = 48;
+
+    private static int lzHash(int[] v, int i) {
+        int h = v[i] * 0x9E3779B1 + v[i + 1] * 0x85EBCA77 + v[i + 2] * 0xC2B2AE3D;
+        return h >>> (32 - LZ_HASH_BITS);
+    }
+
+    private static int bitLen(int packed) {
+        return 32 - Integer.numberOfLeadingZeros(packed + 1);
+    }
+
+    /**
+     * Greedy hash-chain LZ77 matcher over a section's token values. Matches
+     * may overlap their own output (the decoder copies value by value) and
+     * cross channel boundaries. A copy is kept only when its cost under
+     * {@code costs} (a literal-only histogram probe, so never-seen copy
+     * symbols price in their own rarity) undercuts the real entropy cost of
+     * the literals it replaces. The segmentation is cached so the counting
+     * and writing passes replay identical decisions; with {@code costs} null
+     * only conservative same-value runs are emitted.
+     */
+    static void findMatches(TokenBuf buf, int distMult, EntropyEncoder costs) {
+        if (buf.matched) {
+            return;
+        }
+        buf.matched = true;
+        int n = buf.n;
+        if (n < 8) {
+            return;
+        }
+        int[] val = buf.val;
+        if (costs == null) {
+            // legacy conservative mode: long same-value runs only
+            int i = 1;
+            while (i < n) {
+                int prev = val[i - 1];
+                int r = 0;
+                while (i + r < n && val[i + r] == prev) {
+                    r++;
+                }
+                if (r >= 12) {
+                    buf.addMatch(i, r, 1);
+                    i += r;
+                } else {
+                    i += Math.max(1, r);
+                }
+            }
+            return;
+        }
+        int[] head = new int[1 << LZ_HASH_BITS];
+        java.util.Arrays.fill(head, -1);
+        int[] prev = new int[n];
+        var special = EntropyEncoder.specialDistanceValues(distMult);
+        int i = 0;
+        while (i + 3 <= n) {
+            int maxLen = n - i;
+            // seed with the same-value run: distance 1 is by far the cheapest
+            int bestLen = 0;
+            int bestDist = 0;
+            if (i > 0 && val[i] == val[i - 1]) {
+                int l = 1;
+                while (l < maxLen && val[i + l] == val[i - 1]) {
+                    l++;
+                }
+                bestLen = l;
+                bestDist = 1;
+            }
+            // a qualifying run is essentially free to code: skip the search
+            int cand = bestDist == 1 && bestLen >= 12 ? -1 : head[lzHash(val, i)];
+            int chain = LZ_MAX_CHAIN;
+            while (cand >= 0 && chain-- > 0 && i - cand <= LZ_WINDOW) {
+                // a distance-1 best costs almost nothing: beat it clearly
+                int need = bestLen + (bestDist == 1 ? 3 : 0);
+                if (need >= maxLen) {
+                    break;
+                }
+                if (val[cand + need] != val[i + need]) {
+                    cand = prev[cand];
+                    continue;
+                }
+                int l = 0;
+                while (l < maxLen && val[cand + l] == val[i + l]) {
+                    l++;
+                }
+                if (l > need) {
+                    bestLen = l;
+                    bestDist = i - cand;
+                    if (l == maxLen) {
+                        break;
+                    }
+                }
+                cand = prev[cand];
+            }
+            if (bestLen >= EntropyEncoder.MIN_LENGTH) {
+                Integer sv = special.get(bestDist);
+                int dv = sv != null ? sv : bestDist + 119;
+                // the literal-only probe has an empty distance context, which
+                // would underprice the distance token: floor the copy cost
+                double copyBits = Math.max(costs.copyCostBits(buf.ctx[i], bestLen, dv), 28);
+                double bar = copyBits + 96;
+                double litBits = 0;
+                for (int k = 0; k < bestLen && litBits <= bar; k++) {
+                    litBits += costs.tokenCostBits(buf.ctx[i + k], val[i + k]);
+                }
+                boolean accept = (bestDist == 1 && bestLen >= 12)
+                        || (bestLen >= 48 && litBits > bar);
+                // lazy guard: don't let a far match swallow an imminent
+                // same-value run, which codes for a fraction of the cost
+                if (accept && bestDist != 1 && i + 1 < n && val[i + 1] == val[i]) {
+                    int r = 1;
+                    int cap = Math.min(maxLen - 1, bestLen);
+                    while (r < cap && val[i + 1 + r] == val[i]) {
+                        r++;
+                    }
+                    if (r * 2 >= bestLen) {
+                        accept = false;
+                    }
+                }
+                if (accept) {
+                    if (LZ_STATS) {
+                        statMatches.incrementAndGet();
+                        statCopied.addAndGet(bestLen);
+                        statSaved.addAndGet((long) (litBits - copyBits));
+                    }
+                    buf.addMatch(i, bestLen, dv);
+                    int matchEnd = i + bestLen;
+                    int hashEnd = Math.min(matchEnd, n - 2);
+                    while (i < hashEnd) {
+                        int h = lzHash(val, i);
+                        prev[i] = head[h];
+                        head[h] = i;
+                        i++;
+                    }
+                    i = matchEnd;
+                    continue;
+                }
+            }
+            int h = lzHash(val, i);
+            prev[i] = head[h];
+            head[h] = i;
             i++;
         }
     }
@@ -787,7 +1090,10 @@ public final class JxlEncoder {
                             vW, vN, vNW, vNE, vNN, wp);
                     n = val > n.split ? n.left : n.right;
                 }
-                int residual = (int) (px[row + x] - pred);
+                int residual = (int) (px[row + x] - pred) - n.offset;
+                if (n.multiplier != 1) {
+                    residual /= n.multiplier;
+                }
                 buf.add(n.ctx, packSigned(residual));
                 if (wp != null) {
                     wp.afterPredict(x, y, px[row + x]);
@@ -842,6 +1148,156 @@ public final class JxlEncoder {
             }
             default -> 0;
         };
+    }
+
+    // ------------------------------------------------- leaf offset/multiplier
+
+    /** Residual statistics of one leaf, gathered over every pixel it codes. */
+    private static final class LeafStat {
+        long count;
+        int first;
+        long gcd;              // gcd of (residual - first)
+        int min = Integer.MAX_VALUE;
+        int max = Integer.MIN_VALUE;
+        final int[] sample = new int[512];
+        int nSample;
+
+        void add(int r) {
+            if (count == 0) {
+                first = r;
+            } else {
+                gcd = gcd(gcd, Math.abs((long) r - first));
+            }
+            min = Math.min(min, r);
+            max = Math.max(max, r);
+            if (nSample < sample.length) {
+                sample[nSample++] = r;
+            } else if ((count & 127) == 0) {
+                sample[(int) ((count >>> 7) % sample.length)] = r;
+            }
+            count++;
+        }
+
+        private static long gcd(long a, long b) {
+            while (b != 0) {
+                long t = a % b;
+                a = b;
+                b = t;
+            }
+            return a;
+        }
+    }
+
+    /**
+     * Chooses per-leaf residual offsets and multipliers for one channel's
+     * subtree: a full pixel walk (identical to {@link #tokenizeRect})
+     * accumulates each leaf's residual gcd and a sampled distribution; leaves
+     * whose residuals share a factor divide it out, and biased distributions
+     * are re-centred. Must run before tokenization.
+     */
+    static void refineLeaves(Chan ch, TNode sub, int[] ref, List<int[]> rects) {
+        java.util.IdentityHashMap<TNode, LeafStat> stats = new java.util.IdentityHashMap<>();
+        int[] px = ch.px;
+        int stride = ch.w;
+        for (int[] r : rects) {
+            int x0 = r[0];
+            int y0 = r[1];
+            int w = r[2];
+            int h = r[3];
+            WpState wp = ch.predictor == 6 ? new WpState(WpState.WpParams.DEFAULT, w) : null;
+            for (int y = 0; y < h; y++) {
+                int row = (y0 + y) * stride + x0;
+                int rowN = row - stride;
+                for (int x = 0; x < w; x++) {
+                    int vW = x > 0 ? px[row + x - 1] : (y > 0 ? px[rowN + x] : 0);
+                    int vN = y > 0 ? px[rowN + x] : vW;
+                    int vNW = (x > 0 && y > 0) ? px[rowN + x - 1] : vW;
+                    int vNE = (x + 1 < w && y > 0) ? px[rowN + x + 1] : vN;
+                    int vNN = y > 1 ? px[row - 2 * stride + x] : vN;
+                    long pred;
+                    if (wp != null) {
+                        wp.beforePredict(x, y, vW, vN, vNW, vNE, vNN);
+                        pred = wp.prediction();
+                    } else {
+                        pred = ModularStream.clampedGradient(vW, vN, vNW);
+                    }
+                    TNode n = sub;
+                    while (n.prop >= 0) {
+                        int val = propValue(n.prop, px, ref, row, rowN, x, y,
+                                vW, vN, vNW, vNE, vNN, wp);
+                        n = val > n.split ? n.left : n.right;
+                    }
+                    stats.computeIfAbsent(n, k -> new LeafStat())
+                            .add((int) (px[row + x] - pred));
+                    if (wp != null) {
+                        wp.afterPredict(x, y, px[row + x]);
+                    }
+                }
+            }
+        }
+        stats.forEach(JxlEncoder::chooseLeafParams);
+    }
+
+    private static void chooseLeafParams(TNode leaf, LeafStat s) {
+        if (s.count < 64) {
+            return;
+        }
+        // int arithmetic must stay exact: skip extreme residual ranges where
+        // 32-bit wrap could break the divisibility guarantee
+        if (s.min < -(1 << 30) || s.max > (1 << 30)) {
+            return;
+        }
+        int mult = 1;
+        int off = 0;
+        long g = s.gcd;
+        if (g > 1 && g <= (1 << 30)) {
+            mult = (int) g;
+            off = (int) (((long) s.first % mult + mult) % mult);
+            if (off * 2 > mult) {
+                off -= mult;
+            }
+        }
+        // re-centre by whole multiplier steps against the sampled quotients
+        int n = s.nSample;
+        long[] q = new long[n];
+        for (int i = 0; i < n; i++) {
+            q[i] = ((long) s.sample[i] - off) / mult;
+        }
+        java.util.Arrays.sort(q);
+        long med = q[n / 2];
+        if (med >= Integer.MIN_VALUE && med <= Integer.MAX_VALUE) {
+            long best = sampleCost(q, 0);
+            long bestK = 0;
+            for (long k = med - 1; k <= med + 1; k++) {
+                if (k == 0) {
+                    continue;
+                }
+                long c = sampleCost(q, k) + 8; // emission overhead margin
+                if (c < best) {
+                    best = c;
+                    bestK = k;
+                }
+            }
+            long shifted = off + bestK * mult;
+            if (shifted >= -(1 << 30) && shifted <= (1 << 30)) {
+                off = (int) shifted;
+            }
+        }
+        if (mult == 1 && off == 0) {
+            return;
+        }
+        leaf.offset = off;
+        leaf.multiplier = mult;
+    }
+
+    private static long sampleCost(long[] q, long k) {
+        long bits = 0;
+        for (long v : q) {
+            long d = v - k;
+            long packed = d >= 0 ? 2 * d : -2 * d - 1;
+            bits += 64 - Long.numberOfLeadingZeros(packed + 1);
+        }
+        return bits;
     }
 
     // ---------------------------------------------------------- tree learning
@@ -1117,24 +1573,22 @@ public final class JxlEncoder {
      * projected cost of coding the group against the global histograms.
      */
     private byte[] tryLocalGroup(int g, int groupColumns, int numGlobal,
-            List<Chan> groupChans, int[] refOf, TokenBuf globalTokens, EntropyEncoder probe) {
+            List<Chan> groupChans, int[] refOf, TokenBuf globalTokens, EntropyEncoder probe,
+            int distMult) {
         if (globalTokens.n == 0) {
             return null;
         }
+        findMatches(globalTokens, distMult, null); // already cached from writeFrame
         double globalBits = 0;
+        int m = 0;
         int i = 0;
         while (i < globalTokens.n) {
-            if (i > 0) {
-                int prev = globalTokens.val[i - 1];
-                int r = 0;
-                while (i + r < globalTokens.n && globalTokens.val[i + r] == prev) {
-                    r++;
-                }
-                if (r >= MIN_RUN) {
-                    globalBits += probe.copyCostBits(globalTokens.ctx[i], r);
-                    i += r;
-                    continue;
-                }
+            if (m < globalTokens.nMatches && globalTokens.mPos[m] == i) {
+                globalBits += probe.copyCostBits(globalTokens.ctx[i],
+                        globalTokens.mLen[m], globalTokens.mVal[m]);
+                i += globalTokens.mLen[m];
+                m++;
+                continue;
             }
             globalBits += probe.tokenCostBits(globalTokens.ctx[i], globalTokens.val[i]);
             i++;
@@ -1151,7 +1605,11 @@ public final class JxlEncoder {
             int h = Math.min(GROUP_DIM, c.h - gy);
             List<int[]> rect = w > 0 && h > 0
                     ? List.of(new int[] {gx, gy, w, h}) : List.of();
-            localSubs.put(c, learnTree(c, refPlane(refOf, numGlobal + k), rect, 1 << 13, 3));
+            TNode sub = learnTree(c, refPlane(refOf, numGlobal + k), rect, 1 << 13, 3);
+            if (!rect.isEmpty()) {
+                refineLeaves(c, sub, refPlane(refOf, numGlobal + k), rect);
+            }
+            localSubs.put(c, sub);
         }
         TNode localTree = chainNode(groupChans, groupChans.size() - 1, localSubs);
         int numCtxLocal = assignCtx(localTree);
@@ -1161,18 +1619,24 @@ public final class JxlEncoder {
             tokenizeRect(c, localSubs.get(c), refPlane(refOf, numGlobal + k), gx, gy,
                     Math.min(GROUP_DIM, c.w - gx), Math.min(GROUP_DIM, c.h - gy), buf);
         }
+        EntropyEncoder localLit = new EntropyEncoder(numCtxLocal, true, true);
+        countLiterals(buf, localLit);
+        localLit.prepareCosts();
+        findMatches(buf, distMult, Boolean.getBoolean("jxl.enc.lz77legacy") ? null : localLit);
         BitWriter gw = new BitWriter();
         gw.writeBool(false); // use_global_tree = false: a local tree follows
         gw.writeBool(true);  // default wp
         gw.write(0, 2);      // nb_transforms = 0
-        EntropyEncoder treeEnc = new EntropyEncoder(6, false);
+        EntropyEncoder treeEnc = new EntropyEncoder(6, false, false, true);
         emitTree(localTree, null, treeEnc);
         treeEnc.writeSpec(gw);
         emitTree(localTree, gw, treeEnc);
-        EntropyEncoder dataEnc = new EntropyEncoder(numCtxLocal, true, true);
-        emitBuffer(buf, null, dataEnc);
+        treeEnc.finishSection(gw);
+        EntropyEncoder dataEnc = new EntropyEncoder(numCtxLocal, true, true, true);
+        emitBuffer(buf, null, dataEnc, distMult);
         dataEnc.writeSpec(gw);
-        emitBuffer(buf, gw, dataEnc);
+        emitBuffer(buf, gw, dataEnc, distMult);
+        dataEnc.finishSection(gw);
         gw.zeroPadToByte();
         byte[] bytes = gw.toByteArray();
         return bytes.length * 8L + 128 < globalBits ? bytes : null;

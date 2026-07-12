@@ -111,6 +111,32 @@ public final class AnsDecoder {
         return sym;
     }
 
+    /**
+     * Encoder support: builds the slot map of the normative alias table.
+     * For each symbol {@code s} with cumulative start
+     * {@code start[s] = sum(freq[0..s))}, entry {@code start[s] + r} is the
+     * 12-bit state index that decodes to {@code (s, r)}; the rANS encoder
+     * pushes a symbol as {@code state = (state / f) * 4096 + map[start[s] + state % f]}.
+     */
+    public static int[] reverseMap(int logAlphaSize, int[] freq) throws IOException {
+        AnsDecoder d = new AnsDecoder(logAlphaSize, freq);
+        int bucketMask = (1 << d.logBucketSize) - 1;
+        int[] start = new int[freq.length + 1];
+        for (int s = 0; s < freq.length; s++) {
+            start[s + 1] = start[s] + freq[s];
+        }
+        int[] map = new int[DIST_SUM];
+        for (int idx = 0; idx < DIST_SUM; idx++) {
+            int i = idx >>> d.logBucketSize;
+            int pos = idx & bucketMask;
+            boolean direct = pos < d.cutoff[i];
+            int sym = direct ? i : d.symbol[i];
+            int off = direct ? 0 : d.offsetOrNext[i];
+            map[start[sym] + off + pos] = idx;
+        }
+        return map;
+    }
+
     /** Reads a distribution over {@code 1 << logAlphaSize} entries. */
     public static AnsDecoder readDistribution(Bits in, int logAlphaSize) throws IOException {
         int tableSize = 1 << logAlphaSize;

@@ -19,6 +19,7 @@ final class EntropyEncoder {
     private final int numDist;      // contexts including the LZ77 distance context
     private final boolean lz77;
     private final boolean perContext;
+    private final boolean allowAns;
     private final HybridUintConfig config = new HybridUintConfig(4, 1, 0);
     private final HybridUintConfig lenConfig = new HybridUintConfig(0, 0, 0);
     private final long[][] histograms; // per context (or one shared histogram)
@@ -26,22 +27,39 @@ final class EntropyEncoder {
     private PrefixEncoder[] codes;
     private final int[] scratch = new int[1];
 
+    // rANS state (populated by writeSpec when ANS wins the cost comparison)
+    private boolean useAns;
+    private int[][] ansFreq;    // per cluster, table-size entries summing 4096
+    private int[][] ansStart;   // per cluster, cumulative starts
+    private int[][] ansRev;     // per cluster, (start[sym] + r) -> 12-bit index
+    private int[] secTok = new int[1024]; // (cluster << 16) | symbol
+    private int[] secVal = new int[1024]; // hybrid-uint extra bits value
+    private byte[] secBits = new byte[1024];
+    private int secN;
+
     /**
      * @param numCtx number of value contexts
      * @param perContextClusters when true, contexts are counted separately and
      *        merged into at most eight clusters; otherwise all share one code
      * @param lz77 enable LZ77 copies (adds the distance context)
+     * @param allowAns permit rANS symbol coding when it beats prefix codes;
+     *        every section must then end with {@link #finishSection}
      */
-    EntropyEncoder(int numCtx, boolean perContextClusters, boolean lz77) {
+    EntropyEncoder(int numCtx, boolean perContextClusters, boolean lz77, boolean allowAns) {
         this.lz77 = lz77;
         this.perContext = perContextClusters;
+        this.allowAns = allowAns;
         this.numDist = numCtx + (lz77 ? 1 : 0);
         this.histograms = new long[perContext ? numDist : 1][ALPHABET];
         this.clusterMap = new int[numDist];
     }
 
+    EntropyEncoder(int numCtx, boolean perContextClusters, boolean lz77) {
+        this(numCtx, perContextClusters, lz77, false);
+    }
+
     EntropyEncoder(int numCtx, boolean perContextClusters) {
-        this(numCtx, perContextClusters, false);
+        this(numCtx, perContextClusters, false, false);
     }
 
     /** Pass 1: account for {@code value} in context {@code ctx}. */
@@ -49,12 +67,26 @@ final class EntropyEncoder {
         histograms[perContext ? ctx : 0][(int) config.encode(value, scratch)]++;
     }
 
-    /** Pass 1: account for a copy of {@code len} previous values. */
-    void countCopy(int ctx, int len) {
+    /** Pass 1: account for a copy of {@code len} values at distance value {@code distValue}. */
+    void countCopy(int ctx, int len, int distValue) {
         histograms[perContext ? ctx : 0]
                 [MIN_SYMBOL + (int) lenConfig.encode(len - MIN_LENGTH, scratch)]++;
-        // distance value 1 -> special distance {1, 0}: the previous value
-        histograms[perContext ? numDist - 1 : 0][(int) config.encode(1, scratch)]++;
+        histograms[perContext ? numDist - 1 : 0][(int) config.encode(distValue, scratch)]++;
+    }
+
+    /**
+     * Distance token values for real distances at this {@code distMult}: the
+     * 120 special 2-D entries where applicable, else the linear escape
+     * {@code d + 119} (the decoder maps values >= 120 to {@code v - 119}).
+     */
+    static java.util.HashMap<Integer, Integer> specialDistanceValues(int distMult) {
+        var map = new java.util.HashMap<Integer, Integer>(160);
+        for (int v = 0; v < 120; v++) {
+            int sp = com.ebremer.jpegxl.entropy.EntropyDecoder.SPECIAL_DISTANCES[v];
+            int d = Math.max(1, ((sp >> 4) - 7) + distMult * (sp & 7));
+            map.putIfAbsent(d, v);
+        }
+        return map;
     }
 
     private double[] ctxTotals; // per-histogram totals, prepared for cost queries
@@ -87,11 +119,11 @@ final class EntropyEncoder {
     }
 
     /** Cost in bits of an LZ77 copy of {@code len} values in {@code ctx}. */
-    double copyCostBits(int ctx, int len) {
+    double copyCostBits(int ctx, int len, int distValue) {
         int[] tmp = new int[1];
         long enc = lenConfig.encode(len - MIN_LENGTH, tmp);
         double bits = symbolCostBits(ctx, MIN_SYMBOL + (int) enc) + (int) (enc >>> 32);
-        long dist = config.encode(1, tmp);
+        long dist = config.encode(distValue, tmp);
         return bits + symbolCostBits(numDist - 1, (int) dist) + (int) (dist >>> 32);
     }
 
@@ -137,14 +169,6 @@ final class EntropyEncoder {
                 out.write(clusterMap[i], nbits);
             }
         }
-        out.writeBool(true); // use_prefix_code
-        for (int i = 0; i < numClusters; i++) {
-            // hybrid config with log_alpha_size = 15: split_exp(4) = 4 bits,
-            // msb(1) in ceil(log2(5)) = 3 bits, lsb(0) in ceil(log2(4)) = 2 bits
-            out.write(config.splitExp, 4);
-            out.write(config.msbInToken, 3);
-            out.write(config.lsbInToken, 2);
-        }
         long[][] clustered = new long[numClusters][ALPHABET];
         int[] maxToken = new int[numClusters];
         for (int i = 0; i < histograms.length; i++) {
@@ -155,6 +179,62 @@ final class EntropyEncoder {
                     maxToken[cl] = Math.max(maxToken[cl], t);
                 }
             }
+        }
+
+        // choose the symbol coder: exact header costs plus entropy estimates
+        PrefixEncoder[] prefixCodes = new PrefixEncoder[numClusters];
+        int logAlpha = 5;
+        for (int i = 0; i < numClusters; i++) {
+            prefixCodes[i] = new PrefixEncoder(clustered[i], maxToken[i] + 1);
+            logAlpha = Math.max(logAlpha, ceilLog2(maxToken[i] + 1));
+        }
+        int[][] freqs = null;
+        if (allowAns && logAlpha <= 8) {
+            double prefixTotal = 0;
+            double ansTotal = 2; // log_alpha_size bits
+            freqs = new int[numClusters][];
+            for (int i = 0; i < numClusters; i++) {
+                BitWriter pw = new BitWriter();
+                int count = maxToken[i] + 1;
+                if (count > 1) {
+                    pw.write(0, 5); // alphabet-size field, roughly
+                }
+                prefixCodes[i].writeHeader(pw);
+                prefixTotal += pw.bitLength() + prefixCodes[i].costBits(clustered[i]);
+                freqs[i] = AnsEncoder.quantize(clustered[i], count, 1 << logAlpha);
+                BitWriter aw = new BitWriter();
+                AnsEncoder.writeDistribution(aw, freqs[i], 1 << logAlpha);
+                ansTotal += aw.bitLength() + AnsEncoder.dataBits(clustered[i], freqs[i]);
+            }
+            useAns = ansTotal < prefixTotal;
+        }
+
+        out.writeBool(!useAns); // use_prefix_code
+        if (useAns) {
+            out.write(logAlpha - 5, 2);
+            for (int i = 0; i < numClusters; i++) {
+                writeConfig(out, config, logAlpha);
+            }
+            ansFreq = freqs;
+            ansStart = new int[numClusters][];
+            ansRev = new int[numClusters][];
+            for (int i = 0; i < numClusters; i++) {
+                AnsEncoder.writeDistribution(out, freqs[i], 1 << logAlpha);
+                int[] start = new int[freqs[i].length + 1];
+                for (int s = 0; s < freqs[i].length; s++) {
+                    start[s + 1] = start[s] + freqs[i][s];
+                }
+                ansStart[i] = start;
+                try {
+                    ansRev[i] = com.ebremer.jpegxl.entropy.AnsDecoder.reverseMap(logAlpha, freqs[i]);
+                } catch (java.io.IOException e) {
+                    throw new IllegalStateException("invalid quantized distribution", e);
+                }
+            }
+            return;
+        }
+        for (int i = 0; i < numClusters; i++) {
+            writeConfig(out, config, 15);
         }
         for (int i = 0; i < numClusters; i++) {
             int count = maxToken[i] + 1;
@@ -167,10 +247,22 @@ final class EntropyEncoder {
                 out.write(count - 1 - (1 << n), n);
             }
         }
-        codes = new PrefixEncoder[numClusters];
+        codes = prefixCodes;
         for (int i = 0; i < numClusters; i++) {
-            codes[i] = new PrefixEncoder(clustered[i], maxToken[i] + 1);
             codes[i].writeHeader(out);
+        }
+    }
+
+    private static int ceilLog2(int v) {
+        return v <= 1 ? 0 : 32 - Integer.numberOfLeadingZeros(v - 1);
+    }
+
+    /** Hybrid-uint config in the width scheme of {@code Bits.atMost}. */
+    private static void writeConfig(BitWriter out, HybridUintConfig c, int logAlphaSize) {
+        out.write(c.splitExp, ceilLog2(logAlphaSize + 1));
+        if (c.splitExp != logAlphaSize) {
+            out.write(c.msbInToken, ceilLog2(c.splitExp + 1));
+            out.write(c.lsbInToken, ceilLog2(c.splitExp - c.msbInToken + 1));
         }
     }
 
@@ -259,19 +351,82 @@ final class EntropyEncoder {
         long enc = config.encode(value, scratch);
         int token = (int) enc;
         int midBits = (int) (enc >>> 32);
+        if (useAns) {
+            secPush(clusterMap[ctx], token, scratch[0], midBits);
+            return;
+        }
         codes[clusterMap[ctx]].writeSymbol(out, token);
         out.write(scratch[0], midBits);
     }
 
-    /** Pass 2: emit a copy of {@code len} previous values. */
-    void writeCopy(BitWriter out, int ctx, int len) {
+    /** Pass 2: emit a copy of {@code len} values at distance value {@code distValue}. */
+    void writeCopy(BitWriter out, int ctx, int len, int distValue) {
         long enc = lenConfig.encode(len - MIN_LENGTH, scratch);
         int token = (int) enc;
         int midBits = (int) (enc >>> 32);
+        if (useAns) {
+            secPush(clusterMap[ctx], MIN_SYMBOL + token, scratch[0], midBits);
+            long dist = config.encode(distValue, scratch);
+            secPush(clusterMap[numDist - 1], (int) dist, scratch[0], (int) (dist >>> 32));
+            return;
+        }
         codes[clusterMap[ctx]].writeSymbol(out, MIN_SYMBOL + token);
         out.write(scratch[0], midBits);
-        long dist = config.encode(1, scratch);
+        long dist = config.encode(distValue, scratch);
         codes[clusterMap[numDist - 1]].writeSymbol(out, (int) dist);
         out.write(scratch[0], (int) (dist >>> 32));
+    }
+
+    private void secPush(int cluster, int symbol, int extraVal, int extraBits) {
+        if (secN == secTok.length) {
+            secTok = java.util.Arrays.copyOf(secTok, secN * 2);
+            secVal = java.util.Arrays.copyOf(secVal, secN * 2);
+            secBits = java.util.Arrays.copyOf(secBits, secN * 2);
+        }
+        secTok[secN] = (cluster << 16) | symbol;
+        secVal[secN] = extraVal;
+        secBits[secN] = (byte) extraBits;
+        secN++;
+    }
+
+    /**
+     * Ends one entropy-coded section. In ANS mode this runs the reverse rANS
+     * pass over the section's buffered tokens and writes the stream: the
+     * final encoder state first (the decoder's initial 32-bit read), then
+     * per token its renormalisation word (if the decoder pulls one) followed
+     * by its hybrid-uint extra bits. A section with no tokens still writes
+     * the initial state, which the decoder's finish() validates. No-op for
+     * prefix coding, where tokens were written directly.
+     */
+    void finishSection(BitWriter out) {
+        if (!useAns) {
+            return;
+        }
+        boolean[] renorm = new boolean[secN];
+        int[] words = new int[secN];
+        long state = com.ebremer.jpegxl.entropy.AnsDecoder.INIT_STATE & 0xffffffffL;
+        for (int k = secN - 1; k >= 0; k--) {
+            int cl = secTok[k] >>> 16;
+            int sym = secTok[k] & 0xffff;
+            long f = ansFreq[cl][sym];
+            if (state >= (f << 20)) {
+                renorm[k] = true;
+                words[k] = (int) (state & 0xffff);
+                state >>>= 16;
+            }
+            state = (state / f) * com.ebremer.jpegxl.entropy.AnsDecoder.DIST_SUM
+                    + ansRev[cl][ansStart[cl][sym] + (int) (state % f)];
+        }
+        out.write((int) (state & 0xffff), 16);
+        out.write((int) (state >>> 16), 16);
+        for (int k = 0; k < secN; k++) {
+            if (renorm[k]) {
+                out.write(words[k], 16);
+            }
+            if (secBits[k] > 0) {
+                out.write(secVal[k], secBits[k]);
+            }
+        }
+        secN = 0;
     }
 }

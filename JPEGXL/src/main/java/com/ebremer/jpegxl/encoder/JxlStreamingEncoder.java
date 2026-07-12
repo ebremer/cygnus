@@ -190,8 +190,12 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         }
         int rct = -1;
         if (!grey) {
-            rct = selectGroupRct(px, w, h);
-            JxlEncoder.forwardRct(rct, px[0], px[1], px[2]);
+            int[][] rgb = {px[0], px[1], px[2]};
+            rct = JxlEncoder.selectRct(rgb, w, h);
+            JxlEncoder.applyForwardRct(rct, rgb);
+            px[0] = rgb[0];
+            px[1] = rgb[1];
+            px[2] = rgb[2];
             if (rct == 0) {
                 rct = -1; // nothing to code
             }
@@ -206,7 +210,9 @@ public final class JxlStreamingEncoder implements AutoCloseable {
             JxlEncoder.Chan c = list.get(i);
             JxlEncoder.choosePredictor(c);
             int[] ref = i > 0 ? list.get(i - 1).px : null;
-            subs.put(c, JxlEncoder.learnTree(c, ref, rect, 1 << 14, 4));
+            JxlEncoder.TNode sub = JxlEncoder.learnTree(c, ref, rect, 1 << 14, 4);
+            JxlEncoder.refineLeaves(c, sub, ref, rect);
+            subs.put(c, sub);
         }
         JxlEncoder.TNode tree = JxlEncoder.chainNode(list, list.size() - 1, subs);
         int numCtx = JxlEncoder.assignCtx(tree);
@@ -226,40 +232,22 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         } else {
             gw.write(0, 2);  // nb_transforms = 0
         }
-        EntropyEncoder treeEnc = new EntropyEncoder(6, false);
+        EntropyEncoder treeEnc = new EntropyEncoder(6, false, false, true);
         JxlEncoder.emitTree(tree, null, treeEnc);
         treeEnc.writeSpec(gw);
         JxlEncoder.emitTree(tree, gw, treeEnc);
-        EntropyEncoder dataEnc = new EntropyEncoder(numCtx, true, true);
-        JxlEncoder.emitBuffer(buf, null, dataEnc);
+        treeEnc.finishSection(gw);
+        EntropyEncoder litProbe = new EntropyEncoder(numCtx, true, true);
+        JxlEncoder.countLiterals(buf, litProbe);
+        litProbe.prepareCosts();
+        JxlEncoder.findMatches(buf, w, litProbe);
+        EntropyEncoder dataEnc = new EntropyEncoder(numCtx, true, true, true);
+        JxlEncoder.emitBuffer(buf, null, dataEnc, w);
         dataEnc.writeSpec(gw);
-        JxlEncoder.emitBuffer(buf, gw, dataEnc);
+        JxlEncoder.emitBuffer(buf, gw, dataEnc, w);
+        dataEnc.finishSection(gw);
         gw.zeroPadToByte();
         return gw.toByteArray();
-    }
-
-    /** Picks the cheapest RCT for one group under the gradient-cost estimate. */
-    private static int selectGroupRct(int[][] px, int w, int h) {
-        int best = 0;
-        long bestCost = Long.MAX_VALUE;
-        int n = w * h;
-        int[] c0 = new int[n];
-        int[] c1 = new int[n];
-        int[] c2 = new int[n];
-        for (int type = 0; type <= 6; type++) {
-            System.arraycopy(px[0], 0, c0, 0, n);
-            System.arraycopy(px[1], 0, c1, 0, n);
-            System.arraycopy(px[2], 0, c2, 0, n);
-            JxlEncoder.forwardRct(type, c0, c1, c2);
-            long cost = JxlEncoder.fullGradientCost(new JxlEncoder.Chan(w, h, c0))
-                    + JxlEncoder.fullGradientCost(new JxlEncoder.Chan(w, h, c1))
-                    + JxlEncoder.fullGradientCost(new JxlEncoder.Chan(w, h, c2));
-            if (cost < bestCost) {
-                bestCost = cost;
-                best = type;
-            }
-        }
-        return best;
     }
 
     /**

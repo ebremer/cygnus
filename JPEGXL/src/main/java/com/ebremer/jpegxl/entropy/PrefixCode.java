@@ -94,6 +94,11 @@ public final class PrefixCode {
         0x00011, 0xb0022, 0xc0003, 0xd0043,
     });
 
+    /** Encoder access to the fixed ANS log-count code. */
+    public static PrefixCode logCount() {
+        return LOG_COUNT;
+    }
+
     /** The fixed 4-bit code for reading code-length-code lengths (RFC 7932 3.5). */
     private static final PrefixCode CODE_LENGTH_CODE =
             fromLengths(new int[] {2, 4, 3, 2, 2, 4});

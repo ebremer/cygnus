@@ -276,8 +276,13 @@ public final class EntropyDecoder {
                 clusterMap, usePrefixCodes, configs, prefixCodes, ansCodes);
     }
 
-    /** {a,b} pairs encoded as (a+7)*16 + b, per the special distance table. */
-    private static final int[] SPECIAL_DISTANCES = {
+    /**
+     * {a,b} pairs encoded as (a+7)*16 + b, per the special distance table:
+     * distance token value {@code v < 120} decodes to
+     * {@code max(1, a + distMult * b)}. Public so the encoder can build the
+     * reverse mapping from the same table.
+     */
+    public static final int[] SPECIAL_DISTANCES = {
         0x71, 0x80, 0x81, 0x61, 0x72, 0x90, 0x82, 0x62, 0x91, 0x51, 0x92, 0x52,
         0x73, 0xa0, 0x83, 0x63, 0xa1, 0x41, 0x93, 0x53, 0xa2, 0x42, 0x74, 0xb0,
         0x84, 0x64, 0xb1, 0x31, 0xa3, 0x43, 0x94, 0x54, 0xb2, 0x32, 0x75, 0xa4,

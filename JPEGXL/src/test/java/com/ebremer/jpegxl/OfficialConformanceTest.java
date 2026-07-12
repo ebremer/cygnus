@@ -63,13 +63,10 @@ class OfficialConformanceTest {
     }
 
     /**
-     * Cases with a small documented deviation from the strict level-10
-     * thresholds (the case passes the level-5 thresholds; its level-5
-     * variant runs and passes below): localized VarDCT residuals,
-     * suspected in a rare-transform detail.
+     * Cases with a documented deviation from their declared thresholds.
+     * Currently empty — every corpus case passes.
      */
-    private static final java.util.Set<String> KNOWN_DEVIATIONS = java.util.Set.of(
-            "upsampling");       // rms 4.0e-4 (limit 1e-4), peak 2.6e-2 (limit 4e-3)
+    private static final java.util.Set<String> KNOWN_DEVIATIONS = java.util.Set.of();
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("cases")

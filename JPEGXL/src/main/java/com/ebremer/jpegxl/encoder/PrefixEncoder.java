@@ -43,6 +43,15 @@ final class PrefixEncoder {
         out.write(codes[symbol], lengths[symbol]);
     }
 
+    /** Total data bits of {@code histogram} under this code. */
+    long costBits(long[] histogram) {
+        long bits = 0;
+        for (int i = 0; i < alphabetSize && i < histogram.length; i++) {
+            bits += histogram[i] * lengths[i];
+        }
+        return bits;
+    }
+
     /** Emits the prefix code description (RFC 7932 section 3, as profiled by JPEG XL). */
     void writeHeader(BitWriter out) {
         if (alphabetSize == 1) {
