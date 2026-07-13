@@ -15,12 +15,14 @@
   <modules>
     <module>JPEG2000</module>
     <module>JPEGXL</module>
+    <module>SVS</module>
   </modules>
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>25</maven.compiler.release>
     <junit.version>5.13.1</junit.version>
+    <twelvemonkeys.version>3.13.1</twelvemonkeys.version>
   </properties>
 
   <dependencyManagement>
@@ -29,6 +31,16 @@
         <groupId>org.junit.jupiter</groupId>
         <artifactId>junit-jupiter</artifactId>
         <version>${junit.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.twelvemonkeys.imageio</groupId>
+        <artifactId>imageio-tiff</artifactId>
+        <version>${twelvemonkeys.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.twelvemonkeys.imageio</groupId>
+        <artifactId>imageio-jpeg</artifactId>
+        <version>${twelvemonkeys.version}</version>
       </dependency>
     </dependencies>
   </dependencyManagement>
