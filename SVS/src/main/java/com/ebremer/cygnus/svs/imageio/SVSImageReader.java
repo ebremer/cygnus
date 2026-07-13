@@ -230,7 +230,7 @@ public final class SVSImageReader extends ImageReader {
         Rectangle destRegion = new Rectangle(0, 0, 0, 0);
         computeRegions(param, dir.width(), dir.height(),
                 param != null ? param.getDestination() : null, srcRegion, destRegion);
-        BufferedImage dest = getDestination(param, imageTypes(dir), dir.width(), dir.height());
+        BufferedImage dest = destination(param, imageTypes(dir), destRegion);
         checkReadParamBandSettings(param, 3, dest.getRaster().getNumBands());
 
         new Jp2kTileDecoder(stream(), dir).readRegion(
@@ -245,6 +245,39 @@ public final class SVSImageReader extends ImageReader {
                     return !abortRequested();
                 });
         return dest;
+    }
+
+    /**
+     * The image a read writes into, sized to the region asked for.
+     *
+     * <p>This is what {@link #getDestination} does, minus the one thing that
+     * makes it useless here: it rejects any image whose width times height
+     * overflows an int — which is most of a slide's full-resolution level —
+     * before it so much as looks at how small a region you asked for.</p>
+     */
+    private BufferedImage destination(ImageReadParam param, Iterator<ImageTypeSpecifier> types,
+                                      Rectangle destRegion) throws IIOException {
+        if (param != null && param.getDestination() != null) {
+            return param.getDestination();
+        }
+        ImageTypeSpecifier wanted = param != null ? param.getDestinationType() : null;
+        ImageTypeSpecifier first = types.hasNext() ? types.next() : null;
+        if (first == null) {
+            throw new IIOException("No image type for this level");
+        }
+        ImageTypeSpecifier type = first;
+        if (wanted != null) {
+            boolean legal = wanted.equals(first);
+            while (!legal && types.hasNext()) {
+                legal = wanted.equals(types.next());
+            }
+            if (!legal) {
+                throw new IIOException("Destination type from ImageReadParam does not match!");
+            }
+            type = wanted;
+        }
+        return type.createBufferedImage(destRegion.x + destRegion.width,
+                destRegion.y + destRegion.height);
     }
 
     // ---- label, macro and thumbnail ----

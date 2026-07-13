@@ -210,7 +210,7 @@ public final class NDPIImageReader extends ImageReader {
                 param != null ? param.getDestination() : null, srcRegion, destRegion);
 
         List<ImageTypeSpecifier> types = decoder.imageTypes();
-        BufferedImage dest = getDestination(param, types.iterator(), width, height);
+        BufferedImage dest = destination(param, types, destRegion);
         checkReadParamBandSettings(param, types.get(0).getNumBands(),
                 dest.getRaster().getNumBands());
 
@@ -225,6 +225,29 @@ public final class NDPIImageReader extends ImageReader {
                     return !abortRequested();
                 });
         return dest;
+    }
+
+    /**
+     * The image a read writes into, sized to the region asked for.
+     *
+     * <p>This is what {@link #getDestination} does, minus the one thing that
+     * makes it useless here: it rejects any image whose width times height
+     * overflows an int — which is most of a slide's full-resolution level —
+     * before it so much as looks at how small a region you asked for.</p>
+     */
+    private BufferedImage destination(ImageReadParam param, List<ImageTypeSpecifier> types,
+                                      Rectangle destRegion) throws IIOException {
+        if (param != null && param.getDestination() != null) {
+            return param.getDestination();
+        }
+        ImageTypeSpecifier type = param != null ? param.getDestinationType() : null;
+        if (type == null) {
+            type = types.get(0);
+        } else if (!types.contains(type)) {
+            throw new IIOException("Destination type from ImageReadParam does not match!");
+        }
+        return type.createBufferedImage(destRegion.x + destRegion.width,
+                destRegion.y + destRegion.height);
     }
 
     // ---- the pictures of the slide itself ----

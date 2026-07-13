@@ -22,6 +22,7 @@ public final class Ndpi {
     public static final int TAG_SAMPLES_PER_PIXEL = 277;
     public static final int TAG_ROWS_PER_STRIP = 278;
     public static final int TAG_STRIP_BYTE_COUNTS = 279;
+    public static final int TAG_TILE_WIDTH = 322;
     public static final int TAG_X_RESOLUTION = 282;
     public static final int TAG_Y_RESOLUTION = 283;
     public static final int TAG_RESOLUTION_UNIT = 296;
@@ -55,6 +56,24 @@ public final class Ndpi {
 
     public static final int COMPRESSION_NONE = 1;
     public static final int COMPRESSION_JPEG = 7;
+
+    /**
+     * Hamamatsu's private code for JPEG XR (ISO/IEC 29199-2). Newer scanners
+     * write this instead, and lay the level out as a tiled TIFF of JPEG XR tiles
+     * rather than as one over-large JPEG. Reading it needs a JPEG XR decoder,
+     * which this module does not have and neither does OpenSlide.
+     */
+    public static final int COMPRESSION_JPEGXR = 22610;
+
+    /** Human-readable name for a compression code, for messages and metadata. */
+    public static String compressionName(int compression) {
+        return switch (compression) {
+            case COMPRESSION_NONE -> "uncompressed";
+            case COMPRESSION_JPEG -> "JPEG";
+            case COMPRESSION_JPEGXR -> "JPEG XR";
+            default -> "compression " + compression;
+        };
+    }
 
     /** Source lens of the macro image — a photograph of the whole slide. */
     public static final double SOURCE_LENS_MACRO = -1;

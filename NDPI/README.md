@@ -11,6 +11,27 @@ A read-only Java ImageIO plug-in for Hamamatsu NDPI whole-slide images, for JDK 
 - **Focus stacks** — a slide's out-of-focus z-planes are kept out of the pyramid
   and listed separately (`NdpiStructure.focusPlanes()`).
 
+## What it reads
+
+Validated against twelve real slides: the OpenSlide reference set (CMU-1/2/3),
+brightfield slides up to 5.4 GB and 20 gigapixels, and fluorescence channels.
+A 1024x1024 region of a 234240x81664 level 0 comes back in tens of milliseconds.
+
+Two things it does not read, and one that is not what it looks like:
+
+- **JPEG XR levels** (compression 22610). Hamamatsu's newer scanners lay a level
+  out as a *tiled* TIFF of JPEG XR tiles rather than as one over-large JPEG.
+  Decoding those needs a JPEG XR codec, which this module does not have and
+  neither does OpenSlide. The reader recognizes them and says so by name; the
+  slide's geometry and properties are still readable, and its map image usually
+  is too.
+- **Nothing else so far** — every other slide in the corpus reads whole.
+- The **map** image is not a photograph. Its samples are small integers (0, 1, 2,
+  ...), one per pixel, identifying scan regions; it renders nearly black because
+  that is what it holds. (Some slides also write a nonsense
+  `PhotometricInterpretation` for it, which the reader ignores in favour of
+  `SamplesPerPixel`.)
+
 ## Usage
 
 Level 0 of a slide is routinely gigapixels, so `ImageIO.read(file)` will try to
@@ -120,3 +141,10 @@ Covered, among the rest: a level 65536 pixels wide, whose frame header cannot sa
 so; a level whose MCU-start table is wrong, which has to be re-derived; and a
 slide whose data sits past 4 GiB, written into a sparse file so it costs a few
 hundred kilobytes of disk rather than four gigabytes.
+
+One thing the synthesized files cannot cover is a level with more than 2^31
+pixels, since a fixture would have to hold that many. `ImageReader.getDestination`
+refuses such an image outright — before it looks at how small a region you asked
+for — so the reader sizes its own destination instead. That is what the corpus is
+for: six of the twelve real slides have a level 0 past 2^31 pixels, and all six
+read.

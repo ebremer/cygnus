@@ -3,7 +3,10 @@ package com.ebremer.cygnus.ndpi;
 import com.twelvemonkeys.imageio.stream.ByteArrayImageInputStream;
 import java.awt.Point;
 import java.awt.Rectangle;
+import java.awt.color.ColorSpace;
 import java.awt.image.BufferedImage;
+import java.awt.image.DataBuffer;
+import java.awt.image.WritableRaster;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -42,12 +45,26 @@ public final class NdpiTileDecoder {
         boolean tileDecoded(int done, int total);
     }
 
+    /** How a directory stores its pixels. */
+    private enum Kind {
+        /** One JPEG, cut into tiles by restart markers. Every pyramid level of a slide. */
+        JPEG,
+        /** Raw 8-bit samples. The map image, and only ever a small one. */
+        RAW,
+        /** A codec this reader does not have — in practice JPEG XR. */
+        UNREADABLE,
+    }
+
     private final ImageInputStream stream;
     private final NdpiDirectory directory;
     private final ImageReader jpeg;
-    private final JpegHeader header;
+    private final Kind kind;
+    private final int compression;
+    private final JpegHeader header;      // null unless JPEG
     private final long stripOffset;
     private final long stripEnd;
+    private final int bands;
+    private final boolean whiteIsZero;
     private final int width;
     private final int height;
     private final int tileWidth;
@@ -60,17 +77,58 @@ public final class NdpiTileDecoder {
 
     public NdpiTileDecoder(ImageInputStream stream, NdpiDirectory directory, ImageReader jpeg)
             throws IOException {
-        int compression = directory.compression();
-        if (compression != Ndpi.COMPRESSION_JPEG) {
-            throw new IIOException("NDPI directory " + directory.index()
-                    + " is not JPEG (compression " + compression + ")");
-        }
         this.stream = stream;
         this.directory = directory;
         this.jpeg = jpeg;
+
+        this.compression = directory.compression();
+        this.kind = switch (compression) {
+            case Ndpi.COMPRESSION_JPEG -> Kind.JPEG;
+            case Ndpi.COMPRESSION_NONE -> Kind.RAW;
+            default -> Kind.UNREADABLE;
+        };
+        this.whiteIsZero =
+                directory.integer(Ndpi.TAG_PHOTOMETRIC_INTERPRETATION).orElse(1) == 0;
+
+        if (kind == Kind.UNREADABLE) {
+            // Say what we can about it anyway: the geometry is all in the tags, so a caller
+            // can still see the slide's shape, and only asking for pixels fails.
+            this.header = null;
+            this.stripOffset = -1;
+            this.stripEnd = -1;
+            this.bands = directory.samplesPerPixel();
+            this.width = directory.width();
+            this.height = directory.height();
+            this.tileWidth = width;
+            this.tileHeight = height;
+            this.tilesAcross = 1;
+            this.tilesDown = 1;
+            return;
+        }
+
         this.stripOffset = directory.stripOffset();
         this.stripEnd = stripOffset + directory.stripByteCount();
+
+        if (kind == Kind.RAW) {
+            this.header = null;
+            this.bands = directory.samplesPerPixel();
+            this.width = directory.width();
+            this.height = directory.height();
+            this.tileWidth = width;
+            this.tileHeight = height;
+            this.tilesAcross = 1;
+            this.tilesDown = 1;
+            long needed = (long) width * height * bands;
+            if (needed > stripEnd - stripOffset) {
+                throw new IIOException("NDPI directory " + directory.index() + " is "
+                        + width + "x" + height + "x" + bands + " uncompressed, which needs "
+                        + needed + " bytes, but its strip holds " + (stripEnd - stripOffset));
+            }
+            return;
+        }
+
         this.header = JpegHeader.read(stream, stripOffset, stripEnd);
+        this.bands = header.components();
 
         int restartInterval = header.restartInterval();
         if (restartInterval == 0) {
@@ -114,6 +172,26 @@ public final class NdpiTileDecoder {
         this.tilesDown = Math.ceilDiv(height, tileHeight);
     }
 
+    /** Fails with the codec's name, rather than a tag number, when we cannot read it. */
+    private void requireReadable() throws IIOException {
+        if (kind == Kind.UNREADABLE) {
+            throw new IIOException("NDPI directory " + directory.index() + " is "
+                    + Ndpi.compressionName(compression) + ", which this reader does not decode. "
+                    + "Hamamatsu's newer scanners write levels as tiled JPEG XR rather than as "
+                    + "one over-large JPEG; OpenSlide does not read those either.");
+        }
+    }
+
+    /** Whether the pixels can be decoded at all; the geometry is readable regardless. */
+    public boolean isReadable() {
+        return kind != Kind.UNREADABLE;
+    }
+
+    /** The codec the directory's pixels are stored with. */
+    public String compressionName() {
+        return Ndpi.compressionName(compression);
+    }
+
     public int width() {
         return width;
     }
@@ -140,31 +218,50 @@ public final class NdpiTileDecoder {
 
     /** Whether the level is broken into restart intervals rather than being one JPEG. */
     public boolean isTiled() {
-        return header.restartInterval() > 0;
+        return header != null && header.restartInterval() > 0;
     }
 
-    /** Colour components the level's JPEG holds: 3 for a scanned slide, 1 for fluorescence. */
+    /** Colour components: 3 for a scanned slide, 1 for a fluorescence channel or the map. */
     public int bands() {
-        return header.components();
+        return bands;
     }
 
-    /** The types the JPEG decoder offers for this level's pixels. */
+    /** The types the pixels can be decoded to. */
     public List<ImageTypeSpecifier> imageTypes() throws IOException {
+        requireReadable();
         if (imageTypes == null) {
-            jpeg.setInput(new ByteArrayImageInputStream(tileJpeg(0)));
-            try {
-                List<ImageTypeSpecifier> types = new ArrayList<>();
-                jpeg.getImageTypes(0).forEachRemaining(types::add);
-                if (types.isEmpty()) {
-                    throw new IIOException("The JPEG decoder offers no type for NDPI directory "
-                            + directory.index());
-                }
-                imageTypes = List.copyOf(types);
-            } finally {
-                jpeg.setInput(null);
-            }
+            imageTypes = kind == Kind.RAW ? List.of(rawImageType()) : jpegImageTypes();
         }
         return imageTypes;
+    }
+
+    private ImageTypeSpecifier rawImageType() throws IIOException {
+        if (bands >= 3) {
+            return ImageTypeSpecifier.createInterleaved(
+                    ColorSpace.getInstance(ColorSpace.CS_sRGB), new int[] {0, 1, 2},
+                    DataBuffer.TYPE_BYTE, false, false);
+        }
+        if (bands == 1) {
+            return ImageTypeSpecifier.createGrayscale(8, DataBuffer.TYPE_BYTE, false);
+        }
+        throw new IIOException("NDPI directory " + directory.index() + " is uncompressed with "
+                + bands + " samples per pixel");
+    }
+
+    /** What the JPEG decoder itself offers, asked of a tile so the answer is its own. */
+    private List<ImageTypeSpecifier> jpegImageTypes() throws IOException {
+        jpeg.setInput(new ByteArrayImageInputStream(tileJpeg(0)));
+        try {
+            List<ImageTypeSpecifier> types = new ArrayList<>();
+            jpeg.getImageTypes(0).forEachRemaining(types::add);
+            if (types.isEmpty()) {
+                throw new IIOException("The JPEG decoder offers no type for NDPI directory "
+                        + directory.index());
+            }
+            return List.copyOf(types);
+        } finally {
+            jpeg.setInput(null);
+        }
     }
 
     /**
@@ -179,6 +276,15 @@ public final class NdpiTileDecoder {
                            BufferedImage dest, Rectangle destRegion,
                            int[] srcBands, int[] destBands, Progress progress)
             throws IOException {
+        requireReadable();
+        if (kind == Kind.RAW) {
+            readRaw(srcRegion, subX, subY, dest, destRegion, srcBands, destBands);
+            if (progress != null) {
+                progress.tileDecoded(1, 1);
+            }
+            return;
+        }
+
         int firstTileX = srcRegion.x / tileWidth;
         int lastTileX = (srcRegion.x + srcRegion.width - 1) / tileWidth;
         int firstTileY = srcRegion.y / tileHeight;
@@ -238,6 +344,50 @@ public final class NdpiTileDecoder {
                 if (progress != null && !progress.tileDecoded(done, total)) {
                     return;
                 }
+            }
+        }
+    }
+
+    /** Raw 8-bit samples, row by row. Only the map image is stored this way. */
+    private void readRaw(Rectangle srcRegion, int subX, int subY,
+                         BufferedImage dest, Rectangle destRegion,
+                         int[] srcBands, int[] destBands) throws IOException {
+        WritableRaster raster = dest.getRaster();
+        long rowLength = (long) width * bands;
+        byte[] row = new byte[(int) rowLength];
+        int[] pixel = new int[bands];
+        boolean interleaved = srcBands == null && destBands == null
+                && raster.getNumBands() == bands;
+        int[] out = interleaved ? new int[destRegion.width * bands] : null;
+
+        for (int dy = 0; dy < destRegion.height; dy++) {
+            long y = srcRegion.y + (long) dy * subY;
+            stream.seek(stripOffset + y * rowLength);
+            stream.readFully(row);
+
+            int at = 0;
+            for (int dx = 0; dx < destRegion.width; dx++) {
+                int x = srcRegion.x + dx * subX;
+                for (int b = 0; b < bands; b++) {
+                    int sample = row[x * bands + b] & 0xFF;
+                    pixel[b] = whiteIsZero ? 255 - sample : sample;
+                }
+                if (interleaved) {
+                    for (int b = 0; b < bands; b++) {
+                        out[at++] = pixel[b];
+                    }
+                } else {
+                    int count = srcBands != null ? srcBands.length
+                            : (destBands != null ? destBands.length : bands);
+                    for (int b = 0; b < count; b++) {
+                        int from = srcBands != null ? srcBands[b] : b;
+                        int to = destBands != null ? destBands[b] : b;
+                        raster.setSample(destRegion.x + dx, destRegion.y + dy, to, pixel[from]);
+                    }
+                }
+            }
+            if (interleaved) {
+                raster.setPixels(destRegion.x, destRegion.y + dy, destRegion.width, 1, out);
             }
         }
     }
