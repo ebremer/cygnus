@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.ebremer</groupId>
+    <artifactId>cygnus</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>ndpi</artifactId>
+  <packaging>jar</packaging>
+
+  <name>Cygnus Hamamatsu NDPI Reader</name>
+  <description>Read-only Java ImageIO plug-in for Hamamatsu NDPI whole-slide images</description>
+
+  <dependencies>
+    <!--
+      Decodes the JPEG tiles. There is deliberately no TIFF dependency: an NDPI
+      directory is not a TIFF directory a TIFF reader can parse (64-bit offsets
+      smuggled into a classic TIFF), and its pixel data is not a TIFF codec's to
+      decode, so the container is read here.
+    -->
+    <dependency>
+      <groupId>com.twelvemonkeys.imageio</groupId>
+      <artifactId>imageio-jpeg</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>

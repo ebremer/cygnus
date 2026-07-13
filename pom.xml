@@ -16,6 +16,7 @@
     <module>JPEG2000</module>
     <module>JPEGXL</module>
     <module>SVS</module>
+    <module>NDPI</module>
   </modules>
 
   <properties>
