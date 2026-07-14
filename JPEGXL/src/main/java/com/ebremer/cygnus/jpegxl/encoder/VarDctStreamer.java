@@ -1,6 +1,7 @@
 package com.ebremer.cygnus.jpegxl.encoder;
 
 import com.ebremer.cygnus.jpegxl.codestream.BitDepth;
+import com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo;
 import com.ebremer.cygnus.jpegxl.codestream.ImageMetadata;
 import com.ebremer.cygnus.jpegxl.codestream.SizeHeader;
 import com.ebremer.cygnus.jpegxl.io.BitWriter;
@@ -71,11 +72,10 @@ final class VarDctStreamer {
     private final BitDepth depth;
     private final int bits;
     private final boolean grey;
-    private final boolean alpha;
-    private final boolean alphaAssociated;
+    private final java.util.List<ExtraChannelInfo> extras;
     private final float distance;
     private final int numInput;
-    private final int alphaIndex;
+    private final int colourCount;
 
     private final int groupColumns;
     private final int numBands;      // = group rows
@@ -114,7 +114,7 @@ final class VarDctStreamer {
     private boolean finished;
 
     VarDctStreamer(OutputStream out, int width, int height, BitDepth depth, boolean grey,
-            boolean alpha, boolean alphaAssociated, float distance, boolean rateControl) {
+            java.util.List<ExtraChannelInfo> extras, float distance, boolean rateControl) {
         this.out = out;
         this.rateControl = rateControl;
         this.width = width;
@@ -122,11 +122,10 @@ final class VarDctStreamer {
         this.depth = depth;
         this.bits = depth.bitsPerSample;
         this.grey = grey;
-        this.alpha = alpha;
-        this.alphaAssociated = alphaAssociated;
+        this.extras = java.util.List.copyOf(extras);
         this.distance = distance;
-        this.numInput = (grey ? 1 : 3) + (alpha ? 1 : 0);
-        this.alphaIndex = grey ? 1 : 3;
+        this.colourCount = grey ? 1 : 3;
+        this.numInput = colourCount + this.extras.size();
         this.paddedHeight = (height + 7) & ~7;
 
         this.groupColumns = VarDctEncoder.ceilDiv(width, VarDctEncoder.GROUP_DIM);
@@ -136,7 +135,7 @@ final class VarDctStreamer {
         this.lfColumns = VarDctEncoder.ceilDiv(width, lfDim);
         this.numLfGroups = lfColumns * VarDctEncoder.ceilDiv(height, lfDim);
 
-        this.enc = new VarDctEncoder(width, height, depth, grey, alpha, distance);
+        this.enc = new VarDctEncoder(width, height, depth, grey, this.extras, distance);
         this.books = Math.min(numBands, MAX_BOOKS);
         this.bookPerBand = numBands <= MAX_BOOKS;
         int[] map = new int[books * VarDctEncoder.CONTEXTS_PER_PRESET];
@@ -279,9 +278,10 @@ final class VarDctStreamer {
             for (int i = 0; i < tokens.n; i++) {
                 hfEnc.writeShared(gw, contextBase + tokens.ctx[i], tokens.val[i], scratch);
             }
-            if (alpha) {
+            if (!extras.isEmpty()) {
                 int x0 = gc * VarDctEncoder.GROUP_DIM;
-                enc.writeGroupAlpha(gw, hold[alphaIndex], holdY0, x0, top,
+                enc.writeGroupExtras(gw, java.util.Arrays.copyOfRange(hold, colourCount,
+                                hold.length), holdY0, x0, top,
                         Math.min(VarDctEncoder.GROUP_DIM, width - x0),
                         Math.min(VarDctEncoder.GROUP_DIM, height - top));
             }
@@ -375,19 +375,18 @@ final class VarDctStreamer {
         int prevMul = 0;
         double prevErr = 0;
         for (int round = 0; round < 4; round++) {
-            VarDctEncoder probe = new VarDctEncoder(cw, ch, depth, grey, false, distance);
+            VarDctEncoder probe = new VarDctEncoder(cw, ch, depth, grey,
+                    java.util.List.of(), distance);
             probe.setHfMul(mul);
             probe.loadWindow(crop, 0, ch, 0, (ch + 7) & ~7, 0);
             probe.measureWindow();
             probe.quantiseWindow(mean);
-            byte[] jxl = probe.standalone(null, false);
+            byte[] jxl = probe.standalone(new int[0][]);
             double err = VarDctEncoder.measureError(crop, cw, ch, depth, grey, jxl);
 
-            // A finer quantiser stops paying at some point: the error a band can
-            // reach is floored by what the decoder's own smoothing does to it,
-            // not by the coefficients, and past that floor a finer step buys bits
-            // and nothing else. When a step of the multiplier barely moves the
-            // error, take the cheaper one and stop.
+            // A finer quantiser stops paying once the band is as close to the
+            // source as eight-bit output can get it. When a step of the
+            // multiplier barely moves the error, take the cheaper one and stop.
             if (prevMul > 0 && err > prevErr * FLOOR_GAIN) {
                 best = prevMul;
                 break;
@@ -512,10 +511,10 @@ final class VarDctStreamer {
         w.write(0xff, 8);
         w.write(0x0a, 8);
         new SizeHeader(width, height).write(w);
-        ImageMetadata meta = JxlEncoder.buildMetadata(depth, grey, alpha, alphaAssociated);
+        ImageMetadata meta = JxlEncoder.buildMetadata(depth, grey, extras);
         meta.xybEncoded = true;
         meta.write(w);
-        VarDctEncoder.writeFrameHeader(w, alpha);
+        VarDctEncoder.writeFrameHeader(w, extras.size());
         w.writeBool(false); // TOC not permuted
         w.zeroPadToByte();
         VarDctEncoder.writeTocEntry(w, lfGlobalBytes.length);

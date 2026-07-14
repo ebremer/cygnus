@@ -148,6 +148,28 @@ cropped result; reference, LF and preview frames always decode whole.
   (`VarDctEncoder.encode(rgb, w, h, distance)`), and an iterative
   rate-control mode (`encodeToTarget`) that refines the quantiser against
   the achieved error; the ImageIO quality knob uses the latter.
+- **Extra channels**: as many as the image needs, of every type the format
+  defines — alpha, depth, selection mask, CMYK black, CFA, thermal, spot
+  colour, and the catch-all — each with its own name, its own bit depth
+  (integer or float, independent of the colour planes) and its own resolution.
+  Pass a `List<ExtraChannelInfo>` and one plane per entry:
+
+  ```java
+  var extras = List.of(
+      ExtraChannelInfo.alpha(BitDepth.of(8), false),
+      ExtraChannelInfo.of(ExtraChannelInfo.TYPE_DEPTH, BitDepth.of(16), "depth"),
+      ExtraChannelInfo.spot(BitDepth.of(8), "pantone-032", 0.94f, 0.28f, 0.32f, 1f));
+  byte[] jxl = JxlEncoder.encode(planes, w, h, 8, false, extras);   // lossless
+  byte[] lossy = VarDctEncoder.encode(planes, w, h, 8, false, extras, 1.0f);
+  ```
+
+  In the lossy path only the colour is quantised; the extra channels ride
+  beside it losslessly, so a lossy render still has an exact depth buffer.
+  A `dimShift` stores a channel at half, a quarter or an eighth of the size and
+  lets the decoder stretch it back out. Works lossless, lossy, progressive,
+  float and streamed — except `dimShift`, which the row-at-a-time streaming
+  encoder refuses, having nowhere to put a quarter-width row. ImageIO remains
+  alpha-only: a `BufferedImage` has nowhere to put a channel called "thermal".
 - **Both restoration filters are accounted for on encode.** The decoder blurs
   every frame with gaborish and then runs an edge-preserving filter over it, and
   an encoder that ignores either is aiming at the wrong target. Gaborish is
@@ -246,7 +268,7 @@ byte[] jpeg = JpegReconstructor.reconstruct(jxl);  // the original, byte-exact
 ```
 - 256×256 groups with a proper TOC, so large images decode in bounded memory
   and are parallelisable by conforming decoders.
-- Greyscale/RGB, 1–31 bits, optional alpha (lossless).
+- Greyscale/RGB, 1–31 bits, any number of extra channels (lossless).
 
 ## Building
 

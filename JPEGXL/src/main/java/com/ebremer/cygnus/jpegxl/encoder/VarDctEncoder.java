@@ -1,6 +1,7 @@
 package com.ebremer.cygnus.jpegxl.encoder;
 
 import com.ebremer.cygnus.jpegxl.codestream.BitDepth;
+import com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo;
 import com.ebremer.cygnus.jpegxl.codestream.ImageMetadata;
 import com.ebremer.cygnus.jpegxl.codestream.RestorationFilter;
 import com.ebremer.cygnus.jpegxl.codestream.SizeHeader;
@@ -95,7 +96,7 @@ public final class VarDctEncoder {
     private final int bits;
     private final double maxVal;   // integer samples only
     private final boolean grey;
-    private final boolean hasAlpha;
+    private final java.util.List<ExtraChannelInfo> extras;
     private final int globalScale;
     private int hfMul;
     private final float[] scaledDequant = new float[3];
@@ -177,11 +178,12 @@ public final class VarDctEncoder {
      * time through {@link #loadWindow}.
      */
     VarDctEncoder(int width, int height, int bits, boolean grey, boolean alpha, float distance) {
-        this(width, height, BitDepth.of(bits), grey, alpha, distance);
+        this(width, height, BitDepth.of(bits), grey,
+                JxlEncoder.alphaOnly(BitDepth.of(bits), alpha, false), distance);
     }
 
-    VarDctEncoder(int width, int height, BitDepth depth, boolean grey, boolean alpha,
-            float distance) {
+    VarDctEncoder(int width, int height, BitDepth depth, boolean grey,
+            java.util.List<ExtraChannelInfo> extras, float distance) {
         this.width = width;
         this.height = height;
         this.paddedWidth = (width + 7) & ~7;
@@ -190,7 +192,7 @@ public final class VarDctEncoder {
         this.bits = depth.bitsPerSample;
         this.maxVal = depth.floatingPoint ? 1 : (1 << depth.bitsPerSample) - 1;
         this.grey = grey;
-        this.hasAlpha = alpha;
+        this.extras = java.util.List.copyOf(extras);
         float d = Math.max(0.1f, distance);
         this.globalScale = Math.max(1, Math.min(65535, Math.round(4096f / d)));
         this.hfMul = baseHfMul(d);
@@ -980,6 +982,22 @@ public final class VarDctEncoder {
     }
 
     /**
+     * Lossy colour with any number of extra channels, each carried losslessly.
+     *
+     * <p>Only the colour goes through XYB and the quantiser. Every extra channel
+     * rides in a modular sub-stream beside it and comes back exactly as it went
+     * in — which is what you want: a lossy render whose depth buffer is still
+     * exact, a lossy micrograph whose segmentation mask has not been smeared. It
+     * is also what the format expects; an extra channel has no perceptual model
+     * to be quantised against.
+     */
+    public static byte[] encode(int[][] planes, int width, int height, int bits,
+            boolean grey, java.util.List<ExtraChannelInfo> extras, float distance)
+            throws IOException {
+        return encodeSamples(planes, width, height, BitDepth.of(bits), grey, extras, distance);
+    }
+
+    /**
      * Encodes floating-point samples lossily.
      *
      * <p>The float goes straight into the XYB conversion, and that is the whole
@@ -1001,8 +1019,16 @@ public final class VarDctEncoder {
     public static byte[] encodeFloat(float[][] planes, int width, int height, BitDepth depth,
             boolean grey, boolean alpha, boolean alphaAssociated, float distance)
             throws IOException {
-        return encodeSamples(pack(planes, width, height, depth, grey, alpha), width, height,
-                depth, grey, alpha, alphaAssociated, distance);
+        return encodeFloat(planes, width, height, depth, grey,
+                JxlEncoder.alphaOnly(depth, alpha, alphaAssociated), distance);
+    }
+
+    /** {@link #encodeFloat} with any number of extra channels. */
+    public static byte[] encodeFloat(float[][] planes, int width, int height, BitDepth depth,
+            boolean grey, java.util.List<ExtraChannelInfo> extras, float distance)
+            throws IOException {
+        return encodeSamples(JxlEncoder.pack(planes, width, height, depth, grey, extras),
+                width, height, depth, grey, extras, distance);
     }
 
     /** {@link #encodeFloat} at IEEE binary32, the depth that holds any float. */
@@ -1016,11 +1042,20 @@ public final class VarDctEncoder {
     static byte[] encodeSamples(int[][] planes, int width, int height, BitDepth depth,
             boolean grey, boolean alpha, boolean alphaAssociated, float distance)
             throws IOException {
-        checkInput(planes, width, height, depth, grey, alpha);
-        VarDctEncoder enc = new VarDctEncoder(width, height, depth, grey, alpha, distance);
-        enc.loadWhole(planes);
+        return encodeSamples(planes, width, height, depth, grey,
+                JxlEncoder.alphaOnly(depth, alpha, alphaAssociated), distance);
+    }
+
+    static byte[] encodeSamples(int[][] planes, int width, int height, BitDepth depth,
+            boolean grey, java.util.List<ExtraChannelInfo> extras, float distance)
+            throws IOException {
+        checkInput(planes, width, height, depth, grey, extras);
+        VarDctEncoder enc = new VarDctEncoder(width, height, depth, grey, extras, distance);
+        int colour = grey ? 1 : 3;
+        enc.loadWhole(java.util.Arrays.copyOf(planes, colour));
         enc.quantiseWindow(Double.NaN);
-        return enc.standalone(alpha ? planes[grey ? 1 : 3] : null, alphaAssociated);
+        return enc.standalone(
+                java.util.Arrays.copyOfRange(planes, colour, planes.length));
     }
 
     /** Lays float planes out as the samples the coder will carry. */
@@ -1054,31 +1089,33 @@ public final class VarDctEncoder {
      * measures, which is why the window's quantisation — masking reference and
      * all — is left exactly as the caller set it.
      */
-    byte[] standalone(int[] alphaPlane, boolean alphaAssociated) throws IOException {
+    byte[] standalone(int[][] extraPlanes) throws IOException {
         BitWriter out = new BitWriter();
         out.write(0xff, 8);
         out.write(0x0a, 8);
         new SizeHeader(width, height).write(out);
-        ImageMetadata meta = JxlEncoder.buildMetadata(depth, grey, hasAlpha, alphaAssociated);
+        ImageMetadata meta = JxlEncoder.buildMetadata(depth, grey, extras);
         meta.xybEncoded = true;
         meta.write(out);
-        writeFrame(out, alphaPlane);
+        writeFrame(out, extraPlanes);
         return out.toByteArray();
     }
 
     static void checkInput(int[][] planes, int width, int height, BitDepth depth,
             boolean grey, boolean alpha) {
+        checkInput(planes, width, height, depth, grey,
+                JxlEncoder.alphaOnly(depth, alpha, false));
+    }
+
+    static void checkInput(int[][] planes, int width, int height, BitDepth depth,
+            boolean grey, java.util.List<ExtraChannelInfo> extras) {
         if (width <= 0 || height <= 0) {
             throw new IllegalArgumentException("bad dimensions");
         }
         if (!depth.floatingPoint && (depth.bitsPerSample < 1 || depth.bitsPerSample > 16)) {
             throw new IllegalArgumentException("lossy integer samples must be 1..16 bits");
         }
-        int numInput = (grey ? 1 : 3) + (alpha ? 1 : 0);
-        if (planes.length != numInput) {
-            throw new IllegalArgumentException("expected " + numInput + " planes, got "
-                    + planes.length);
-        }
+        JxlEncoder.checkPlanes(planes, width, height, grey, extras);
     }
 
     /**
@@ -1112,14 +1149,20 @@ public final class VarDctEncoder {
     static byte[] toTarget(int[][] planes, int width, int height, BitDepth depth,
             boolean grey, boolean alpha, boolean alphaAssociated, float distance)
             throws IOException {
+        return toTarget(planes, width, height, depth, grey,
+                JxlEncoder.alphaOnly(depth, alpha, alphaAssociated), distance);
+    }
+
+    static byte[] toTarget(int[][] planes, int width, int height, BitDepth depth,
+            boolean grey, java.util.List<ExtraChannelInfo> extras, float distance)
+            throws IOException {
         float d = Math.max(0.1f, distance);
         double target = targetError(d);
         byte[] best = null;
         double bestMiss = Double.MAX_VALUE;
         float tryD = d;
         for (int round = 0; round < 3; round++) {
-            byte[] jxl = encodeSamples(planes, width, height, depth, grey, alpha,
-                    alphaAssociated, tryD);
+            byte[] jxl = encodeSamples(planes, width, height, depth, grey, extras, tryD);
             double err = measureError(planes, width, height, depth, grey, jxl);
             double miss = Math.abs(Math.log(Math.max(err, 1e-3) / target));
             if (miss < bestMiss) {
@@ -1213,7 +1256,7 @@ public final class VarDctEncoder {
 
     // --------------------------------------------------------------- frame
 
-    private void writeFrame(BitWriter out, int[] alphaPlane) throws IOException {
+    private void writeFrame(BitWriter out, int[][] extraPlanes) throws IOException {
         int groupColumns = ceilDiv(width, GROUP_DIM);
         int groupRows = ceilDiv(height, GROUP_DIM);
         int numGroups = groupColumns * groupRows;
@@ -1242,7 +1285,7 @@ public final class VarDctEncoder {
         // ---- sections (bit-contiguous in the single-section case)
         if (single) {
             BitWriter one = new BitWriter();
-            writeLfGlobalBits(one, true, alphaPlane);
+            writeLfGlobalBits(one, true, extraPlanes);
             writeLfGroupBits(one, cells, 0, lfCols);
             writeHfGlobalBits(one, hfEnc, numGroups, 1);
             for (int i = 0; i < groupCtx[0].length; i++) {
@@ -1250,7 +1293,7 @@ public final class VarDctEncoder {
             }
             one.zeroPadToByte();
             byte[] payload = one.toByteArray();
-            writeFrameHeader(out, hasAlpha);
+            writeFrameHeader(out, extras.size());
             out.writeBool(false); // TOC not permuted
             out.zeroPadToByte();
             writeTocEntry(out, payload.length);
@@ -1260,7 +1303,7 @@ public final class VarDctEncoder {
         }
 
         BitWriter lfg = new BitWriter();
-        writeLfGlobalBits(lfg, false, alphaPlane);
+        writeLfGlobalBits(lfg, false, extraPlanes);
         lfg.zeroPadToByte();
         byte[] lfGlobalBytes = lfg.toByteArray();
         byte[][] lfGroupBytes = new byte[numLfGroups][];
@@ -1281,10 +1324,10 @@ public final class VarDctEncoder {
             for (int i = 0; i < groupCtx[g].length; i++) {
                 hfEnc.write(gw, groupCtx[g][i], groupVal[g][i]);
             }
-            if (alphaPlane != null) {
+            if (!extras.isEmpty()) {
                 int x0 = (g % groupColumns) * GROUP_DIM;
                 int gy = (g / groupColumns) * GROUP_DIM;
-                writeGroupAlpha(gw, alphaPlane, 0, x0, gy,
+                writeGroupExtras(gw, extraPlanes, 0, x0, gy,
                         Math.min(GROUP_DIM, width - x0), Math.min(GROUP_DIM, height - gy));
             }
             gw.zeroPadToByte();
@@ -1292,7 +1335,7 @@ public final class VarDctEncoder {
         }
 
         // ---- header + TOC + payload
-        writeFrameHeader(out, hasAlpha);
+        writeFrameHeader(out, extras.size());
         out.writeBool(false); // TOC not permuted
         out.zeroPadToByte();
         writeTocEntry(out, lfGlobalBytes.length);
@@ -1397,7 +1440,7 @@ public final class VarDctEncoder {
         }
     }
 
-    void writeLfGlobalBits(BitWriter w, boolean single, int[] alphaPlane) {
+    void writeLfGlobalBits(BitWriter w, boolean single, int[][] extraPlanes) {
         w.writeBool(true);   // LfChannelDequantization.all_default
         if (globalScale <= 2048) {
             w.write(0, 2);
@@ -1420,34 +1463,35 @@ public final class VarDctEncoder {
         w.write(0, 16);      // base correlation B = 0 (no implicit Y contribution)
         w.write(128, 8);     // x factor LF
         w.write(128, 8);     // b factor LF
-        if (!hasAlpha) {
+        if (extras.isEmpty()) {
             w.writeBool(false); // no global MA tree; no modular channels either
             return;
         }
         w.writeBool(true);   // global tree present
         if (single) {
-            // the alpha channel fits the global stream: a learned tree and
-            // real code here, the tokens right after the stream header
-            AlphaCode a = buildAlphaCode(alphaPlane, width, height);
+            // the extra channels fit the global stream: a learned tree and a real
+            // code here, the tokens right after the stream header
+            JxlEncoder.SubStream s = JxlEncoder.buildSubStream(
+                    extraCrops(extraPlanes, 0, 0, 0, width, height));
             EntropyEncoder treeEnc = new EntropyEncoder(6, false, false, true);
-            JxlEncoder.emitTree(a.tree, null, treeEnc);
-            EntropyEncoder litProbe = new EntropyEncoder(a.numCtx, true, true);
-            JxlEncoder.countLiterals(a.buf, litProbe);
+            JxlEncoder.emitTree(s.tree, null, treeEnc);
+            EntropyEncoder litProbe = new EntropyEncoder(s.numCtx, true, true);
+            JxlEncoder.countLiterals(s.buf, litProbe);
             litProbe.prepareCosts();
-            JxlEncoder.findMatches(a.buf, width, litProbe);
-            EntropyEncoder dataEnc = new EntropyEncoder(a.numCtx, true, true, true);
-            JxlEncoder.emitBuffer(a.buf, null, dataEnc, width);
+            JxlEncoder.findMatches(s.buf, s.distMult, litProbe);
+            EntropyEncoder dataEnc = new EntropyEncoder(s.numCtx, true, true, true);
+            JxlEncoder.emitBuffer(s.buf, null, dataEnc, s.distMult);
             treeEnc.writeSpec(w);
-            JxlEncoder.emitTree(a.tree, w, treeEnc);
+            JxlEncoder.emitTree(s.tree, w, treeEnc);
             treeEnc.finishSection(w);
             dataEnc.writeSpec(w);
             w.writeBool(true);  // use_global_tree
             w.writeBool(true);  // default weighted-predictor parameters
             w.write(0, 2);      // nb_transforms = 0
-            JxlEncoder.emitBuffer(a.buf, w, dataEnc, width);
+            JxlEncoder.emitBuffer(s.buf, w, dataEnc, s.distMult);
             dataEnc.finishSection(w);
         } else {
-            // alpha is bigger than a group: nothing is coded globally, so a
+            // the extras are bigger than a group: nothing is coded globally, so a
             // trivial one-leaf tree and an empty code satisfy the reader
             JxlEncoder.TNode leaf = new JxlEncoder.TNode();
             leaf.predictor = 5; // gradient
@@ -1463,53 +1507,67 @@ public final class VarDctEncoder {
         }
     }
 
-    /** A learned modular code for one alpha rectangle. */
-    private static final class AlphaCode {
-        JxlEncoder.TNode tree;
-        int numCtx;
-        JxlEncoder.TokenBuf buf;
-    }
-
-    private static AlphaCode buildAlphaCode(int[] px, int aw, int ah) {
-        JxlEncoder.Chan c = new JxlEncoder.Chan(aw, ah, px);
-        JxlEncoder.choosePredictor(c);
-        java.util.List<int[]> rect = java.util.List.of(new int[] {0, 0, aw, ah});
-        JxlEncoder.TNode sub = JxlEncoder.learnTree(c, null, rect, 1 << 14, 4);
-        JxlEncoder.refineLeaves(c, sub, null, rect);
-        AlphaCode a = new AlphaCode();
-        a.tree = sub;
-        a.numCtx = JxlEncoder.assignCtx(sub);
-        a.buf = new JxlEncoder.TokenBuf();
-        JxlEncoder.tokenizeRect(c, sub, null, 0, 0, aw, ah, a.buf);
-        return a;
+    /**
+     * The extra channels cropped to one image rectangle, as coded channels.
+     *
+     * <p>An extra channel with a {@code dimShift} holds every 2^d'th sample, so
+     * its slice of a group is that much smaller — and a slice that comes out
+     * empty is not coded at all, which is what the decoder expects (it renumbers
+     * the channels after it, and the channel number is a tree property).
+     *
+     * @param planes one plane per extra channel, holding image rows from
+     *               {@code srcY0} at that channel's own width
+     */
+    private java.util.List<JxlEncoder.Chan> extraCrops(int[][] planes, int srcY0,
+            int left, int top, int w, int h) {
+        java.util.List<JxlEncoder.Chan> out = new java.util.ArrayList<>();
+        for (int i = 0; i < extras.size(); i++) {
+            ExtraChannelInfo ec = extras.get(i);
+            int ecW = ec.planeWidth(width);
+            int ecH = ec.planeHeight(height);
+            JxlEncoder.Chan whole = new JxlEncoder.Chan(ecW, ecH, ec.dimShift, ec.dimShift,
+                    planes[i]);
+            int[] s = JxlEncoder.slice(whole, left, top, w, h);
+            if (s[2] <= 0 || s[3] <= 0) {
+                continue;
+            }
+            int row0 = s[1] - (srcY0 >> ec.dimShift);
+            int[] px = new int[s[2] * s[3]];
+            for (int y = 0; y < s[3]; y++) {
+                System.arraycopy(planes[i], (row0 + y) * ecW + s[0], px, y * s[2], s[2]);
+            }
+            out.add(new JxlEncoder.Chan(s[2], s[3], px));
+        }
+        return out;
     }
 
     /**
-     * Writes one group's alpha crop as a self-contained modular sub-stream.
-     * {@code alpha} holds image rows from {@code srcY0} at the image's width.
+     * Writes one group's extra channels as a self-contained modular sub-stream.
+     * {@code planes} hold image rows from {@code srcY0}.
      */
-    void writeGroupAlpha(BitWriter gw, int[] alpha, int srcY0, int x0, int gy, int w, int h) {
-        int[] px = new int[w * h];
-        for (int y = 0; y < h; y++) {
-            System.arraycopy(alpha, (gy - srcY0 + y) * width + x0, px, y * w, w);
+    void writeGroupExtras(BitWriter gw, int[][] planes, int srcY0, int x0, int gy,
+            int w, int h) {
+        java.util.List<JxlEncoder.Chan> crops = extraCrops(planes, srcY0, x0, gy, w, h);
+        if (crops.isEmpty()) {
+            return; // a stream with no channels reads no header at all
         }
-        AlphaCode a = buildAlphaCode(px, w, h);
+        JxlEncoder.SubStream s = JxlEncoder.buildSubStream(crops);
         gw.writeBool(false); // use_global_tree = false: the section is standalone
         gw.writeBool(true);  // default weighted-predictor parameters
         gw.write(0, 2);      // nb_transforms = 0
         EntropyEncoder treeEnc = new EntropyEncoder(6, false, false, true);
-        JxlEncoder.emitTree(a.tree, null, treeEnc);
+        JxlEncoder.emitTree(s.tree, null, treeEnc);
         treeEnc.writeSpec(gw);
-        JxlEncoder.emitTree(a.tree, gw, treeEnc);
+        JxlEncoder.emitTree(s.tree, gw, treeEnc);
         treeEnc.finishSection(gw);
-        EntropyEncoder litProbe = new EntropyEncoder(a.numCtx, true, true);
-        JxlEncoder.countLiterals(a.buf, litProbe);
+        EntropyEncoder litProbe = new EntropyEncoder(s.numCtx, true, true);
+        JxlEncoder.countLiterals(s.buf, litProbe);
         litProbe.prepareCosts();
-        JxlEncoder.findMatches(a.buf, w, litProbe);
-        EntropyEncoder dataEnc = new EntropyEncoder(a.numCtx, true, true, true);
-        JxlEncoder.emitBuffer(a.buf, null, dataEnc, w);
+        JxlEncoder.findMatches(s.buf, s.distMult, litProbe);
+        EntropyEncoder dataEnc = new EntropyEncoder(s.numCtx, true, true, true);
+        JxlEncoder.emitBuffer(s.buf, null, dataEnc, s.distMult);
         dataEnc.writeSpec(gw);
-        JxlEncoder.emitBuffer(a.buf, gw, dataEnc, w);
+        JxlEncoder.emitBuffer(s.buf, gw, dataEnc, s.distMult);
         dataEnc.finishSection(gw);
     }
 
@@ -1592,6 +1650,10 @@ public final class VarDctEncoder {
     }
 
     static void writeFrameHeader(BitWriter out, boolean alpha) {
+        writeFrameHeader(out, alpha ? 1 : 0);
+    }
+
+    static void writeFrameHeader(BitWriter out, int numExtra) {
         out.zeroPadToByte();
         out.writeBool(false);        // !all_default
         out.write(0, 2);             // frame_type: regular
@@ -1599,14 +1661,14 @@ public final class VarDctEncoder {
         out.writeU64(128);           // flags: skip adaptive LF smoothing
         // xyb encoded => no do_YCbCr bit
         out.write(0, 2);             // log upsampling
-        if (alpha) {
+        for (int i = 0; i < numExtra; i++) {
             out.write(0, 2);         // extra channel upsampling
         }
         out.write(2, 3);             // x_qm_scale = 2
         out.write(2, 3);             // b_qm_scale = 2
         out.write(0, 2);             // num_passes = 1
         out.writeBool(false);        // have_crop
-        int blendEntries = 1 + (alpha ? 1 : 0);
+        int blendEntries = 1 + numExtra;
         for (int i = 0; i < blendEntries; i++) {
             out.write(0, 2);         // blend mode: replace (full frame -> no source)
         }

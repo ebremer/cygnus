@@ -107,8 +107,8 @@ public final class JxlEncoder {
     private final BitDepth depth;
     private final int bits;   // depth.bitsPerSample, used everywhere it always was
     private final boolean grey;
-    private final boolean alpha;
-    private final boolean alphaAssociated;
+    private final List<ExtraChannelInfo> extras;
+    private final int colourCount;
     private final int[][] input;
     private final int numInput;
     private final boolean progressive;
@@ -130,31 +130,61 @@ public final class JxlEncoder {
      */
     private static final int PROGRESSIVE_PASSES = 3;
 
-    private JxlEncoder(int[][] planes, int width, int height, int bits,
-            boolean grey, boolean alpha, boolean alphaAssociated) {
-        this(planes, width, height, BitDepth.of(bits), grey, alpha, alphaAssociated, false);
-    }
-
     private JxlEncoder(int[][] planes, int width, int height, BitDepth depth, boolean grey,
-            boolean alpha, boolean alphaAssociated, boolean progressive) {
+            List<ExtraChannelInfo> extras, boolean progressive) {
         this.depth = depth;
         this.progressive = progressive;
         this.width = width;
         this.height = height;
         this.bits = depth.bitsPerSample;
         this.grey = grey;
-        this.alpha = alpha;
-        this.alphaAssociated = alphaAssociated;
-        this.numInput = (grey ? 1 : 3) + (alpha ? 1 : 0);
-        if (planes.length != numInput) {
-            throw new IllegalArgumentException("expected " + numInput + " planes, got " + planes.length);
-        }
+        this.extras = List.copyOf(extras);
+        this.colourCount = grey ? 1 : 3;
+        this.numInput = colourCount + this.extras.size();
+        checkPlanes(planes, width, height, grey, this.extras);
         this.input = new int[numInput][];
         for (int i = 0; i < numInput; i++) {
-            if (planes[i].length != width * height) {
-                throw new IllegalArgumentException("plane " + i + " has wrong size");
-            }
             this.input[i] = planes[i].clone();
+        }
+    }
+
+    /**
+     * The alpha channel an image with one would declare, at the image's own
+     * depth — which is what the boolean-alpha entry points are shorthand for.
+     */
+    static List<ExtraChannelInfo> alphaOnly(BitDepth depth, boolean alpha, boolean associated) {
+        return alpha ? List.of(ExtraChannelInfo.alpha(depth, associated)) : List.of();
+    }
+
+    /**
+     * Width of an extra channel's plane. A channel with {@code dimShift} d holds
+     * every 2^d'th sample along each axis, so its plane is that much smaller and
+     * the decoder stretches it back out.
+     */
+    static int ecWidth(ExtraChannelInfo ec, int width) {
+        return ec.planeWidth(width);
+    }
+
+    static int ecHeight(ExtraChannelInfo ec, int height) {
+        return ec.planeHeight(height);
+    }
+
+    /** Every plane present, the right size, and holding samples its depth can carry. */
+    static void checkPlanes(int[][] planes, int width, int height, boolean grey,
+            List<ExtraChannelInfo> extras) {
+        int colour = grey ? 1 : 3;
+        int n = colour + extras.size();
+        if (planes.length != n) {
+            throw new IllegalArgumentException("expected " + n + " planes, got " + planes.length);
+        }
+        for (int i = 0; i < n; i++) {
+            int w = i < colour ? width : ecWidth(extras.get(i - colour), width);
+            int h = i < colour ? height : ecHeight(extras.get(i - colour), height);
+            if (planes[i] == null || planes[i].length != w * h) {
+                throw new IllegalArgumentException("plane " + i + " should be " + w + "x" + h
+                        + " (" + w * h + " samples), got "
+                        + (planes[i] == null ? "null" : planes[i].length));
+            }
         }
     }
 
@@ -166,14 +196,39 @@ public final class JxlEncoder {
      */
     public static byte[] encode(int[][] planes, int width, int height, int bits,
             boolean grey, boolean alpha, boolean alphaAssociated) throws IOException {
+        return encode(planes, width, height, bits, grey,
+                alphaOnly(BitDepth.of(bits), alpha, alphaAssociated));
+    }
+
+    /**
+     * Encodes samples with any number of extra channels.
+     *
+     * <p>Alpha is only the extra channel everyone has. The format allows as many
+     * as an image needs, of nine kinds — depth, selection mask, CMYK black, CFA,
+     * thermal, spot colour, and two flavours of "something the reader may not
+     * understand" — each with its own name, its own bit depth, and its own
+     * resolution. A microscope slide can carry its fluorescence channels; a
+     * render can carry its depth buffer and its object mask; a scientific stack
+     * can carry sixteen bands and say what each of them is. All of it rides in
+     * the modular stream and comes back exactly.
+     *
+     * @param planes colour planes first (1 for greyscale, 3 for RGB), then one
+     *               plane per entry in {@code extras}, in that order. An extra
+     *               channel with a {@code dimShift} is smaller: see
+     *               {@link ExtraChannelInfo#step()}.
+     * @param extras what each extra channel is; build them with
+     *               {@link ExtraChannelInfo#alpha}, {@link ExtraChannelInfo#of},
+     *               {@link ExtraChannelInfo#spot} or {@link ExtraChannelInfo#cfa}
+     */
+    public static byte[] encode(int[][] planes, int width, int height, int bits,
+            boolean grey, List<ExtraChannelInfo> extras) throws IOException {
         if (width <= 0 || height <= 0) {
             throw new IllegalArgumentException("bad dimensions " + width + "x" + height);
         }
         if (bits < 1 || bits > 31) {
             throw new IllegalArgumentException("bits per sample must be in 1..31");
         }
-        return new JxlEncoder(planes, width, height, BitDepth.of(bits), grey, alpha,
-                alphaAssociated, false).run();
+        return new JxlEncoder(planes, width, height, BitDepth.of(bits), grey, extras, false).run();
     }
 
     /**
@@ -193,14 +248,20 @@ public final class JxlEncoder {
      */
     public static byte[] encodeProgressive(int[][] planes, int width, int height, int bits,
             boolean grey, boolean alpha, boolean alphaAssociated) throws IOException {
+        return encodeProgressive(planes, width, height, bits, grey,
+                alphaOnly(BitDepth.of(bits), alpha, alphaAssociated));
+    }
+
+    /** {@link #encodeProgressive} with any number of extra channels. */
+    public static byte[] encodeProgressive(int[][] planes, int width, int height, int bits,
+            boolean grey, List<ExtraChannelInfo> extras) throws IOException {
         if (width <= 0 || height <= 0) {
             throw new IllegalArgumentException("bad dimensions " + width + "x" + height);
         }
         if (bits < 1 || bits > 31) {
             throw new IllegalArgumentException("bits per sample must be in 1..31");
         }
-        return new JxlEncoder(planes, width, height, BitDepth.of(bits), grey, alpha,
-                alphaAssociated, true).run();
+        return new JxlEncoder(planes, width, height, BitDepth.of(bits), grey, extras, true).run();
     }
 
     /**
@@ -230,14 +291,26 @@ public final class JxlEncoder {
      */
     public static byte[] encodeFloat(float[][] planes, int width, int height, BitDepth depth,
             boolean grey, boolean alpha, boolean alphaAssociated) throws IOException {
+        return encodeFloat(planes, width, height, depth, grey,
+                alphaOnly(depth, alpha, alphaAssociated));
+    }
+
+    /**
+     * {@link #encodeFloat} with any number of extra channels, each carried at the
+     * depth it declares. A float image can therefore hold an 8-bit mask without
+     * widening it to 32 bits, and a float channel asked for a sample its depth
+     * cannot represent exactly refuses it rather than rounding it.
+     */
+    public static byte[] encodeFloat(float[][] planes, int width, int height, BitDepth depth,
+            boolean grey, List<ExtraChannelInfo> extras) throws IOException {
         if (width <= 0 || height <= 0) {
             throw new IllegalArgumentException("bad dimensions " + width + "x" + height);
         }
         if (!depth.floatingPoint) {
             throw new IllegalArgumentException("encodeFloat needs a floating-point depth");
         }
-        return encodeSamples(pack(planes, width, height, depth, grey, alpha), width, height,
-                depth, grey, alpha, alphaAssociated);
+        return encodeSamples(pack(planes, width, height, depth, grey, extras), width, height,
+                depth, grey, extras);
     }
 
     /** Encodes float samples as IEEE binary32, the depth that holds any of them. */
@@ -253,29 +326,60 @@ public final class JxlEncoder {
      */
     static byte[] encodeSamples(int[][] planes, int width, int height, BitDepth depth,
             boolean grey, boolean alpha, boolean alphaAssociated) throws IOException {
-        return new JxlEncoder(planes, width, height, depth, grey, alpha, alphaAssociated, false)
-                .run();
+        return encodeSamples(planes, width, height, depth, grey,
+                alphaOnly(depth, alpha, alphaAssociated));
+    }
+
+    static byte[] encodeSamples(int[][] planes, int width, int height, BitDepth depth,
+            boolean grey, List<ExtraChannelInfo> extras) throws IOException {
+        return new JxlEncoder(planes, width, height, depth, grey, extras, false).run();
     }
 
     /** Lays float planes out as the samples the coder will carry. */
     static int[][] pack(float[][] planes, int width, int height, BitDepth depth,
             boolean grey, boolean alpha) {
+        return pack(planes, width, height, depth, grey, alphaOnly(depth, alpha, false));
+    }
+
+    /**
+     * Lays float planes out as samples, each channel at the depth it declares:
+     * the colour planes at the image's, every extra at its own.
+     *
+     * <p>An extra channel with an <em>integer</em> depth in a float image is not
+     * a bit pattern — it is a value in [0, 1], which is how the decoder will read
+     * it back (it divides by the channel's full scale). A mask is a mask whatever
+     * the colour planes are made of.
+     */
+    static int[][] pack(float[][] planes, int width, int height, BitDepth depth,
+            boolean grey, List<ExtraChannelInfo> extras) {
         if (!depth.floatingPoint) {
             throw new IllegalArgumentException("float samples need a floating-point depth");
         }
-        int numInput = (grey ? 1 : 3) + (alpha ? 1 : 0);
+        int colour = grey ? 1 : 3;
+        int numInput = colour + extras.size();
         if (planes.length != numInput) {
             throw new IllegalArgumentException("expected " + numInput + " planes, got "
                     + planes.length);
         }
         int[][] out = new int[numInput][];
         for (int c = 0; c < numInput; c++) {
-            if (planes[c].length != width * height) {
-                throw new IllegalArgumentException("plane " + c + " has wrong size");
+            ExtraChannelInfo ec = c < colour ? null : extras.get(c - colour);
+            BitDepth d = ec == null ? depth : ec.bitDepth;
+            int w = ec == null ? width : ecWidth(ec, width);
+            int h = ec == null ? height : ecHeight(ec, height);
+            if (planes[c] == null || planes[c].length != w * h) {
+                throw new IllegalArgumentException("plane " + c + " should be " + w + "x" + h);
             }
-            int[] p = new int[width * height];
-            for (int i = 0; i < p.length; i++) {
-                p[i] = depth.floatToSample(planes[c][i]);
+            int[] p = new int[w * h];
+            if (d.floatingPoint) {
+                for (int i = 0; i < p.length; i++) {
+                    p[i] = d.floatToSample(planes[c][i]);
+                }
+            } else {
+                long max = (1L << d.bitsPerSample) - 1;
+                for (int i = 0; i < p.length; i++) {
+                    p[i] = Math.round(Math.max(0f, Math.min(1f, planes[c][i])) * max);
+                }
             }
             out[c] = p;
         }
@@ -289,19 +393,28 @@ public final class JxlEncoder {
     public static byte[] encodeWithPreview(int[][] planes, int width, int height, int bits,
             boolean grey, boolean alpha, boolean alphaAssociated,
             int[][] previewPlanes, int previewWidth, int previewHeight) throws IOException {
+        return encodeWithPreview(planes, width, height, bits, grey,
+                alphaOnly(BitDepth.of(bits), alpha, alphaAssociated),
+                previewPlanes, previewWidth, previewHeight);
+    }
+
+    /** {@link #encodeWithPreview} with any number of extra channels. */
+    public static byte[] encodeWithPreview(int[][] planes, int width, int height, int bits,
+            boolean grey, List<ExtraChannelInfo> extras,
+            int[][] previewPlanes, int previewWidth, int previewHeight) throws IOException {
         if (previewWidth <= 0 || previewHeight <= 0
                 || previewWidth > 4096 || previewHeight > 4096) {
             throw new IllegalArgumentException("bad preview dimensions");
         }
-        JxlEncoder main = new JxlEncoder(planes, width, height, bits, grey, alpha,
-                alphaAssociated);
+        BitDepth depth = BitDepth.of(bits);
+        JxlEncoder main = new JxlEncoder(planes, width, height, depth, grey, extras, false);
         JxlEncoder preview = new JxlEncoder(previewPlanes, previewWidth, previewHeight,
-                bits, grey, alpha, alphaAssociated);
+                depth, grey, extras, false);
         BitWriter out = new BitWriter();
         out.write(0xff, 8);
         out.write(0x0a, 8);
         new SizeHeader(width, height).write(out);
-        ImageMetadata meta = buildMetadata(BitDepth.of(bits), grey, alpha, alphaAssociated);
+        ImageMetadata meta = buildMetadata(depth, grey, extras);
         meta.previewWidth = previewWidth;
         meta.previewHeight = previewHeight;
         meta.write(out);
@@ -315,7 +428,7 @@ public final class JxlEncoder {
         out.write(0xff, 8);
         out.write(0x0a, 8);
         new SizeHeader(width, height).write(out);
-        buildMetadata(depth, grey, alpha, alphaAssociated).write(out);
+        buildMetadata(depth, grey, extras).write(out);
         writeFrame(out);
         return out.toByteArray();
     }
@@ -339,7 +452,7 @@ public final class JxlEncoder {
             chans.add(new Chan(paletteSize, paletteNumC, 0, -1, paletteData));
             chans.add(new Chan(width, height, index));
             for (int c = paletteNumC; c < numInput; c++) {
-                chans.add(new Chan(width, height, input[c]));
+                chans.add(chanOf(c));
             }
         } else {
             if (!grey) {
@@ -354,7 +467,7 @@ public final class JxlEncoder {
                 }
             }
             for (int i = 0; i < numInput; i++) {
-                chans.add(new Chan(width, height, input[i]));
+                chans.add(chanOf(i));
             }
         }
         if (progressive) {
@@ -371,6 +484,21 @@ public final class JxlEncoder {
     }
 
     /**
+     * Input plane {@code i} as a coded channel. Colour planes are the image's
+     * size; an extra channel is as big as its {@code dimShift} leaves it, and
+     * carries that shift — which is what the decoder gives it, and what puts a
+     * quarter-resolution mask in the LF groups rather than the pass groups.
+     */
+    private Chan chanOf(int i) {
+        if (i < colourCount) {
+            return new Chan(width, height, input[i]);
+        }
+        ExtraChannelInfo ec = extras.get(i - colourCount);
+        return new Chan(ecWidth(ec, width), ecHeight(ec, height),
+                ec.dimShift, ec.dimShift, input[i]);
+    }
+
+    /**
      * Builds a global palette when the image has few distinct sample tuples,
      * folding as many channels as pay off: all channels first (so alpha or a
      * grey plane rides along), colour-only as the fallback. Returns the
@@ -381,11 +509,19 @@ public final class JxlEncoder {
         if (bits > 16) {
             return 0; // colour keys pack 16 bits per channel
         }
-        if (tryPalette(numInput)) {
+        // A palette replaces its channels with one index plane, so it can only
+        // fold channels of the same shape — and the key packs 16 bits each into
+        // a long, so no more than four of them.
+        boolean foldable = numInput <= 4;
+        for (ExtraChannelInfo ec : extras) {
+            foldable &= ec.dimShift == 0 && ec.bitDepth.bitsPerSample <= 16
+                    && !ec.bitDepth.floatingPoint;
+        }
+        if (foldable && tryPalette(numInput)) {
             return numInput;
         }
-        if (!grey && alpha && tryPalette(3)) {
-            return 3;
+        if (numInput > colourCount && colourCount <= 4 && tryPalette(colourCount)) {
+            return colourCount;
         }
         return 0;
     }
@@ -873,7 +1009,7 @@ public final class JxlEncoder {
         }
 
         // ---- assemble the frame
-        writeFrameHeader(out, alpha, numPasses);
+        writeFrameHeader(out, extras.size(), numPasses);
 
         out.writeBool(false); // TOC not permuted
         out.zeroPadToByte();
@@ -1047,22 +1183,28 @@ public final class JxlEncoder {
 
     static ImageMetadata buildMetadata(int bits, boolean grey, boolean alpha,
             boolean alphaAssociated) {
-        return buildMetadata(BitDepth.of(bits), grey, alpha, alphaAssociated);
+        BitDepth depth = BitDepth.of(bits);
+        return buildMetadata(depth, grey, alphaOnly(depth, alpha, alphaAssociated));
     }
 
     static ImageMetadata buildMetadata(BitDepth depth, boolean grey, boolean alpha,
             boolean alphaAssociated) {
+        return buildMetadata(depth, grey, alphaOnly(depth, alpha, alphaAssociated));
+    }
+
+    static ImageMetadata buildMetadata(BitDepth depth, boolean grey,
+            List<ExtraChannelInfo> extras) {
         ImageMetadata meta = new ImageMetadata();
         meta.bitDepth = depth;
-        meta.modular16BitBuffers = !depth.floatingPoint && depth.bitsPerSample <= 12;
-        meta.xybEncoded = false;
-        if (alpha) {
-            ExtraChannelInfo ec = new ExtraChannelInfo();
-            ec.type = ExtraChannelInfo.TYPE_ALPHA;
-            ec.bitDepth = depth;   // alpha rides at the image's own depth, float included
-            ec.alphaAssociated = alphaAssociated;
-            meta.extraChannels.add(ec);
+        // The buffer-width hint has to cover every channel, not just colour: an
+        // 8-bit image carrying a 16-bit depth map still needs the wide buffers.
+        boolean narrow = !depth.floatingPoint && depth.bitsPerSample <= 12;
+        for (ExtraChannelInfo ec : extras) {
+            narrow &= !ec.bitDepth.floatingPoint && ec.bitDepth.bitsPerSample <= 12;
         }
+        meta.modular16BitBuffers = narrow;
+        meta.xybEncoded = false;
+        meta.extraChannels.addAll(extras);
         ColourEncoding colour = new ColourEncoding();
         if (grey) {
             colour.allDefault = false;
@@ -1073,7 +1215,7 @@ public final class JxlEncoder {
     }
 
     static void writeFrameHeader(BitWriter out, boolean alpha) {
-        writeFrameHeader(out, alpha, 1);
+        writeFrameHeader(out, alpha ? 1 : 0, 1);
     }
 
     /**
@@ -1083,7 +1225,7 @@ public final class JxlEncoder {
      *        pass: the decoder derives a shift range per pass from these
      *        markers and takes the channels whose shift falls in it.
      */
-    static void writeFrameHeader(BitWriter out, boolean alpha, int numPasses) {
+    static void writeFrameHeader(BitWriter out, int numExtra, int numPasses) {
         out.zeroPadToByte();
         out.writeBool(false);        // !all_default
         out.write(0, 2);             // frame_type: regular
@@ -1091,7 +1233,9 @@ public final class JxlEncoder {
         out.writeU64(0);             // flags
         out.writeBool(false);        // do_YCbCr (xyb_encoded is false)
         out.write(0, 2);             // log upsampling
-        if (alpha) {
+        for (int i = 0; i < numExtra; i++) {
+            // 0 here, so the channel's own dim_shift is the whole of its
+            // upsampling: the decoder multiplies the two
             out.write(0, 2);         // extra channel upsampling
         }
         out.write(GROUP_SIZE_SHIFT_BITS, 2); // group_size_shift = 8
@@ -1110,7 +1254,7 @@ public final class JxlEncoder {
             throw new IllegalArgumentException("unsupported pass count " + numPasses);
         }
         out.writeBool(false);        // have_crop
-        int blendEntries = 1 + (alpha ? 1 : 0);
+        int blendEntries = 1 + numExtra;
         for (int i = 0; i < blendEntries; i++) {
             out.write(0, 2);         // blend mode: replace (full frame -> no source)
         }
@@ -1208,6 +1352,46 @@ public final class JxlEncoder {
             list.add(chans.get(i));
         }
         return chainNode(list, list.size() - 1, subs);
+    }
+
+    /**
+     * A whole modular sub-stream over a set of channels: the learned tree, its
+     * context count, the tokens, and the LZ77 distance multiplier the decoder
+     * will use. This is what an extra-channel stream is — the colour encoder has
+     * one of these bolted to the side of every VarDCT frame that carries alpha,
+     * and it had room for exactly one channel.
+     *
+     * <p>Property 0 is the channel's index within the sub-stream, so the tree is
+     * a chain of subtrees switched on it, exactly as the global stream builds one.
+     */
+    static final class SubStream {
+        TNode tree;
+        int numCtx;
+        TokenBuf buf;
+        int distMult;
+    }
+
+    /** Learns and tokenizes one sub-stream over {@code channels}, in that order. */
+    static SubStream buildSubStream(List<Chan> channels) {
+        Map<Chan, TNode> subs = new java.util.IdentityHashMap<>();
+        for (Chan c : channels) {
+            choosePredictor(c);
+            List<int[]> rect = List.of(new int[] {0, 0, c.w, c.h});
+            TNode sub = learnTree(c, null, rect, 1 << 14, 4);
+            refineLeaves(c, sub, null, rect);
+            subs.put(c, sub);
+        }
+        SubStream s = new SubStream();
+        s.tree = chainNode(channels, channels.size() - 1, subs);
+        s.numCtx = assignCtx(s.tree);
+        s.buf = new TokenBuf();
+        int widest = 0;
+        for (Chan c : channels) {
+            tokenizeRect(c, subs.get(c), null, 0, 0, c.w, c.h, s.buf);
+            widest = Math.max(widest, c.w);
+        }
+        s.distMult = Math.min(widest, 1 << 21);
+        return s;
     }
 
     /** Assigns leaf contexts in the decoder's BFS order; returns the leaf count. */
@@ -1798,7 +1982,7 @@ public final class JxlEncoder {
      * image column 512 starts at its column 128 — exactly the arithmetic the
      * decoder does when it carves the same slice out.
      */
-    private static int[] slice(Chan c, int left, int top, int w, int h) {
+    static int[] slice(Chan c, int left, int top, int w, int h) {
         int x0 = left >> c.hshift;
         int y0 = top >> c.vshift;
         int cw = Math.min(ceilDiv(w, 1 << c.hshift), c.w - x0);

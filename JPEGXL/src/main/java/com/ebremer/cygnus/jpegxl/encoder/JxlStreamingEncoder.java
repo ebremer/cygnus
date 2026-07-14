@@ -1,6 +1,7 @@
 package com.ebremer.cygnus.jpegxl.encoder;
 
 import com.ebremer.cygnus.jpegxl.codestream.BitDepth;
+import com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo;
 import com.ebremer.cygnus.jpegxl.codestream.SizeHeader;
 import com.ebremer.cygnus.jpegxl.io.BitWriter;
 import java.io.IOException;
@@ -39,8 +40,7 @@ public final class JxlStreamingEncoder implements AutoCloseable {
     private final BitDepth depth;
     private final int bits;
     private final boolean grey;
-    private final boolean alpha;
-    private final boolean alphaAssociated;
+    private final java.util.List<ExtraChannelInfo> extras;
     private final float distance;    // 0 -> lossless modular
     private final boolean rateControl;
     private final int numInput;
@@ -75,8 +75,20 @@ public final class JxlStreamingEncoder implements AutoCloseable {
      */
     public JxlStreamingEncoder(OutputStream out, int width, int height, int bits,
             boolean grey, boolean alpha, boolean alphaAssociated, float distance) {
-        this(out, width, height, BitDepth.of(bits), grey, alpha, alphaAssociated, distance,
-                false);
+        this(out, width, height, BitDepth.of(bits), grey,
+                JxlEncoder.alphaOnly(BitDepth.of(bits), alpha, alphaAssociated), distance, false);
+    }
+
+    /**
+     * Streamed, with any number of extra channels. Rows carry every channel:
+     * colour planes first, then one plane per extra, each at the image's full
+     * width — so a reduced-resolution ({@code dimShift}) channel has no coherent
+     * place in a row-at-a-time API and is refused here. Use the whole-image
+     * {@link JxlEncoder} for those.
+     */
+    public JxlStreamingEncoder(OutputStream out, int width, int height, int bits,
+            boolean grey, java.util.List<ExtraChannelInfo> extras, float distance) {
+        this(out, width, height, BitDepth.of(bits), grey, extras, distance, false);
     }
 
     /**
@@ -99,11 +111,18 @@ public final class JxlStreamingEncoder implements AutoCloseable {
      */
     public static JxlStreamingEncoder targetingQuality(OutputStream out, int width, int height,
             int bits, boolean grey, boolean alpha, boolean alphaAssociated, float distance) {
+        return targetingQuality(out, width, height, bits, grey,
+                JxlEncoder.alphaOnly(BitDepth.of(bits), alpha, alphaAssociated), distance);
+    }
+
+    /** {@link #targetingQuality} with any number of extra channels. */
+    public static JxlStreamingEncoder targetingQuality(OutputStream out, int width, int height,
+            int bits, boolean grey, java.util.List<ExtraChannelInfo> extras, float distance) {
         if (distance <= 0) {
             throw new IllegalArgumentException("rate control needs a positive distance");
         }
-        return new JxlStreamingEncoder(out, width, height, BitDepth.of(bits), grey, alpha,
-                alphaAssociated, distance, true);
+        return new JxlStreamingEncoder(out, width, height, BitDepth.of(bits), grey, extras,
+                distance, true);
     }
 
     /**
@@ -121,15 +140,22 @@ public final class JxlStreamingEncoder implements AutoCloseable {
     public static JxlStreamingEncoder floatSamples(OutputStream out, int width, int height,
             BitDepth depth, boolean grey, boolean alpha, boolean alphaAssociated,
             float distance) {
+        return floatSamples(out, width, height, depth, grey,
+                JxlEncoder.alphaOnly(depth, alpha, alphaAssociated), distance);
+    }
+
+    /** {@link #floatSamples} with any number of extra channels. */
+    public static JxlStreamingEncoder floatSamples(OutputStream out, int width, int height,
+            BitDepth depth, boolean grey, java.util.List<ExtraChannelInfo> extras,
+            float distance) {
         if (!depth.floatingPoint) {
             throw new IllegalArgumentException("floatSamples needs a floating-point depth");
         }
-        return new JxlStreamingEncoder(out, width, height, depth, grey, alpha, alphaAssociated,
-                distance, false);
+        return new JxlStreamingEncoder(out, width, height, depth, grey, extras, distance, false);
     }
 
     private JxlStreamingEncoder(OutputStream out, int width, int height, BitDepth depth,
-            boolean grey, boolean alpha, boolean alphaAssociated, float distance,
+            boolean grey, java.util.List<ExtraChannelInfo> extras, float distance,
             boolean rateControl) {
         if (width <= 0 || height <= 0) {
             throw new IllegalArgumentException("bad dimensions " + width + "x" + height);
@@ -148,11 +174,16 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         this.height = height;
         this.depth = depth;
         this.bits = depth.bitsPerSample;
+        for (ExtraChannelInfo ec : extras) {
+            if (ec.dimShift != 0) {
+                throw new IllegalArgumentException("a streamed extra channel must be full"
+                        + " resolution; \"" + ec.name + "\" has dimShift " + ec.dimShift);
+            }
+        }
         this.grey = grey;
-        this.alpha = alpha;
-        this.alphaAssociated = alphaAssociated;
+        this.extras = java.util.List.copyOf(extras);
         this.distance = distance;
-        this.numInput = (grey ? 1 : 3) + (alpha ? 1 : 0);
+        this.numInput = (grey ? 1 : 3) + this.extras.size();
         this.rateControl = rateControl;
         this.groupColumns = JxlEncoder.ceilDiv(width, JxlEncoder.GROUP_DIM);
         int groupRows = JxlEncoder.ceilDiv(height, JxlEncoder.GROUP_DIM);
@@ -167,8 +198,8 @@ public final class JxlStreamingEncoder implements AutoCloseable {
             this.whole = null;
             this.band = null;
             this.sections = null;
-            this.lossy = new VarDctStreamer(out, width, height, depth, grey, alpha,
-                    alphaAssociated, distance, rateControl);
+            this.lossy = new VarDctStreamer(out, width, height, depth, grey, this.extras,
+                    distance, rateControl);
         } else {
             this.whole = null;
             this.band = new int[numInput][width * Math.min(JxlEncoder.GROUP_DIM, height)];
@@ -396,14 +427,13 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         if (whole != null) {
             byte[] bytes;
             if (distance <= 0) {
-                bytes = JxlEncoder.encodeSamples(whole, width, height, depth, grey, alpha,
-                        alphaAssociated);
+                bytes = JxlEncoder.encodeSamples(whole, width, height, depth, grey, extras);
             } else if (rateControl) {
-                bytes = VarDctEncoder.toTarget(whole, width, height, depth, grey, alpha,
-                        alphaAssociated, distance);
+                bytes = VarDctEncoder.toTarget(whole, width, height, depth, grey, extras,
+                        distance);
             } else {
-                bytes = VarDctEncoder.encodeSamples(whole, width, height, depth, grey, alpha,
-                        alphaAssociated, distance);
+                bytes = VarDctEncoder.encodeSamples(whole, width, height, depth, grey, extras,
+                        distance);
             }
             out.write(bytes);
             out.flush();
@@ -417,8 +447,8 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         w.write(0xff, 8);
         w.write(0x0a, 8);
         new SizeHeader(width, height).write(w);
-        JxlEncoder.buildMetadata(depth, grey, alpha, alphaAssociated).write(w);
-        JxlEncoder.writeFrameHeader(w, alpha);
+        JxlEncoder.buildMetadata(depth, grey, extras).write(w);
+        JxlEncoder.writeFrameHeader(w, extras.size(), 1);
         w.writeBool(false); // TOC not permuted
         w.zeroPadToByte();
         byte[] lfGlobal = buildLfGlobal();

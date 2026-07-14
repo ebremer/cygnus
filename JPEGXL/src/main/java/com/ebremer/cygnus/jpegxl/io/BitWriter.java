@@ -79,6 +79,30 @@ public final class BitWriter {
         }
     }
 
+    /**
+     * F16(): binary16, read back by {@code Bits.f16}.
+     *
+     * <p>Rounded to the nearest half, because half is all the format has: these
+     * fields <em>are</em> f16, so a spot colour of 0.9 is stored as 0.89990234
+     * by anyone who writes one, and refusing it would only mean refusing almost
+     * every colour anybody names. What is refused is a value half cannot reach at
+     * all — beyond 65504, or already infinite or NaN — since the reader rejects
+     * that encoding outright and the file would not be readable.
+     */
+    public void writeF16(float value) {
+        short half = Float.floatToFloat16(value);
+        int bits = half & 0xffff;
+        if (((bits >> 10) & 0x1f) == 31) {
+            throw new IllegalArgumentException("F16 cannot hold " + value);
+        }
+        write(bits, 16);
+    }
+
+    /** What {@link #writeF16} would store for {@code value}. */
+    public static float roundF16(float value) {
+        return Float.float16ToFloat(Float.floatToFloat16(value));
+    }
+
     public void writeEnum(int value) {
         if (value == 0) {
             write(0, 2);

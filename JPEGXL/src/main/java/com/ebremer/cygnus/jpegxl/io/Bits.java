@@ -130,7 +130,14 @@ public final class Bits {
         return v;
     }
 
-    /** F16(): binary16 without infinities or NaNs. */
+    /**
+     * F16(): binary16 without infinities or NaNs.
+     *
+     * <p>A subnormal has no implicit leading one and its exponent is that of the
+     * smallest normal, not one less — so the scale is {@code 2^-24} either way,
+     * which is what clamping the exponent to at least 1 says. Reading it as
+     * {@code 2^-25} halves every subnormal, and this used to.
+     */
     public float f16() throws IOException {
         int bits = u(16);
         int biasedExp = (bits >> 10) & 0x1f;
@@ -138,7 +145,7 @@ public final class Bits {
             throw new IOException("non-finite F16 value in header");
         }
         int mant = (bits & 0x3ff) | (biasedExp > 0 ? 0x400 : 0);
-        float v = (float) Math.scalb((double) mant, biasedExp - 25);
+        float v = (float) Math.scalb((double) mant, Math.max(biasedExp, 1) - 25);
         return (bits >> 15) != 0 ? -v : v;
     }
 
