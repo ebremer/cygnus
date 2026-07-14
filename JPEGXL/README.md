@@ -169,6 +169,14 @@ cropped result; reference, LF and preview frames always decode whole.
     `encodeToTarget` outright — that loop drives the error *averaged over the
     frame* to the target, and when most of the frame is blank, the average is the
     blank.
+- **Progressive (responsive) lossless**: `JxlEncoder.encodeProgressive` applies
+  the Squeeze transform — the channels become a small image of the picture
+  followed by the detail that doubles it, repeatedly — and cuts the frame into
+  passes, coarsest first. A fifth of the bytes then decodes to the **whole**
+  image at low resolution, where a fifth of an ordinary file decodes to a fifth
+  of the image and leaves the rest black. Read a prefix with
+  `JxlDecoder.decodePartial`. Squeeze buys the layout, not the ratio: files run
+  a few percent larger.
 - **JPEG → JPEG XL recompression**: `JpegRecompressor.encode(jpegBytes)`
   losslessly repacks a JPEG as a JPEG XL container with reconstruction data
   (`jbrd`), the write-side twin of `JpegReconstructor` — the quantised DCT

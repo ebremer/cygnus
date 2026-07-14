@@ -57,6 +57,22 @@ class RoundTripTest {
         verifyRoundTrip(original, 200, 130, 28, false, true);
     }
 
+    /**
+     * The depths either side of where float32 gives out. The canvas is float32,
+     * whose mantissa is 24 bits, so a sample survives the trip to [0,1] and back
+     * only while it stays under 2^23 — one bit short of what a 24-bit image
+     * reaches. 23 was fine and 25 took the exact integer path; 24 fell between
+     * them and came back off by one across its whole top half.
+     */
+    @ParameterizedTest(name = "bits={0}")
+    @org.junit.jupiter.params.provider.ValueSource(ints = {22, 23, 24, 25, 26})
+    void depthsAroundTheFloatBoundary(int bits) throws IOException {
+        int w = 200;
+        int h = 130;
+        int[][] original = TestImages.mixed(w, h, 3, bits, 77);
+        verifyRoundTrip(original, w, h, bits, false, false);
+    }
+
     @Test
     void thirtyOneBitRoundTrip() throws IOException {
         int w = 300;

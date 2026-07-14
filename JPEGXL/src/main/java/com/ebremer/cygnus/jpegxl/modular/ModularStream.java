@@ -255,7 +255,14 @@ public final class ModularStream {
         return new WpState.WpParams(p1, p2, p3, w);
     }
 
-    static List<Transform.Squeeze> defaultSqueezeSteps(List<ModularChannel> channels, int nbMeta) {
+    /**
+     * The squeeze plan a stream gets when it codes {@code num_sq == 0}: halve
+     * the chroma once each way if it is full size, then alternate until nothing
+     * is bigger than eight. Shared with the encoder, which writes {@code num_sq
+     * == 0} and must therefore build the same plan from the same channel list.
+     */
+    public static List<Transform.Squeeze> defaultSqueezeSteps(List<ModularChannel> channels,
+            int nbMeta) {
         List<Transform.Squeeze> steps = new ArrayList<>();
         int first = nbMeta;
         int count = channels.size() - nbMeta;

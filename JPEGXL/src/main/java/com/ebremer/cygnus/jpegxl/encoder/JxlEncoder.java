@@ -8,6 +8,7 @@ import com.ebremer.cygnus.jpegxl.codestream.SizeHeader;
 import com.ebremer.cygnus.jpegxl.entropy.HybridUintConfig;
 import com.ebremer.cygnus.jpegxl.io.BitWriter;
 import com.ebremer.cygnus.jpegxl.modular.ModularStream;
+import com.ebremer.cygnus.jpegxl.modular.Transform;
 import com.ebremer.cygnus.jpegxl.modular.WpState;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -28,18 +29,39 @@ public final class JxlEncoder {
     static final int GROUP_DIM = 256;
     private static final int GROUP_SIZE_SHIFT_BITS = 1; // group_size_shift = 7 + 1 -> 256
     private static final int MAX_PALETTE = 1024;
+    /** Dequant-matrix streams the decoder counts before the pass groups. */
+    private static final int NUM_DCT_PARAMS = 17;
 
-    /** One coded modular channel. */
+    /**
+     * One coded modular channel. The shifts are how far the channel has been
+     * halved by {@link Squeeze}: a channel with hshift 2 holds every fourth
+     * column of the image, so a group's slice of it starts at
+     * {@code left >> 2} and is a quarter as wide. Zero everywhere until a
+     * squeeze happens.
+     */
     static final class Chan {
         final int w;
         final int h;
+        final int hshift;
+        final int vshift;
         final int[] px;
         int predictor = 5; // 5 = gradient, 6 = weighted
 
         Chan(int w, int h, int[] px) {
+            this(w, h, 0, 0, px);
+        }
+
+        Chan(int w, int h, int hshift, int vshift, int[] px) {
             this.w = w;
             this.h = h;
+            this.hshift = hshift;
+            this.vshift = vshift;
             this.px = px;
+        }
+
+        /** How coarse this channel is: which pass or LF group codes it. */
+        int shift() {
+            return Math.min(hshift, vshift);
         }
     }
 
@@ -88,6 +110,7 @@ public final class JxlEncoder {
     private final boolean alphaAssociated;
     private final int[][] input;
     private final int numInput;
+    private final boolean progressive;
 
     // decided by prepare()
     private final List<Chan> chans = new ArrayList<>();
@@ -96,10 +119,24 @@ public final class JxlEncoder {
     private int[] paletteData;   // paletteNumC x paletteSize components, or null
     private int paletteSize;
     private int paletteNumC;     // channels folded into the palette
+    private boolean squeezed;    // the channel list has been squeezed
     private boolean prepared;
+
+    /**
+     * Passes a progressive frame is cut into. Squeeze leaves channels at shifts
+     * 0, 1, 2 and beyond; anything from 3 up is coarse enough for the LF groups,
+     * and the three below get a pass each, coarsest first.
+     */
+    private static final int PROGRESSIVE_PASSES = 3;
 
     private JxlEncoder(int[][] planes, int width, int height, int bits,
             boolean grey, boolean alpha, boolean alphaAssociated) {
+        this(planes, width, height, bits, grey, alpha, alphaAssociated, false);
+    }
+
+    private JxlEncoder(int[][] planes, int width, int height, int bits, boolean grey,
+            boolean alpha, boolean alphaAssociated, boolean progressive) {
+        this.progressive = progressive;
         this.width = width;
         this.height = height;
         this.bits = bits;
@@ -134,6 +171,33 @@ public final class JxlEncoder {
             throw new IllegalArgumentException("bits per sample must be in 1..31");
         }
         return new JxlEncoder(planes, width, height, bits, grey, alpha, alphaAssociated).run();
+    }
+
+    /**
+     * Encodes a progressive (responsive) lossless codestream: the same pixels,
+     * laid out so that a prefix of the bytes is already a picture.
+     *
+     * <p>{@link Squeeze} rewrites the channels into a small image of the picture
+     * followed by the detail that doubles it, repeatedly; the frame is then cut
+     * into passes by how coarse each channel is, coarsest first. A reader with
+     * the first tenth of the file has the whole image at low resolution rather
+     * than a tenth of it at full resolution, and each further pass sharpens what
+     * is already there. {@link com.ebremer.cygnus.jpegxl.decoder.JxlDecoder#decodePartial}
+     * reads such a prefix.
+     *
+     * <p>The file is the same size to within a few percent either way — squeeze
+     * buys the layout, not the ratio.
+     */
+    public static byte[] encodeProgressive(int[][] planes, int width, int height, int bits,
+            boolean grey, boolean alpha, boolean alphaAssociated) throws IOException {
+        if (width <= 0 || height <= 0) {
+            throw new IllegalArgumentException("bad dimensions " + width + "x" + height);
+        }
+        if (bits < 1 || bits > 31) {
+            throw new IllegalArgumentException("bits per sample must be in 1..31");
+        }
+        return new JxlEncoder(planes, width, height, bits, grey, alpha, alphaAssociated, true)
+                .run();
     }
 
     /**
@@ -182,12 +246,15 @@ public final class JxlEncoder {
             return;
         }
         prepared = true;
-        paletteNumC = tryPalette();
+        // A palette turns pixels into indices into a lookup, and an index has no
+        // magnitude: the average of index 3 and index 9 is not a colour between
+        // them. Squeeze is built on averaging, so the two do not go together.
+        paletteNumC = progressive ? 0 : tryPalette();
         if (paletteNumC > 0) {
             // palette meta channel + index channel (+ channels left outside)
             nbMeta = 1;
             int[] index = input[0]; // reused as the index plane by tryPalette
-            chans.add(new Chan(paletteSize, paletteNumC, paletteData));
+            chans.add(new Chan(paletteSize, paletteNumC, 0, -1, paletteData));
             chans.add(new Chan(width, height, index));
             for (int c = paletteNumC; c < numInput; c++) {
                 chans.add(new Chan(width, height, input[c]));
@@ -207,6 +274,14 @@ public final class JxlEncoder {
             for (int i = 0; i < numInput; i++) {
                 chans.add(new Chan(width, height, input[i]));
             }
+        }
+        if (progressive) {
+            // after the colour transform, which is where the decoder reads the
+            // squeeze from and so where it will rebuild the same plan
+            for (Transform.Squeeze sq : Squeeze.plan(chans, nbMeta)) {
+                Squeeze.apply(chans, sq);
+            }
+            squeezed = true;
         }
         for (int i = nbMeta; i < chans.size(); i++) {
             choosePredictor(chans.get(i));
@@ -469,8 +544,10 @@ public final class JxlEncoder {
         int groupColumns = ceilDiv(width, GROUP_DIM);
         int groupRows = ceilDiv(height, GROUP_DIM);
         int numGroups = groupColumns * groupRows;
-        int numLfGroups = ceilDiv(width, GROUP_DIM * 8) * ceilDiv(height, GROUP_DIM * 8);
-        boolean single = numGroups == 1;
+        int lfColumns = ceilDiv(width, GROUP_DIM * 8);
+        int numLfGroups = lfColumns * ceilDiv(height, GROUP_DIM * 8);
+        int numPasses = progressive ? PROGRESSIVE_PASSES : 1;
+        boolean single = numPasses == 1 && numGroups == 1;
 
         // channels coded in the global stream: meta channels plus the prefix of
         // channels no larger than a group (mirrors the decoder's rule)
@@ -486,6 +563,71 @@ public final class JxlEncoder {
             }
         }
 
+        // ---- sort the remaining channels into sub-streams by how coarse they
+        // are: shift 3 and up is coarse enough for the LF groups, and the rest
+        // get a pass each, coarsest first
+        List<Integer> lfChans = new ArrayList<>();
+        List<List<Integer>> passChans = new ArrayList<>();
+        for (int p = 0; p < numPasses; p++) {
+            passChans.add(new ArrayList<>());
+        }
+        int[] passOf = new int[chans.size()];
+        java.util.Arrays.fill(passOf, -2); // global
+        for (int i = numGlobal; i < chans.size(); i++) {
+            int m = chans.get(i).shift();
+            if (m >= 3) {
+                passOf[i] = -1;
+                lfChans.add(i);
+            } else {
+                int p = numPasses == 1 ? 0 : PROGRESSIVE_PASSES - 1 - m;
+                passOf[i] = p;
+                passChans.get(p).add(i);
+            }
+        }
+
+        int[][] groupGrid = new int[numGroups][];
+        for (int g = 0; g < numGroups; g++) {
+            groupGrid[g] = groupRect(g, groupColumns);
+        }
+        int[][] lfGrid = new int[numLfGroups][];
+        for (int gg = 0; gg < numLfGroups; gg++) {
+            lfGrid[gg] = lfGroupRect(gg, lfColumns);
+        }
+
+        // ---- a bracket is "ragged" when one of its channels has nothing inside
+        // some group. That channel is then absent from that group's stream, which
+        // renumbers the ones after it — and the channel number is what the tree's
+        // chain switches on, so there a channel is coded with the subtree of
+        // whichever channel usually sits at its position. That is only sound if a
+        // bracket's subtrees are interchangeable, so make them so: one predictor
+        // throughout, and no residual multiplier to divide by (an integer
+        // division that only comes out exact for the channel it was learned from).
+        // No channel of an unsqueezed image ever vanishes, so nothing here fires
+        // unless squeeze is on and the last group is a sliver.
+        boolean[] ragged = new boolean[chans.size()];
+        for (int b = -1; b < numPasses; b++) {
+            List<Integer> bracket = b < 0 ? lfChans : passChans.get(b);
+            int[][] grid = b < 0 ? lfGrid : groupGrid;
+            boolean anyVanishes = false;
+            for (int i : bracket) {
+                for (int[] r : grid) {
+                    int[] s = slice(chans.get(i), r[0], r[1], r[2], r[3]);
+                    anyVanishes |= s[2] <= 0 || s[3] <= 0;
+                }
+            }
+            if (!anyVanishes) {
+                continue;
+            }
+            int weighted = 0;
+            for (int i : bracket) {
+                weighted += chans.get(i).predictor == 6 ? 1 : -1;
+            }
+            for (int i : bracket) {
+                ragged[i] = true;
+                chans.get(i).predictor = weighted > 0 ? 6 : 5;
+            }
+        }
+
         // ---- learn per-channel subtrees and build the global tree
         int[] refOf = referenceChannels(numGlobal);
         Map<Chan, TNode> subs = new HashMap<>();
@@ -493,14 +635,43 @@ public final class JxlEncoder {
             Chan c = chans.get(i);
             List<int[]> rects = i < numGlobal
                     ? List.of(new int[] {0, 0, c.w, c.h})
-                    : groupRects(c, groupColumns, numGroups);
+                    : slicesOver(c, passOf[i] == -1 ? lfGrid : groupGrid);
             TNode sub = learnTree(c, refPlane(refOf, i), rects);
             refineLeaves(c, sub, refPlane(refOf, i), rects);
+            if (ragged[i]) {
+                dropMultipliers(sub);
+            }
             subs.put(c, sub);
         }
-        TNode tree = buildTree(numGlobal, subs);
+
+        // stream indices, which the tree splits on to tell the sub-streams
+        // apart; the ranges run in this order and never overlap
+        int passBase = 1 + 3 * numLfGroups + NUM_DCT_PARAMS;
+        List<Integer> bounds = new ArrayList<>();
+        List<TNode> chains = new ArrayList<>();
+        if (numGlobal > 0) {
+            bounds.add(0);
+            chains.add(chainOf(range(0, numGlobal), subs));
+        }
+        if (!lfChans.isEmpty()) {
+            bounds.add(2 * numLfGroups);   // the last LF group's index
+            chains.add(chainOf(lfChans, subs));
+        }
+        for (int p = 0; p < numPasses; p++) {
+            if (!passChans.get(p).isEmpty()) {
+                bounds.add(passBase + (p + 1) * numGroups - 1);
+                chains.add(chainOf(passChans.get(p), subs));
+            }
+        }
+        TNode tree = buildTree(bounds, chains);
         int numCtx = assignCtx(tree);
 
+        // ---- tokenize every sub-stream
+        TokenBuf globalBuf = new TokenBuf();
+        for (int i = 0; i < numGlobal; i++) {
+            Chan c = chans.get(i);
+            tokenizeRect(c, subs.get(c), refPlane(refOf, i), 0, 0, c.w, c.h, globalBuf);
+        }
         // LZ77 distance multipliers, mirroring the decoder's per-stream rule
         int globalDistMult = 0;
         for (int i = 0; i < chans.size(); i++) {
@@ -513,65 +684,54 @@ public final class JxlEncoder {
             }
         }
         globalDistMult = Math.min(globalDistMult, 1 << 21);
-        int[] groupDistMult = new int[single ? 0 : numGroups];
-        for (int g = 0; g < groupDistMult.length; g++) {
-            int gx = (g % groupColumns) * GROUP_DIM;
-            int gy = (g / groupColumns) * GROUP_DIM;
-            for (int i = numGlobal; i < chans.size(); i++) {
-                Chan c = chans.get(i);
-                int w = Math.min(GROUP_DIM, c.w - gx);
-                int h = Math.min(GROUP_DIM, c.h - gy);
-                if (w > 0 && h > 0) {
-                    groupDistMult[g] = Math.max(groupDistMult[g], w);
-                }
-            }
-        }
 
-        // ---- tokenize all sections
-        TokenBuf globalBuf = new TokenBuf();
-        for (int i = 0; i < numGlobal; i++) {
-            Chan c = chans.get(i);
-            tokenizeRect(c, subs.get(c), refPlane(refOf, i), 0, 0, c.w, c.h, globalBuf);
-        }
-        TokenBuf[] groupBufs = new TokenBuf[single ? 0 : numGroups];
-        for (int g = 0; g < groupBufs.length; g++) {
-            TokenBuf buf = new TokenBuf();
-            int gx = (g % groupColumns) * GROUP_DIM;
-            int gy = (g / groupColumns) * GROUP_DIM;
-            for (int i = numGlobal; i < chans.size(); i++) {
-                Chan c = chans.get(i);
-                tokenizeRect(c, subs.get(c), refPlane(refOf, i), gx, gy,
-                        Math.min(GROUP_DIM, c.w - gx), Math.min(GROUP_DIM, c.h - gy), buf);
-            }
-            groupBufs[g] = buf;
+        // every sub-stream past the global one, in the order the TOC lists them:
+        // the LF groups, then a block of groups per pass
+        int numSub = single ? 0 : numLfGroups + numPasses * numGroups;
+        TokenBuf[] bufs = new TokenBuf[numSub];
+        int[] dist = new int[numSub];
+        for (int s = 0; s < numSub; s++) {
+            List<Integer> sc = s < numLfGroups
+                    ? lfChans
+                    : passChans.get((s - numLfGroups) / numGroups);
+            int[] rect = s < numLfGroups
+                    ? lfGrid[s]
+                    : groupGrid[(s - numLfGroups) % numGroups];
+            bufs[s] = tokenizeSubStream(sc, rect, subs, refOf);
+            dist[s] = distMult(sc, rect);
         }
 
         // ---- LZ77 match search against literal-only statistics
         EntropyEncoder litProbe = new EntropyEncoder(numCtx, true, true);
         countLiterals(globalBuf, litProbe);
-        for (TokenBuf b : groupBufs) {
+        for (TokenBuf b : bufs) {
             countLiterals(b, litProbe);
         }
         litProbe.prepareCosts();
-        findMatches(globalBuf, globalDistMult, Boolean.getBoolean("jxl.enc.lz77legacy") ? null : litProbe);
-        java.util.stream.IntStream.range(0, groupBufs.length).parallel()
-                .forEach(g -> findMatches(groupBufs[g], groupDistMult[g], Boolean.getBoolean("jxl.enc.lz77legacy") ? null : litProbe));
+        EntropyEncoder lit = Boolean.getBoolean("jxl.enc.lz77legacy") ? null : litProbe;
+        findMatches(globalBuf, globalDistMult, lit);
+        java.util.stream.IntStream.range(0, numSub).parallel()
+                .forEach(s -> findMatches(bufs[s], dist[s], lit));
 
-        // ---- per-group local trees where they beat the global code
-        byte[][] localBytes = new byte[groupBufs.length][];
-        if (groupBufs.length >= 2 && chans.size() > numGlobal
+        // ---- per-group local trees where they beat the global code. Only the
+        // classic layout, where a group is one sub-stream holding every
+        // non-global channel: a progressive frame's channels are spread across
+        // passes, so a group is no longer a thing a local tree can be learned on.
+        boolean classic = numPasses == 1 && lfChans.isEmpty();
+        byte[][] localBytes = new byte[numSub][];
+        if (classic && numSub >= 2 && chans.size() > numGlobal
                 && !Boolean.getBoolean("jxl.enc.simpletree")) {
             EntropyEncoder probe = new EntropyEncoder(numCtx, true, true);
             emitBuffer(globalBuf, null, probe, globalDistMult);
-            for (int g = 0; g < groupBufs.length; g++) {
-                emitBuffer(groupBufs[g], null, probe, groupDistMult[g]);
+            for (int s = 0; s < numSub; s++) {
+                emitBuffer(bufs[s], null, probe, dist[s]);
             }
             probe.prepareCosts();
             List<Chan> groupChans = List.copyOf(chans.subList(numGlobal, chans.size()));
             int numGlobalF = numGlobal;
-            java.util.stream.IntStream.range(0, groupBufs.length).parallel().forEach(g ->
-                    localBytes[g] = tryLocalGroup(g, groupColumns, numGlobalF, groupChans,
-                            refOf, groupBufs[g], probe, groupDistMult[g]));
+            java.util.stream.IntStream.range(numLfGroups, numSub).parallel().forEach(s ->
+                    localBytes[s] = tryLocalGroup(s - numLfGroups, groupColumns, numGlobalF,
+                            groupChans, refOf, bufs[s], probe, dist[s]));
         }
 
         // ---- pass 1: histograms (local groups keep their own code)
@@ -579,9 +739,9 @@ public final class JxlEncoder {
         emitTree(tree, null, treeEnc);
         EntropyEncoder dataEnc = new EntropyEncoder(numCtx, true, true, true);
         emitBuffer(globalBuf, null, dataEnc, globalDistMult);
-        for (int g = 0; g < groupBufs.length; g++) {
-            if (localBytes[g] == null) {
-                emitBuffer(groupBufs[g], null, dataEnc, groupDistMult[g]);
+        for (int s = 0; s < numSub; s++) {
+            if (localBytes[s] == null) {
+                emitBuffer(bufs[s], null, dataEnc, dist[s]);
             }
         }
 
@@ -599,42 +759,56 @@ public final class JxlEncoder {
         lfGlobal.zeroPadToByte();
         byte[] lfGlobalBytes = lfGlobal.toByteArray();
 
-        // ---- pass group sections
-        byte[][] groupBytes = new byte[groupBufs.length][];
-        for (int g = 0; g < groupBufs.length; g++) {
-            if (localBytes[g] != null) {
-                groupBytes[g] = localBytes[g];
+        // ---- the rest
+        byte[][] subBytes = new byte[numSub][];
+        for (int s = 0; s < numSub; s++) {
+            if (localBytes[s] != null) {
+                subBytes[s] = localBytes[s];
+                continue;
+            }
+            List<Integer> sc = s < numLfGroups
+                    ? lfChans
+                    : passChans.get((s - numLfGroups) / numGroups);
+            int[] rect = s < numLfGroups
+                    ? lfGrid[s]
+                    : groupGrid[(s - numLfGroups) % numGroups];
+            if (!hasContent(sc, rect)) {
+                // Nothing is coded here — either the bracket is empty, or every
+                // channel of it is clipped to nothing by this group. A stream
+                // with no channels carries no header either, so the section is
+                // not a bare header: it is no bytes at all.
+                subBytes[s] = new byte[0];
                 continue;
             }
             BitWriter gw = new BitWriter();
             gw.writeBool(true); // use_global_tree
             gw.writeBool(true); // default wp
             gw.write(0, 2);     // nb_transforms = 0
-            emitBuffer(groupBufs[g], gw, dataEnc, groupDistMult[g]);
+            emitBuffer(bufs[s], gw, dataEnc, dist[s]);
             dataEnc.finishSection(gw);
             gw.zeroPadToByte();
-            groupBytes[g] = gw.toByteArray();
+            subBytes[s] = gw.toByteArray();
         }
 
         // ---- assemble the frame
-        writeFrameHeader(out, alpha);
+        writeFrameHeader(out, alpha, numPasses);
 
         out.writeBool(false); // TOC not permuted
         out.zeroPadToByte();
         writeTocEntry(out, lfGlobalBytes.length);
         if (!single) {
-            for (int i = 0; i < numLfGroups; i++) {
-                writeTocEntry(out, 0); // empty LfGroup sections
+            for (int gg = 0; gg < numLfGroups; gg++) {
+                writeTocEntry(out, subBytes[gg].length);
             }
-            writeTocEntry(out, 0); // empty HfGlobal section
-            for (byte[] g : groupBytes) {
-                writeTocEntry(out, g.length);
+            writeTocEntry(out, 0); // empty HfGlobal section (this is a modular frame)
+            for (int s = numLfGroups; s < numSub; s++) {
+                writeTocEntry(out, subBytes[s].length);
             }
         }
         out.zeroPadToByte();
         out.writeBytes(lfGlobalBytes);
-        for (byte[] g : groupBytes) {
-            out.writeBytes(g);
+        for (byte[] b : subBytes) {
+            out.writeBytes(b);
         }
         if (LZ_STATS) {
             System.err.printf("[lz] matches=%d copiedTokens=%d estSavedBits=%d%n",
@@ -642,12 +816,88 @@ public final class JxlEncoder {
         }
     }
 
+    /**
+     * Strips a subtree's residual multipliers. The offsets can stay: subtracting
+     * one is exact whatever the residual, where dividing by a multiplier only
+     * comes out whole for the channel whose residuals it was the common divisor of.
+     */
+    private static void dropMultipliers(TNode node) {
+        if (node.prop >= 0) {
+            dropMultipliers(node.left);
+            dropMultipliers(node.right);
+        } else {
+            node.multiplier = 1;
+        }
+    }
+
+    /** Channel indices {@code [from, to)}, as the tree's chains want them. */
+    private static List<Integer> range(int from, int to) {
+        List<Integer> list = new ArrayList<>(to - from);
+        for (int i = from; i < to; i++) {
+            list.add(i);
+        }
+        return list;
+    }
+
+    /**
+     * Tokenizes one sub-stream: a set of channels, each sliced to one rectangle.
+     *
+     * <p>A channel with nothing of it inside the rectangle is left out entirely,
+     * which renumbers the ones after it — the channel index is what the tree's
+     * chain switches on, so the subtree a channel gets here is the one its
+     * <em>position in the surviving list</em> selects, not the one learned from
+     * it. Those are the same channel except in the rare group where something
+     * ahead of it vanished, and there it costs a little compression and nothing
+     * else: the decoder walks to the same subtree, because it renumbers the same
+     * way.
+     */
+    private TokenBuf tokenizeSubStream(List<Integer> chanIdx, int[] rect,
+            Map<Chan, TNode> subs, int[] refOf) {
+        TokenBuf buf = new TokenBuf();
+        int pos = 0;
+        for (int i : chanIdx) {
+            Chan c = chans.get(i);
+            int[] s = slice(c, rect[0], rect[1], rect[2], rect[3]);
+            if (s[2] <= 0 || s[3] <= 0) {
+                continue;
+            }
+            TNode sub = subs.get(chans.get(chanIdx.get(pos)));
+            tokenizeRect(c, sub, refPlane(refOf, i), s[0], s[1], s[2], s[3], buf);
+            pos++;
+        }
+        return buf;
+    }
+
+    /** Whether any of these channels has anything inside the rectangle. */
+    private boolean hasContent(List<Integer> chanIdx, int[] rect) {
+        for (int i : chanIdx) {
+            int[] s = slice(chans.get(i), rect[0], rect[1], rect[2], rect[3]);
+            if (s[2] > 0 && s[3] > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The LZ77 distance multiplier of a sub-stream: its widest channel slice. */
+    private int distMult(List<Integer> chanIdx, int[] rect) {
+        int m = 0;
+        for (int i : chanIdx) {
+            int[] s = slice(chans.get(i), rect[0], rect[1], rect[2], rect[3]);
+            if (s[2] > 0 && s[3] > 0) {
+                m = Math.max(m, s[2]);
+            }
+        }
+        return Math.min(m, 1 << 21);
+    }
+
     /** GroupHeader of the global modular stream, including the transforms. */
     private void writeGroupHeader(BitWriter w) {
         w.writeBool(true);  // use_global_tree
         w.writeBool(true);  // default weighted predictor parameters
+        int nbTransforms = (paletteData != null || rctType >= 0 ? 1 : 0) + (squeezed ? 1 : 0);
+        writeTransformCount(w, nbTransforms);
         if (paletteData != null) {
-            w.write(1, 2);  // nb_transforms = 1
             w.write(1, 2);  // transform id: palette
             w.write(0, 2);  // begin_c selector 0
             w.write(0, 3);  // begin_c = 0
@@ -673,10 +923,24 @@ public final class JxlEncoder {
             w.write(0, 2);  // nb_deltas selector 0 -> 0
             w.write(0, 4);  // d_pred = 0
         } else if (rctType >= 0) {
-            w.write(1, 2);  // nb_transforms = 1
             writeRctTransform(w, rctType);
+        }
+        if (squeezed) {
+            w.write(2, 2);  // transform id: squeeze
+            w.write(0, 2);  // num_sq = 0: the decoder rebuilds the default plan
+        }
+    }
+
+    /** nb_transforms: U32(0, 1, 2 + u(4), 18 + u(8)). */
+    private static void writeTransformCount(BitWriter w, int n) {
+        if (n < 2) {
+            w.write(n, 2);
+        } else if (n < 18) {
+            w.write(2, 2);
+            w.write(n - 2, 4);
         } else {
-            w.write(0, 2);  // nb_transforms = 0
+            w.write(3, 2);
+            w.write(n - 18, 8);
         }
     }
 
@@ -722,6 +986,17 @@ public final class JxlEncoder {
     }
 
     static void writeFrameHeader(BitWriter out, boolean alpha) {
+        writeFrameHeader(out, alpha, 1);
+    }
+
+    /**
+     * @param numPasses 1 for an ordinary frame; 3 for a progressive one, whose
+     *        passes are told apart by the downsampling each is enough for — 4x,
+     *        then 2x, then full. That is what puts each squeezed channel in a
+     *        pass: the decoder derives a shift range per pass from these
+     *        markers and takes the channels whose shift falls in it.
+     */
+    static void writeFrameHeader(BitWriter out, boolean alpha, int numPasses) {
         out.zeroPadToByte();
         out.writeBool(false);        // !all_default
         out.write(0, 2);             // frame_type: regular
@@ -733,7 +1008,20 @@ public final class JxlEncoder {
             out.write(0, 2);         // extra channel upsampling
         }
         out.write(GROUP_SIZE_SHIFT_BITS, 2); // group_size_shift = 8
-        out.write(0, 2);             // num_passes = 1 (U32 selector 0)
+        if (numPasses == 1) {
+            out.write(0, 2);         // num_passes = 1 (U32 selector 0)
+        } else if (numPasses == PROGRESSIVE_PASSES) {
+            out.write(2, 2);         // num_passes = 3
+            out.write(2, 2);         // num_ds = 2
+            out.write(0, 2);         // pass 0 coefficient shift (VarDCT only)
+            out.write(0, 2);         // pass 1 coefficient shift
+            out.write(2, 2);         // downsample[0] = 1 << 2 = 4  -> pass 0 covers shift 2
+            out.write(1, 2);         // downsample[1] = 1 << 1 = 2  -> pass 1 covers shift 1
+            out.write(0, 2);         // last_pass[0] = 0
+            out.write(1, 2);         // last_pass[1] = 1
+        } else {
+            throw new IllegalArgumentException("unsupported pass count " + numPasses);
+        }
         out.writeBool(false);        // have_crop
         int blendEntries = 1 + (alpha ? 1 : 0);
         for (int i = 0; i < blendEntries; i++) {
@@ -800,26 +1088,38 @@ public final class JxlEncoder {
     }
 
     /**
-     * Builds the MA tree. Channels coded in the global stream and channels
-     * coded per group both see property 0 restart at zero, so when both kinds
-     * exist the tree first splits on property 1 (the stream index: 0 for the
-     * global stream, larger for group streams).
+     * Builds the MA tree.
+     *
+     * <p>Property 0 is a channel's index <em>within its sub-stream</em>, and it
+     * restarts at zero in each: channel 0 of the global stream, of an LF group
+     * and of every pass are all different channels. So the tree first sorts the
+     * sub-streams apart on property 1, the stream index, whose ranges run in
+     * order — the global stream is 0, then the LF groups, then a block per pass
+     * — and only then chains through the channels of the one it landed in.
+     *
+     * @param bounds the largest stream index in each sub-stream kind's range,
+     *               in increasing order; {@code chains} holds the matching chain
      */
-    private TNode buildTree(int numGlobal, Map<Chan, TNode> subs) {
-        List<Chan> globals = chans.subList(0, numGlobal);
-        List<Chan> groups = chans.subList(numGlobal, chans.size());
-        if (globals.isEmpty()) {
-            return chainNode(groups, groups.size() - 1, subs);
+    private static TNode buildTree(List<Integer> bounds, List<TNode> chains) {
+        TNode node = chains.get(chains.size() - 1);
+        for (int i = chains.size() - 2; i >= 0; i--) {
+            TNode n = new TNode();
+            n.prop = 1;
+            n.split = bounds.get(i);
+            n.left = node;              // a later sub-stream: index above the bound
+            n.right = chains.get(i);
+            node = n;
         }
-        if (groups.isEmpty()) {
-            return chainNode(globals, globals.size() - 1, subs);
+        return node;
+    }
+
+    /** The chain of per-channel subtrees for one sub-stream, keyed by property 0. */
+    private TNode chainOf(List<Integer> chanIdx, Map<Chan, TNode> subs) {
+        List<Chan> list = new ArrayList<>(chanIdx.size());
+        for (int i : chanIdx) {
+            list.add(chans.get(i));
         }
-        TNode n = new TNode();
-        n.prop = 1;
-        n.split = 0;
-        n.left = chainNode(groups, groups.size() - 1, subs);
-        n.right = chainNode(globals, globals.size() - 1, subs);
-        return n;
+        return chainNode(list, list.size() - 1, subs);
     }
 
     /** Assigns leaf contexts in the decoder's BFS order; returns the leaf count. */
@@ -1311,7 +1611,18 @@ public final class JxlEncoder {
     private static final HybridUintConfig TOKEN_CFG = new HybridUintConfig(4, 1, 0);
     private static final double LOG2 = Math.log(2);
 
-    /** Nearest earlier same-sized channel in the same substream, or -1. */
+    /**
+     * Nearest earlier same-shaped channel in the same sub-stream, or -1.
+     *
+     * <p>The decoder resolves this itself, and not from these dimensions: it
+     * looks at the channels as they appear <em>inside a group</em>, clipped to
+     * that group's rectangle. Two channels that differ here by a column — an
+     * odd-width squeeze leaves an average one wider than its residual — clip to
+     * the same width in most groups, and the decoder would then pair them where
+     * this does not. So a reference is only taken when nothing between it and
+     * the channel shares the channel's shifts: any nearer candidate the decoder
+     * could find must have those shifts, and there is none.
+     */
     private int[] referenceChannels(int numGlobal) {
         int[] refOf = new int[chans.size()];
         java.util.Arrays.fill(refOf, -1);
@@ -1320,8 +1631,13 @@ public final class JxlEncoder {
             int lo = i < numGlobal ? 0 : numGlobal;
             for (int j = i - 1; j >= lo; j--) {
                 Chan r = chans.get(j);
-                if (r.w == c.w && r.h == c.h) {
-                    refOf[i] = j;
+                if (r.hshift == c.hshift && r.vshift == c.vshift) {
+                    // the first channel back that could be paired at all; if it
+                    // is not the same shape, the decoder might still pair them
+                    // once clipped, so take nothing
+                    if (r.w == c.w && r.h == c.h) {
+                        refOf[i] = j;
+                    }
                     break;
                 }
             }
@@ -1333,16 +1649,44 @@ public final class JxlEncoder {
         return refOf[i] >= 0 ? chans.get(refOf[i]).px : null;
     }
 
-    /** The group grid rectangles clipped to one channel, in group scan order. */
-    private static List<int[]> groupRects(Chan c, int groupColumns, int numGroups) {
+    /**
+     * The part of a channel that an image-space rectangle covers. A channel
+     * squeezed to hshift 2 holds every fourth column, so a group starting at
+     * image column 512 starts at its column 128 — exactly the arithmetic the
+     * decoder does when it carves the same slice out.
+     */
+    private static int[] slice(Chan c, int left, int top, int w, int h) {
+        int x0 = left >> c.hshift;
+        int y0 = top >> c.vshift;
+        int cw = Math.min(ceilDiv(w, 1 << c.hshift), c.w - x0);
+        int chh = Math.min(ceilDiv(h, 1 << c.vshift), c.h - y0);
+        return new int[] {x0, y0, Math.max(cw, 0), Math.max(chh, 0)};
+    }
+
+    /** The image-space rectangle of one pass group. */
+    private int[] groupRect(int g, int groupColumns) {
+        int left = (g % groupColumns) * GROUP_DIM;
+        int top = (g / groupColumns) * GROUP_DIM;
+        return new int[] {left, top,
+            Math.min(GROUP_DIM, width - left), Math.min(GROUP_DIM, height - top)};
+    }
+
+    /** The image-space rectangle of one LF group: eight groups on a side. */
+    private int[] lfGroupRect(int gg, int lfColumns) {
+        int lfDim = GROUP_DIM * 8;
+        int left = (gg % lfColumns) * lfDim;
+        int top = (gg / lfColumns) * lfDim;
+        return new int[] {left, top,
+            Math.min(lfDim, width - left), Math.min(lfDim, height - top)};
+    }
+
+    /** One channel's slices over a grid of rectangles, in scan order. */
+    private List<int[]> slicesOver(Chan c, int[][] grid) {
         List<int[]> rects = new ArrayList<>();
-        for (int g = 0; g < numGroups; g++) {
-            int gx = (g % groupColumns) * GROUP_DIM;
-            int gy = (g / groupColumns) * GROUP_DIM;
-            int w = Math.min(GROUP_DIM, c.w - gx);
-            int h = Math.min(GROUP_DIM, c.h - gy);
-            if (w > 0 && h > 0) {
-                rects.add(new int[] {gx, gy, w, h});
+        for (int[] r : grid) {
+            int[] s = slice(c, r[0], r[1], r[2], r[3]);
+            if (s[2] > 0 && s[3] > 0) {
+                rects.add(s);
             }
         }
         return rects;

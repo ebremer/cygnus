@@ -4,7 +4,7 @@ import java.io.IOException;
 import java.util.List;
 
 /** Inverse RCT / palette / squeeze transforms (18181-1 annex H.6). */
-final class InverseTransforms {
+public final class InverseTransforms {
 
     private InverseTransforms() {
     }
@@ -314,7 +314,12 @@ final class InverseTransforms {
         return out;
     }
 
-    private static long smoothTendency(long b, long a, long n) {
+    /**
+     * The predicted difference across a squeezed pair, from the neighbouring
+     * averages: what the residual is coded relative to. Shared with the
+     * encoder's forward squeeze, which must subtract exactly what this adds.
+     */
+    public static long smoothTendency(long b, long a, long n) {
         long diff = 0;
         if (b >= a && a >= n) {
             diff = (4 * b - 3 * n - a + 6) / 12;

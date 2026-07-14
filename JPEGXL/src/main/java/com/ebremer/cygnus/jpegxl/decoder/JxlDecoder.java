@@ -85,6 +85,25 @@ public final class JxlDecoder {
         return image;
     }
 
+    /**
+     * Decodes as much of a codestream as has arrived, instead of failing on one
+     * that stops early. Sections whose bytes are not all present are left out,
+     * and what they would have carried stays zero.
+     *
+     * <p>That is what makes a progressive file
+     * ({@link com.ebremer.cygnus.jpegxl.encoder.JxlEncoder#encodeProgressive})
+     * worth writing: its channels are a small image of the picture followed by
+     * the detail that doubles it, so the missing detail simply does not sharpen
+     * anything, and a prefix of the bytes decodes to the whole image at low
+     * resolution. On an ordinary file the missing sections are whole groups, and
+     * what comes back has holes in it instead — still decoded, but not a picture
+     * anyone wants.
+     */
+    public static JxlImage decodePartial(byte[] file) throws IOException {
+        return decodeImpl(new CodestreamSource.ArraySource(Container.extractCodestream(file)),
+                null, false, false, true);
+    }
+
     private static void attachContainerMetadata(JxlImage image, byte[] file) throws IOException {
         if (Container.isContainer(file)) {
             image.exif = Container.exifPayload(file);
@@ -130,15 +149,15 @@ public final class JxlDecoder {
     public static JxlImage decode(CodestreamSource src, java.awt.Rectangle region)
             throws IOException {
         if (region == null) {
-            return decodeImpl(src, null, false, false);
+            return decodeImpl(src, null, false, false, false);
         }
         try {
-            return decodeImpl(src, region, true, false);
+            return decodeImpl(src, region, true, false, false);
         } catch (RegionUnsupportedException e) {
             if (ModularStream.DEBUG) {
                 System.err.println("[jxl] region fallback: " + e.getMessage());
             }
-            return decodeImpl(src, region, false, false);
+            return decodeImpl(src, region, false, false, false);
         }
     }
 
@@ -159,7 +178,7 @@ public final class JxlDecoder {
 
     /** See {@link #decodeToFloats(byte[])}. */
     public static JxlImage decodeToFloats(CodestreamSource src) throws IOException {
-        return decodeImpl(src, null, false, true);
+        return decodeImpl(src, null, false, true, false);
     }
 
     /** A header parse that runs over a byte window of the codestream. */
@@ -234,7 +253,7 @@ public final class JxlDecoder {
     }
 
     public static JxlImage decode(CodestreamSource src) throws IOException {
-        return decodeImpl(src, null, false, false);
+        return decodeImpl(src, null, false, false, false);
     }
 
     /**
@@ -244,9 +263,11 @@ public final class JxlDecoder {
      *        false with a non-null region, everything is decoded and the
      *        output is merely cropped
      * @param floatOut deliver every output channel as floats
+     * @param partial decode whatever sections have arrived and leave the rest
+     *        at zero, instead of failing on a codestream that stops early
      */
     private static JxlImage decodeImpl(CodestreamSource src, java.awt.Rectangle requested,
-            boolean selective, boolean floatOut) throws IOException {
+            boolean selective, boolean floatOut, boolean partial) throws IOException {
         Prelude prelude = parsePrelude(src);
         SizeHeader size = prelude.size();
         ImageMetadata meta = prelude.meta();
@@ -275,7 +296,7 @@ public final class JxlDecoder {
             FrameEntry pe = prelude.preview();
             try {
                 FrameResult r = decodeFrame(src, pe.fh(), pe.toc(), meta,
-                        new FrameResult[5], null);
+                        new FrameResult[5], null, partial);
                 upsampleFrame(r, meta);
                 applyPatches(r, new FrameResult[4], meta, null);
                 if (r.splines != null) {
@@ -353,7 +374,7 @@ public final class JxlDecoder {
                 continue;
             }
 
-            FrameResult r = decodeFrame(src, fh, toc, meta, lfBuffer, sel);
+            FrameResult r = decodeFrame(src, fh, toc, meta, lfBuffer, sel, partial);
 
             if (fh.type == FrameHeader.TYPE_LF) {
                 // an LF frame provides the LF image for a lower level
@@ -481,7 +502,8 @@ public final class JxlDecoder {
     }
 
     private static FrameResult decodeFrame(CodestreamSource src, FrameHeader fh, Toc toc,
-            ImageMetadata meta, FrameResult[] lfBuffer, GroupSelection sel) throws IOException {
+            ImageMetadata meta, FrameResult[] lfBuffer, GroupSelection sel, boolean partial)
+            throws IOException {
         requireSupported(fh, meta, fh.displayWidth, fh.displayHeight);
 
         FrameState state = new FrameState();
@@ -507,6 +529,10 @@ public final class JxlDecoder {
             decodePassGroup(bits, state, 0, 0);
             bits.expectEndOfSection();
         } else {
+            long have = src.size();
+            if (!arrived(toc, toc.lfGlobalIndex(), have)) {
+                throw new IOException("codestream ends before the frame's global section");
+            }
             Bits lfg = section(src, toc, toc.lfGlobalIndex());
             decodeLfGlobal(lfg, state);
             lfg.expectEndOfSection();
@@ -518,23 +544,32 @@ public final class JxlDecoder {
             int[] lfList = sel == null ? sequence(fh.numLfGroups) : sel.lfGroups(fh);
             parallelFor(lfList.length, i -> {
                 int gg = lfList[i];
+                if (partial && !arrived(toc, toc.lfGroupIndex(gg), have)) {
+                    return;
+                }
                 Bits bits = section(src, toc, toc.lfGroupIndex(gg));
                 decodeLfGroup(bits, state, gg);
                 bits.expectEndOfSection();
             });
-            Bits hfg = section(src, toc, toc.hfGlobalIndex(fh));
-            if (state.vardct != null) {
-                decodeHfGlobal(hfg, state);
-                hfg.expectEndOfSection();
-            } else if (toc.sizes[toc.hfGlobalIndex(fh)] != 0) {
-                throw new IOException("unexpected HfGlobal data in a modular frame");
+            if (!partial || arrived(toc, toc.hfGlobalIndex(fh), have)) {
+                Bits hfg = section(src, toc, toc.hfGlobalIndex(fh));
+                if (state.vardct != null) {
+                    decodeHfGlobal(hfg, state);
+                    hfg.expectEndOfSection();
+                } else if (toc.sizes[toc.hfGlobalIndex(fh)] != 0) {
+                    throw new IOException("unexpected HfGlobal data in a modular frame");
+                }
             }
             // groups are independent; passes accumulate sequentially per group
             int[] gList = sel == null ? sequence(fh.numGroups) : sel.groups(fh);
             parallelFor(gList.length, i -> {
                 int g = gList[i];
                 for (int pass = 0; pass < fh.passes.numPasses; pass++) {
-                    Bits bits = section(src, toc, toc.passGroupIndex(fh, pass, g));
+                    int idx = toc.passGroupIndex(fh, pass, g);
+                    if (partial && !arrived(toc, idx, have)) {
+                        break;   // and every later pass of this group too
+                    }
+                    Bits bits = section(src, toc, idx);
                     decodePassGroup(bits, state, pass, g);
                     bits.expectEndOfSection();
                 }
@@ -717,10 +752,17 @@ public final class JxlDecoder {
             }
         }
 
-        // keep the raw samples of deep integer images so plain (replace-blend,
-        // feature-free) frames can be emitted without float rounding
+        // Keep the raw samples of deep integer images so plain (replace-blend,
+        // feature-free) frames can be emitted without float rounding.
+        //
+        // "Deep" starts at 24, not above it: the canvas is float32, whose
+        // mantissa is 24 bits, and a sample survives the trip to [0,1] and back
+        // only while its relative error stays under half a step — which holds up
+        // to 2^23 and no further. A 24-bit image reaches 2^24-1, so its top half
+        // comes back off by one. (That is the whole bug: 23 bits was exact, 25
+        // took this path, and 24 fell between them.)
         if (!xyb && !fh.doYCbCr && state.vardct == null
-                && !meta.bitDepth.floatingPoint && meta.bitDepth.bitsPerSample > 24) {
+                && !meta.bitDepth.floatingPoint && meta.bitDepth.bitsPerSample > 23) {
             boolean allInt = true;
             for (var ec : meta.extraChannels) {
                 allInt &= !ec.bitDepth.floatingPoint;
@@ -1136,8 +1178,10 @@ public final class JxlDecoder {
                     System.arraycopy(canvas[c], (cy + y) * width + cx, p, y * cw, cw);
                 }
                 floatPlanes[c] = p;
-            } else if (exact != null && depth.bitsPerSample > 24) {
-                // deep integers pass through exactly instead of via float32
+            } else if (exact != null && depth.bitsPerSample > 23) {
+                // deep integers pass through exactly instead of via float32,
+                // whose 24-bit mantissa cannot hold a sample above 2^23 and
+                // return it unchanged
                 long max = (1L << depth.bitsPerSample) - 1;
                 int[] p = new int[cw * ch];
                 int[] src = exact[c];
@@ -1171,6 +1215,11 @@ public final class JxlDecoder {
     private static Bits section(CodestreamSource src, Toc toc, int index) throws IOException {
         int size = toc.sizes[index];
         return new Bits(src.readRange(toc.offsets[index], size), 0, size, toc.offsets[index]);
+    }
+
+    /** Whether all of a section's bytes are in the codestream we have. */
+    private static boolean arrived(Toc toc, int index, long have) {
+        return toc.offsets[index] + (long) toc.sizes[index] <= have;
     }
 
     /** A loop body that decodes one independent unit. */
@@ -1415,7 +1464,16 @@ public final class JxlDecoder {
             int y0 = top >> gc.vshift;
             int cw = Math.min(Bits.ceilDiv(w, 1 << gc.hshift), gc.width - x0);
             int ch = Math.min(Bits.ceilDiv(h, 1 << gc.vshift), gc.height - y0);
-            rect.add(new ModularChannel(Math.max(cw, 0), Math.max(ch, 0), gc.hshift, gc.vshift));
+            if (cw <= 0 || ch <= 0) {
+                // A channel with nothing of it inside this group is not in this
+                // group's stream at all — not even as an empty one. It matters:
+                // the channel index is an MA-tree property, so an omitted channel
+                // renumbers every channel after it. A squeeze on an odd width
+                // leaves a residual one column narrower than its average, which
+                // is exactly nothing when the last group column is one pixel.
+                continue;
+            }
+            rect.add(new ModularChannel(cw, ch, gc.hshift, gc.vshift));
             mapping.add(new int[] {i, x0, y0});
         }
         if (rect.isEmpty()) {
