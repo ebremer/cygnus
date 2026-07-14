@@ -134,14 +134,14 @@ cropped result; reference, LF and preview frames always decode whole.
 
 - **Lossless modular mode**: cost-based reversible colour transform
   selection (RCT types 0–6), global palette detection for few-colour images,
-  per-channel choice between the gradient and the self-correcting weighted
-  predictor, run-length LZ77 copies, learned (content-adaptive) MA trees —
-  greedy entropy-driven splits over the modular properties, including the
-  previous-channel ones — plus per-group local trees where a private code
-  beats the global one, histogram clustering, histogram-optimised prefix
+  run-length LZ77 copies, learned (content-adaptive) MA trees — greedy
+  entropy-driven splits over the modular properties, including the
+  previous-channel ones, with each leaf choosing its own predictor from all
+  fourteen the format defines — plus per-group local trees where a private
+  code beats the global one, histogram clustering, histogram-optimised prefix
   codes (package-merge, RFC 7932 simple and complex descriptions), optional
-  embedded previews. On photographic content the output lands between
-  `cjxl -e2` and `-e4`.
+  embedded previews. On the conformance photographs the output runs a few
+  percent over `cjxl -e7` (`bike` +5.3%, `bicycles` +3.4%, `cafe` −1.5%).
 - **Lossy (VarDCT) mode**: XYB colour, 8×8 and 16×16 DCT blocks chosen by a
   rate estimate, activity-masked adaptive quantisation, default quantisation
   tables with a distance-controlled quantiser

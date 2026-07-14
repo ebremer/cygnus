@@ -1152,6 +1152,7 @@ public final class JxlEncoder {
         int ctx;         // leaf context id, assigned in BFS order
         int offset;      // leaf residual offset
         int multiplier = 1; // leaf residual multiplier
+        LeafStat stat;   // scratch, held only across a leaf-refinement pass
     }
 
     static TNode leafNode(Chan c) {
@@ -1443,9 +1444,13 @@ public final class JxlEncoder {
     }
 
     /**
-     * Walks one channel rectangle in scan order, running the channel's learned
-     * subtree per pixel and buffering packed residuals under the leaf context.
-     * The rectangle is its own little image: neighbours never cross it.
+     * Walks one channel rectangle in scan order, running the learned subtree per
+     * pixel and buffering packed residuals under the leaf context. The rectangle
+     * is its own little image: neighbours never cross it.
+     *
+     * <p>The tree is walked <em>before</em> the prediction is made, because the
+     * leaf is what chooses the predictor — which is how the decoder has always
+     * read a tree, and for a long time was not how this wrote one.
      */
     static void tokenizeRect(Chan ch, TNode sub, int[] ref, int x0, int y0, int w, int h,
             TokenBuf buf) {
@@ -1454,7 +1459,7 @@ public final class JxlEncoder {
         }
         int[] px = ch.px;
         int stride = ch.w;
-        WpState wp = ch.predictor == 6 ? new WpState(WpState.WpParams.DEFAULT, w) : null;
+        WpState wp = usesWp(sub) ? new WpState(WpState.WpParams.DEFAULT, w) : null;
         for (int y = 0; y < h; y++) {
             int row = (y0 + y) * stride + x0;
             int rowN = row - stride;
@@ -1464,12 +1469,10 @@ public final class JxlEncoder {
                 int vNW = (x > 0 && y > 0) ? px[rowN + x - 1] : vW;
                 int vNE = (x + 1 < w && y > 0) ? px[rowN + x + 1] : vN;
                 int vNN = y > 1 ? px[row - 2 * stride + x] : vN;
-                long pred;
+                int vNEE = (x + 2 < w && y > 0) ? px[rowN + x + 2] : vNE;
+                int vWW = x > 1 ? px[row + x - 2] : vW;
                 if (wp != null) {
                     wp.beforePredict(x, y, vW, vN, vNW, vNE, vNN);
-                    pred = wp.prediction();
-                } else {
-                    pred = ModularStream.clampedGradient(vW, vN, vNW);
                 }
                 TNode n = sub;
                 while (n.prop >= 0) {
@@ -1477,6 +1480,7 @@ public final class JxlEncoder {
                             vW, vN, vNW, vNE, vNN, wp);
                     n = val > n.split ? n.left : n.right;
                 }
+                long pred = predict(n.predictor, wp, vW, vN, vNW, vNE, vNN, vNEE, vWW);
                 int residual = (int) (px[row + x] - pred) - n.offset;
                 if (n.multiplier != 1) {
                     residual /= n.multiplier;
@@ -1487,6 +1491,29 @@ public final class JxlEncoder {
                 }
             }
         }
+    }
+
+    /** The decoder's predictor, so that what we subtract is what it will add. */
+    private static long predict(int p, WpState wp, int vW, int vN, int vNW, int vNE, int vNN,
+            int vNEE, int vWW) {
+        try {
+            return ModularStream.predict(p, wp, vW, vN, vNW, vNE, vNN, vNEE, vWW);
+        } catch (IOException e) {
+            throw new IllegalStateException("no such predictor: " + p, e);
+        }
+    }
+
+    /**
+     * Whether a subtree makes the decoder run the weighted predictor: some leaf
+     * predicts with it, or some node splits on its error. The encoder has to run
+     * it in exactly the same cases, since its state depends on being fed every
+     * pixel from the start of the rectangle.
+     */
+    private static boolean usesWp(TNode n) {
+        if (n.prop >= 0) {
+            return n.prop == 15 || usesWp(n.left) || usesWp(n.right);
+        }
+        return n.predictor == 6;
     }
 
     /**
@@ -1583,15 +1610,16 @@ public final class JxlEncoder {
      * are re-centred. Must run before tokenization.
      */
     static void refineLeaves(Chan ch, TNode sub, int[] ref, List<int[]> rects) {
-        java.util.IdentityHashMap<TNode, LeafStat> stats = new java.util.IdentityHashMap<>();
+        List<TNode> touched = new ArrayList<>();
         int[] px = ch.px;
         int stride = ch.w;
+        boolean wpNeeded = usesWp(sub);
         for (int[] r : rects) {
             int x0 = r[0];
             int y0 = r[1];
             int w = r[2];
             int h = r[3];
-            WpState wp = ch.predictor == 6 ? new WpState(WpState.WpParams.DEFAULT, w) : null;
+            WpState wp = wpNeeded ? new WpState(WpState.WpParams.DEFAULT, w) : null;
             for (int y = 0; y < h; y++) {
                 int row = (y0 + y) * stride + x0;
                 int rowN = row - stride;
@@ -1601,12 +1629,10 @@ public final class JxlEncoder {
                     int vNW = (x > 0 && y > 0) ? px[rowN + x - 1] : vW;
                     int vNE = (x + 1 < w && y > 0) ? px[rowN + x + 1] : vN;
                     int vNN = y > 1 ? px[row - 2 * stride + x] : vN;
-                    long pred;
+                    int vNEE = (x + 2 < w && y > 0) ? px[rowN + x + 2] : vNE;
+                    int vWW = x > 1 ? px[row + x - 2] : vW;
                     if (wp != null) {
                         wp.beforePredict(x, y, vW, vN, vNW, vNE, vNN);
-                        pred = wp.prediction();
-                    } else {
-                        pred = ModularStream.clampedGradient(vW, vN, vNW);
                     }
                     TNode n = sub;
                     while (n.prop >= 0) {
@@ -1614,15 +1640,22 @@ public final class JxlEncoder {
                                 vW, vN, vNW, vNE, vNN, wp);
                         n = val > n.split ? n.left : n.right;
                     }
-                    stats.computeIfAbsent(n, k -> new LeafStat())
-                            .add((int) (px[row + x] - pred));
+                    long pred = predict(n.predictor, wp, vW, vN, vNW, vNE, vNN, vNEE, vWW);
+                    if (n.stat == null) {
+                        n.stat = new LeafStat();
+                        touched.add(n);
+                    }
+                    n.stat.add((int) (px[row + x] - pred));
                     if (wp != null) {
                         wp.afterPredict(x, y, px[row + x]);
                     }
                 }
             }
         }
-        stats.forEach(JxlEncoder::chooseLeafParams);
+        for (TNode leaf : touched) {
+            chooseLeafParams(leaf, leaf.stat);
+            leaf.stat = null;
+        }
     }
 
     private static void chooseLeafParams(TNode leaf, LeafStat s) {
@@ -1691,12 +1724,35 @@ public final class JxlEncoder {
 
     private static final int MAX_SAMPLES = 1 << 15;
     private static final int MIN_LEARN_PIXELS = 4096;
-    private static final int MAX_DEPTH = 4;
+    private static final int MAX_DEPTH = 8;
     private static final int MIN_LEAF_SAMPLES = 64;
-    private static final double SPLIT_COST_BITS = 650; // node overhead plus margin
+    private static final double SPLIT_COST_BITS = 650;
     private static final int TOKEN_ALPHABET = 72;
     private static final HybridUintConfig TOKEN_CFG = new HybridUintConfig(4, 1, 0);
     private static final double LOG2 = Math.log(2);
+
+    /**
+     * Raw bits a token carries besides itself — the middle of the hybrid integer,
+     * written uncoded.
+     *
+     * <p>The learner must count them, and for a long time did not have to. While a
+     * channel had one predictor, every pixel paid the same raw bits whichever side
+     * of a split it fell, so the term cancelled and only token entropy decided
+     * anything. It does not cancel between predictors. Predicting an eight-bit
+     * photograph with zero leaves every residual near 128 — one magnitude class, a
+     * beautifully concentrated token distribution, almost no entropy — and seven
+     * raw bits a pixel. Score by entropy alone and that is the predictor you pick.
+     */
+    private static final double[] TOKEN_EXTRA_BITS = new double[TOKEN_ALPHABET];
+
+    static {
+        int split = 1 << TOKEN_CFG.splitExp;
+        int inToken = TOKEN_CFG.msbInToken + TOKEN_CFG.lsbInToken;
+        for (int t = 0; t < TOKEN_ALPHABET; t++) {
+            TOKEN_EXTRA_BITS[t] = t < split ? 0
+                    : TOKEN_CFG.splitExp - inToken + ((t - split) >> inToken);
+        }
+    }
 
     /**
      * Nearest earlier same-shaped channel in the same sub-stream, or -1.
@@ -1779,29 +1835,41 @@ public final class JxlEncoder {
         return rects;
     }
 
-    /** Sampled pixels of one channel: residual tokens plus property values. */
+    /**
+     * Sampled pixels of one channel: the residual each predictor would leave,
+     * plus every property value. Every predictor, because the leaf a pixel lands
+     * in is what chooses one, and the learner cannot know which leaf that is
+     * until it has decided how to split — so it has to keep all the answers.
+     */
     private static final class Samples {
         int n;
         long totalPixels;
-        byte[] token;
+        byte[][] token;   // [predictor][sample]: hybrid-uint token of the residual
         int[] propIds;
-        int[][] prop; // [column][sample]
+        int[][] prop;     // [column][sample]
     }
 
     /**
-     * Properties the learner may split on. 0 and 1 are fixed by the chain
-     * structure; 15 forces the decoder to run the weighted predictor, so it is
-     * only offered on channels that pay that cost anyway.
+     * The predictors a leaf may choose from, all of which the learner carries
+     * through the split search. Narrowing the field first was tried — score them
+     * over the channel as a whole, keep the best few — and it cost 0.45% of the
+     * density to save 15% of the time, which is the wrong way round for an
+     * encoder whose reason to exist is the density.
      */
-    private static int[] candidateProps(Chan c, int[] ref) {
-        int n = 13 + (c.predictor == 6 ? 1 : 0) + (ref != null ? 4 : 0);
+    private static final int NUM_PREDICTORS = 14;
+
+    /**
+     * Properties the learner may split on. 0 and 1 are fixed by the chain
+     * structure. 15 is the weighted predictor's own error, and offering it makes
+     * the decoder run that predictor — but so does any leaf choosing it, and now
+     * every leaf may, so it costs nothing extra to offer.
+     */
+    private static int[] candidateProps(int[] ref) {
+        int n = 14 + (ref != null ? 4 : 0);
         int[] ids = new int[n];
         int k = 0;
-        for (int p = 2; p <= 14; p++) {
+        for (int p = 2; p <= 15; p++) {
             ids[k++] = p;
-        }
-        if (c.predictor == 6) {
-            ids[k++] = 15;
         }
         if (ref != null) {
             ids[k++] = 16;
@@ -1814,8 +1882,11 @@ public final class JxlEncoder {
 
     /**
      * Walks the rectangles exactly like {@link #tokenizeRect} and records an
-     * evenly strided subset of pixels: the residual's hybrid-uint token and
-     * every candidate property value.
+     * evenly strided subset of pixels: what every predictor would have left
+     * behind, and every candidate property value.
+     *
+     * <p>The weighted predictor runs over every pixel, sampled or not — its state
+     * is a running thing and cannot be picked up halfway.
      */
     private static Samples collectSamples(Chan c, int[] ref, List<int[]> rects, int maxSamples) {
         long total = 0;
@@ -1826,8 +1897,8 @@ public final class JxlEncoder {
         int capacity = (int) (total / step) + rects.size() + 1;
         Samples s = new Samples();
         s.totalPixels = total;
-        s.propIds = candidateProps(c, ref);
-        s.token = new byte[capacity];
+        s.propIds = candidateProps(ref);
+        s.token = new byte[NUM_PREDICTORS][capacity];
         s.prop = new int[s.propIds.length][capacity];
         int[] px = c.px;
         int stride = c.w;
@@ -1838,7 +1909,7 @@ public final class JxlEncoder {
             int y0 = r[1];
             int w = r[2];
             int h = r[3];
-            WpState wp = c.predictor == 6 ? new WpState(WpState.WpParams.DEFAULT, w) : null;
+            WpState wp = new WpState(WpState.WpParams.DEFAULT, w);
             for (int y = 0; y < h; y++) {
                 int row = (y0 + y) * stride + x0;
                 int rowN = row - stride;
@@ -1848,23 +1919,23 @@ public final class JxlEncoder {
                     int vNW = (x > 0 && y > 0) ? px[rowN + x - 1] : vW;
                     int vNE = (x + 1 < w && y > 0) ? px[rowN + x + 1] : vN;
                     int vNN = y > 1 ? px[row - 2 * stride + x] : vN;
-                    if (wp != null) {
-                        wp.beforePredict(x, y, vW, vN, vNW, vNE, vNN);
-                    }
+                    int vNEE = (x + 2 < w && y > 0) ? px[rowN + x + 2] : vNE;
+                    int vWW = x > 1 ? px[row + x - 2] : vW;
+                    wp.beforePredict(x, y, vW, vN, vNW, vNE, vNN);
                     if (phase++ % step == 0) {
-                        long pred = wp != null ? wp.prediction()
-                                : ModularStream.clampedGradient(vW, vN, vNW);
-                        int residual = (int) (px[row + x] - pred);
-                        s.token[s.n] = (byte) TOKEN_CFG.encode(packSigned(residual), tmp);
+                        for (int p = 0; p < NUM_PREDICTORS; p++) {
+                            long pred = predict(p, wp, vW, vN, vNW, vNE, vNN, vNEE, vWW);
+                            int residual = (int) (px[row + x] - pred);
+                            s.token[p][s.n] =
+                                    (byte) TOKEN_CFG.encode(packSigned(residual), tmp);
+                        }
                         for (int p = 0; p < s.propIds.length; p++) {
                             s.prop[p][s.n] = propValue(s.propIds[p], px, ref, row, rowN,
                                     x, y, vW, vN, vNW, vNE, vNN, wp);
                         }
                         s.n++;
                     }
-                    if (wp != null) {
-                        wp.afterPredict(x, y, px[row + x]);
-                    }
+                    wp.afterPredict(x, y, px[row + x]);
                 }
             }
         }
@@ -1909,28 +1980,57 @@ public final class JxlEncoder {
         return splitNode(c, s, idx, maxDepth, upscale, xlogx);
     }
 
-    /** One greedy split attempt over the node's samples; recurses on success. */
+    /**
+     * One greedy split attempt over the node's samples; recurses on success.
+     *
+     * <p>A split is costed by what each side would come to <em>once it has chosen
+     * its own predictor</em>, which is the whole difference. A property that
+     * separates the smooth part of a plane from its edges is worth nothing if
+     * both halves must go on predicting the same way; it is worth a great deal if
+     * one half can switch to west and the other to the weighted predictor. So the
+     * cost of a side is the smallest entropy any predictor leaves it with, and
+     * both sides are free to answer differently.
+     */
     private static TNode splitNode(Chan c, Samples s, int[] idx, int depthLeft, double upscale,
             double[] xlogx) {
         int m = idx.length;
         if (depthLeft <= 0 || m < 2 * MIN_LEAF_SAMPLES) {
-            return leafNode(c);
+            return leafNode(c, s, idx, xlogx);
         }
-        int[] full = new int[TOKEN_ALPHABET];
-        for (int i = 0; i < m; i++) {
-            full[s.token[idx[i]]]++;
+        int[][] full = new int[NUM_PREDICTORS][TOKEN_ALPHABET];
+        for (int p = 0; p < NUM_PREDICTORS; p++) {
+            byte[] tok = s.token[p];
+            int[] hist = full[p];
+            for (int i = 0; i < m; i++) {
+                hist[tok[idx[i]]]++;
+            }
         }
-        double sumFull = 0;
-        for (int t = 0; t < TOKEN_ALPHABET; t++) {
-            sumFull += xlogx[full[t]];
+        // A side costs xlogx[count] - sum(xlogx[hist]) in coded tokens, plus the
+        // raw middle bits those tokens carry. Track the two together as a score
+        // (lower is better) so the best predictor for a side is just its minimum.
+        double[] sumFull = new double[NUM_PREDICTORS];
+        double[] extraFull = new double[NUM_PREDICTORS];
+        double bestFull = Double.MAX_VALUE;
+        for (int p = 0; p < NUM_PREDICTORS; p++) {
+            double sum = 0;
+            double extra = 0;
+            for (int t = 0; t < TOKEN_ALPHABET; t++) {
+                sum += xlogx[full[p][t]];
+                extra += full[p][t] * TOKEN_EXTRA_BITS[t];
+            }
+            sumFull[p] = sum;
+            extraFull[p] = extra;
+            bestFull = Math.min(bestFull, extra - sum);
         }
-        double baseCost = xlogx[m] - sumFull;
+        double baseCost = xlogx[m] + bestFull;
 
         int bestCol = -1;
         int bestSplit = 0;
         double bestCost = baseCost;
         long[] keyed = new long[m];
-        int[] histR = new int[TOKEN_ALPHABET];
+        int[][] histR = new int[NUM_PREDICTORS][TOKEN_ALPHABET];
+        double[] scoreR = new double[NUM_PREDICTORS];
+        double[] scoreL = new double[NUM_PREDICTORS];
         for (int col = 0; col < s.propIds.length; col++) {
             int[] propCol = s.prop[col];
             for (int i = 0; i < m; i++) {
@@ -1940,16 +2040,22 @@ public final class JxlEncoder {
             if ((int) (keyed[0] >>> 32) == (int) (keyed[m - 1] >>> 32)) {
                 continue; // constant property
             }
-            java.util.Arrays.fill(histR, 0);
-            double sumR = 0;
-            double sumL = sumFull;
+            for (int p = 0; p < NUM_PREDICTORS; p++) {
+                java.util.Arrays.fill(histR[p], 0);
+                scoreR[p] = 0;
+                scoreL[p] = extraFull[p] - sumFull[p];
+            }
             // ascending prefix = right side (values <= split), suffix = left
             for (int i = 0; i < m - 1; i++) {
-                int t = s.token[(int) keyed[i]];
-                sumR += xlogx[histR[t] + 1] - xlogx[histR[t]];
-                histR[t]++;
-                int cf = full[t] - histR[t];
-                sumL += xlogx[cf] - xlogx[cf + 1];
+                int sample = (int) keyed[i];
+                for (int p = 0; p < NUM_PREDICTORS; p++) {
+                    int t = s.token[p][sample];
+                    int[] hist = histR[p];
+                    scoreR[p] += TOKEN_EXTRA_BITS[t] - (xlogx[hist[t] + 1] - xlogx[hist[t]]);
+                    hist[t]++;
+                    int cf = full[p][t] - hist[t];
+                    scoreL[p] -= TOKEN_EXTRA_BITS[t] + (xlogx[cf] - xlogx[cf + 1]);
+                }
                 int key = (int) (keyed[i] >>> 32);
                 if (key == (int) (keyed[i + 1] >>> 32)) {
                     continue;
@@ -1959,7 +2065,13 @@ public final class JxlEncoder {
                 if (nR < MIN_LEAF_SAMPLES || nL < MIN_LEAF_SAMPLES) {
                     continue;
                 }
-                double cost = (xlogx[nR] - sumR) + (xlogx[nL] - sumL);
+                double bestR = scoreR[0];
+                double bestL = scoreL[0];
+                for (int p = 1; p < NUM_PREDICTORS; p++) {
+                    bestR = Math.min(bestR, scoreR[p]);
+                    bestL = Math.min(bestL, scoreL[p]);
+                }
+                double cost = (xlogx[nR] + bestR) + (xlogx[nL] + bestL);
                 if (cost < bestCost) {
                     bestCost = cost;
                     bestCol = col;
@@ -1968,7 +2080,7 @@ public final class JxlEncoder {
             }
         }
         if (bestCol < 0 || (baseCost - bestCost) * upscale < SPLIT_COST_BITS) {
-            return leafNode(c);
+            return leafNode(c, s, idx, xlogx);
         }
         int[] propCol = s.prop[bestCol];
         int nLeft = 0;
@@ -1993,6 +2105,33 @@ public final class JxlEncoder {
         n.split = bestSplit;
         n.left = splitNode(c, s, li, depthLeft - 1, upscale, xlogx);
         n.right = splitNode(c, s, ri, depthLeft - 1, upscale, xlogx);
+        return n;
+    }
+
+    /** A leaf, taking whichever predictor leaves its own pixels cheapest to code. */
+    private static TNode leafNode(Chan c, Samples s, int[] idx, double[] xlogx) {
+        TNode n = leafNode(c);
+        int m = idx.length;
+        if (m == 0) {
+            return n;
+        }
+        int[] hist = new int[TOKEN_ALPHABET];
+        double best = Double.MAX_VALUE;
+        for (int p = 0; p < NUM_PREDICTORS; p++) {
+            java.util.Arrays.fill(hist, 0);
+            byte[] tok = s.token[p];
+            for (int i = 0; i < m; i++) {
+                hist[tok[idx[i]]]++;
+            }
+            double score = 0;
+            for (int t = 0; t < TOKEN_ALPHABET; t++) {
+                score += hist[t] * TOKEN_EXTRA_BITS[t] - xlogx[hist[t]];
+            }
+            if (score < best) {
+                best = score;
+                n.predictor = p;
+            }
+        }
         return n;
     }
 

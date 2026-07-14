@@ -6,8 +6,8 @@ import com.ebremer.cygnus.jpegxl.io.BitWriter;
 /**
  * Entropy-coded stream writer using prefix or rANS codes, with optional LZ77
  * copies. Values are first counted per context, contexts with similar
- * statistics are merged into at most eight clusters, and the values are then
- * emitted in a second pass.
+ * statistics are merged into at most {@value #MAX_CLUSTERS} clusters, and the
+ * values are then emitted in a second pass.
  *
  * <p>An encoder that cannot see all its values before it must start writing
  * them takes the other constructor and gives the clusters explicitly, settling
@@ -17,7 +17,7 @@ final class EntropyEncoder {
 
     static final int MIN_SYMBOL = 224;
     static final int MIN_LENGTH = 3;
-    private static final int MAX_CLUSTERS = 8;
+    private static final int MAX_CLUSTERS = 64;
     static final int ALPHABET = MIN_SYMBOL + 40;
     private static final HybridUintConfig VALUE_CONFIG = new HybridUintConfig(4, 1, 0);
 
@@ -58,7 +58,8 @@ final class EntropyEncoder {
     /**
      * @param numCtx number of value contexts
      * @param perContextClusters when true, contexts are counted separately and
-     *        merged into at most eight clusters; otherwise all share one code
+     *        merged into at most {@value #MAX_CLUSTERS} clusters; otherwise all
+     *        share one code
      * @param lz77 enable LZ77 copies (adds the distance context)
      * @param allowAns permit rANS symbol coding when it beats prefix codes;
      *        every section must then end with {@link #finishSection}
@@ -329,16 +330,19 @@ final class EntropyEncoder {
      */
     private void writeClusterMap(BitWriter out, int numClusters) {
         int nbits = numClusters > 1 ? 32 - Integer.numberOfLeadingZeros(numClusters - 1) : 0;
-        BitWriter flat = new BitWriter();
-        flat.writeBool(true);   // is_simple
-        flat.write(nbits, 2);
-        for (int i = 0; i < numDist; i++) {
-            flat.write(clusterMap[i], nbits);
+        BitWriter flat = null;
+        if (nbits <= 3) {   // the flat map's index width is a two-bit field
+            flat = new BitWriter();
+            flat.writeBool(true);   // is_simple
+            flat.write(nbits, 2);
+            for (int i = 0; i < numDist; i++) {
+                flat.write(clusterMap[i], nbits);
+            }
         }
         // only worth building the alternative once the flat map is big enough
         // for its own overhead (a nested code spec and an rANS flush) to lose
         BitWriter coded = null;
-        if (flat.bitLength() > 256) {
+        if (flat == null || flat.bitLength() > 256) {
             coded = new BitWriter();
             coded.writeBool(false);  // !is_simple
             coded.writeBool(true);   // move-to-front
@@ -353,7 +357,7 @@ final class EntropyEncoder {
             }
             nested.finishSection(coded);
         }
-        if (coded != null && coded.bitLength() < flat.bitLength()) {
+        if (flat == null || (coded != null && coded.bitLength() < flat.bitLength())) {
             out.writeBits(coded);
         } else {
             out.writeBits(flat);
@@ -400,6 +404,10 @@ final class EntropyEncoder {
     /**
      * Greedy bottom-up merge of context histograms into at most
      * {@link #MAX_CLUSTERS} clusters, minimising the total entropy increase.
+     *
+     * <p>Every pair's merge cost is held in a matrix rather than recomputed each
+     * round: absorbing {@code j} into {@code i} only changes the costs against
+     * {@code i}, so a round costs one row of entropies, not the whole triangle.
      */
     private void cluster() {
         if (!perContext || explicit) {
@@ -408,30 +416,37 @@ final class EntropyEncoder {
         int n = numDist;
         long[][] hist = new long[n][];
         int[] owner = new int[n];
+        int[] active = new int[n];
+        double[] self = new double[n];
         for (int i = 0; i < n; i++) {
             hist[i] = histograms[i].clone();
             owner[i] = i;
+            active[i] = i;
+            self[i] = entropy(hist[i], null);
         }
-        java.util.List<Integer> active = new java.util.ArrayList<>();
-        for (int i = 0; i < n; i++) {
-            active.add(i);
+        int live = n;
+        double[][] cost = new double[n][n];
+        for (int a = 0; a < n; a++) {
+            for (int b = a + 1; b < n; b++) {
+                cost[a][b] = cost[b][a] = pairCost(hist, self, a, b);
+            }
         }
-        while (active.size() > MAX_CLUSTERS) {
+        while (live > MAX_CLUSTERS) {
             double best = Double.MAX_VALUE;
             int bi = -1;
             int bj = -1;
-            for (int a = 0; a < active.size(); a++) {
-                for (int b = a + 1; b < active.size(); b++) {
-                    double cost = mergeCost(hist[active.get(a)], hist[active.get(b)]);
-                    if (cost < best) {
-                        best = cost;
+            for (int a = 0; a < live; a++) {
+                double[] row = cost[active[a]];
+                for (int b = a + 1; b < live; b++) {
+                    if (row[active[b]] < best) {
+                        best = row[active[b]];
                         bi = a;
                         bj = b;
                     }
                 }
             }
-            int i = active.get(bi);
-            int j = active.get(bj);
+            int i = active[bi];
+            int j = active[bj];
             for (int t = 0; t < ALPHABET; t++) {
                 hist[i][t] += hist[j][t];
             }
@@ -440,7 +455,14 @@ final class EntropyEncoder {
                     owner[k] = i;
                 }
             }
-            active.remove(bj);
+            active[bj] = active[--live];
+            self[i] = entropy(hist[i], null);
+            for (int a = 0; a < live; a++) {
+                int o = active[a];
+                if (o != i) {
+                    cost[i][o] = cost[o][i] = pairCost(hist, self, i, o);
+                }
+            }
         }
         int[] rank = new int[n];
         java.util.Arrays.fill(rank, -1);
@@ -454,8 +476,9 @@ final class EntropyEncoder {
         }
     }
 
-    private static double mergeCost(long[] a, long[] b) {
-        return entropy(a, b) - entropy(a, null) - entropy(b, null);
+    /** Bits lost by coding clusters {@code a} and {@code b} from one histogram. */
+    private static double pairCost(long[][] hist, double[] self, int a, int b) {
+        return entropy(hist[a], hist[b]) - self[a] - self[b];
     }
 
     private static double entropy(long[] a, long[] b) {
@@ -467,15 +490,17 @@ final class EntropyEncoder {
             return 0;
         }
         double bits = 0;
-        double log2 = Math.log(2);
+        double logN = Math.log(n);
         for (int t = 0; t < a.length; t++) {
             long c = a[t] + (b != null ? b[t] : 0);
             if (c > 0) {
-                bits += c * Math.log((double) n / c) / log2;
+                bits += c * (logN - Math.log(c));
             }
         }
-        return bits;
+        return bits / LOG2;
     }
+
+    private static final double LOG2 = Math.log(2);
 
     /** Pass 2: emit {@code value} in context {@code ctx}. */
     void write(BitWriter out, int ctx, int value) {

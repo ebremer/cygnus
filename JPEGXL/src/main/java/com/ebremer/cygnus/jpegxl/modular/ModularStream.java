@@ -569,7 +569,9 @@ public final class ModularStream {
         InverseTransforms.apply(this);
     }
 
-    static long predict(int p, WpState wp, long w, long n, long nw, long ne,
+    /** One predictor, evaluated. Shared with the encoder, which must predict what the
+     *  decoder will predict — now that a leaf chooses its own predictor, from all of these. */
+    public static long predict(int p, WpState wp, long w, long n, long nw, long ne,
             long nn, long nee, long ww) throws IOException {
         return switch (p) {
             case 0 -> 0;
