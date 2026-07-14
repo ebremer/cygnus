@@ -4,46 +4,23 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
-  <groupId>com.ebremer</groupId>
+  <parent>
+    <groupId>com.ebremer</groupId>
+    <artifactId>cygnus</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
   <artifactId>jpegxl</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
   <packaging>jar</packaging>
 
   <name>JPEG XL Reader/Writer</name>
   <description>Pure-Java JPEG XL (ISO/IEC 18181) decoder and lossless encoder with Java ImageIO plug-ins</description>
 
-  <properties>
-    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <maven.compiler.release>25</maven.compiler.release>
-    <junit.version>5.13.1</junit.version>
-  </properties>
-
   <dependencies>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
-      <version>${junit.version}</version>
       <scope>test</scope>
     </dependency>
   </dependencies>
-
-  <build>
-    <plugins>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.14.0</version>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.5.3</version>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-jar-plugin</artifactId>
-        <version>3.4.2</version>
-      </plugin>
-    </plugins>
-  </build>
 </project>
