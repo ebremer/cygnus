@@ -15,6 +15,9 @@ for JDK 25, exposed through the standard Java ImageIO API.
   `VarDctEncoder` basic lossy ones, for non-ImageIO use.
 - **Streaming input** — decoding from an `ImageInputStream` reads section
   ranges on demand instead of buffering the whole file.
+- **Streaming output** — `JxlStreamingEncoder` takes rows top to bottom and
+  never holds the image, lossless or lossy: gigapixel encodes run in a heap
+  sized by the image's width, not its area.
 - **Validated against libjxl** — the test suite cross-checks against the
   reference implementation (cjxl/djxl and ffmpeg's libjxl) plus the official
   conformance test corpus: lossless paths bit-exactly (including 32-bit
@@ -142,16 +145,30 @@ cropped result; reference, LF and preview frames always decode whole.
   (`VarDctEncoder.encode(rgb, w, h, distance)`), and an iterative
   rate-control mode (`encodeToTarget`) that refines the quantiser against
   the achieved error; the ImageIO quality knob uses the latter.
-- **Streaming (chunked) lossless encoding**: `JxlStreamingEncoder` consumes
-  rows top to bottom and compresses each 256-row band of groups as it
-  completes, so peak memory is one band plus the compressed sections and a
-  bounded set of per-group working buffers (encoding parallelism adapts to
-  the available heap) — the image never has to fit in memory (nor under
-  the 2³¹ samples-per-plane array limit): an 8192×8192 RGB image (768 MB
-  of samples) streams through a 200 MB heap. Each group is a
-  self-contained section with its own RCT,
-  predictors, learned tree and entropy code; files are typically a few
-  percent larger than `JxlEncoder.encode`'s.
+- **Streaming (chunked) encoding, lossless or lossy**: `JxlStreamingEncoder`
+  consumes rows top to bottom and compresses each 256-row band of groups as it
+  completes, so peak memory is one band plus the compressed sections — the image
+  never has to fit in memory (nor under the 2³¹ samples-per-plane array limit).
+  A 32768×32768 RGB image (1.07 gigapixels, 12.9 GB of samples) encodes lossily
+  in 44 s through a 768 MB heap, most of which is the 262 MB output being held
+  for the TOC. Working memory scales with width, not height.
+  - *Lossless* codes each group as a self-contained section with its own RCT,
+    predictors, learned tree and entropy code; files run a few percent larger
+    than `JxlEncoder.encode`'s.
+  - *Lossy* runs the VarDCT path band by band. The two steps that ordinarily
+    need the whole image are answered without it: masking's activity reference
+    is accumulated as bands arrive (exact for a one-band image), and the frame's
+    coefficient code becomes a small pool of them via `num_hf_presets`, claimed
+    per band, so blank bands and dense bands are not forced to share an alphabet.
+    The pool more than pays for the drifting reference: multi-band files come out
+    **smaller** than `VarDctEncoder.encode`'s at equal fidelity. An image no taller
+    than one band is byte-identical to the whole-image encoder.
+  - *Rate control* (`targetingQuality`) sets each band's quantiser by encoding and
+    decoding the busiest group in it, so quality tracks the requested distance
+    without a whole-image pass. On slide-like content it beats whole-image
+    `encodeToTarget` outright — that loop drives the error *averaged over the
+    frame* to the target, and when most of the frame is blank, the average is the
+    blank.
 - **JPEG → JPEG XL recompression**: `JpegRecompressor.encode(jpegBytes)`
   losslessly repacks a JPEG as a JPEG XL container with reconstruction data
   (`jbrd`), the write-side twin of `JpegReconstructor` — the quantised DCT
@@ -163,12 +180,21 @@ cropped result; reference, LF and preview frames always decode whole.
   verbatim. Arithmetic-coded, 12-bit and hierarchical JPEGs are rejected.
 
 ```java
+// lossless
 try (var enc = new JxlStreamingEncoder(outputStream, width, height, 8,
         /*grey*/ false, /*alpha*/ false, /*alphaAssociated*/ false)) {
     while (moreRows) {
         enc.writeRows(rowPlanes, rowCount);  // any batch size, top to bottom
     }
 }   // close() finishes the codestream
+
+// lossy: the same, with a Butteraugli-style distance
+try (var enc = new JxlStreamingEncoder(outputStream, width, height, 8,
+        false, false, false, /*distance*/ 1.0f)) { ... }
+
+// lossy, with quality measured per band rather than assumed
+try (var enc = JxlStreamingEncoder.targetingQuality(outputStream, width, height, 8,
+        false, false, false, /*distance*/ 1.0f)) { ... }
 ```
 
 JPEGs recompress losslessly in both directions:

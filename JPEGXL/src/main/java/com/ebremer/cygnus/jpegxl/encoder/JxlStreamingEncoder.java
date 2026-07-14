@@ -10,19 +10,25 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Streaming (chunked) lossless encoder: rows are pushed top to bottom with
- * {@link #writeRows}, each 256-row band of groups is compressed as soon as it
- * completes, and {@link #finish()} assembles the codestream. Peak memory is
- * one band of samples plus the already-compressed sections — the image's
- * total height never has to fit in memory, so images far beyond the reach of
- * {@link JxlEncoder#encode} (and beyond the 2^31 samples-per-plane array
- * limit) can be written.
+ * Streaming (chunked) encoder, lossless or lossy: rows are pushed top to
+ * bottom with {@link #writeRows}, each 256-row band of groups is compressed as
+ * soon as it completes, and {@link #finish()} assembles the codestream. Peak
+ * memory is one band of samples plus the already-compressed sections — the
+ * image's total height never has to fit in memory, so images far beyond the
+ * reach of {@link JxlEncoder#encode} (and beyond the 2^31 samples-per-plane
+ * array limit) can be written.
  *
- * <p>Every group is a self-contained modular section: its own reversible
- * colour transform, predictor choice, learned MA tree and entropy code
- * (nothing is shared across groups, since global statistics would need the
- * whole image). Files are typically a few percent larger than
- * {@link JxlEncoder#encode}'s and decode with any conforming decoder.
+ * <p><b>Lossless</b> (distance 0) codes every group as a self-contained
+ * modular section: its own reversible colour transform, predictor choice,
+ * learned MA tree and entropy code, nothing shared across groups. Files are
+ * typically a few percent larger than {@link JxlEncoder#encode}'s.
+ *
+ * <p><b>Lossy</b> (positive distance) runs the VarDCT path band by band; see
+ * {@link VarDctStreamer} for what the two whole-image steps — masking's
+ * activity reference and the frame's coefficient code — become when the whole
+ * image is never in hand.
+ *
+ * <p>Either way the output decodes with any conforming decoder.
  */
 public final class JxlStreamingEncoder implements AutoCloseable {
 
@@ -33,6 +39,8 @@ public final class JxlStreamingEncoder implements AutoCloseable {
     private final boolean grey;
     private final boolean alpha;
     private final boolean alphaAssociated;
+    private final float distance;    // 0 -> lossless modular
+    private final boolean rateControl;
     private final int numInput;
     private final int groupColumns;
 
@@ -42,19 +50,73 @@ public final class JxlStreamingEncoder implements AutoCloseable {
     private long rowsReceived;
     private final byte[][] sections; // finished pass-group sections, group order
     private final int[][] whole;     // single-group images just buffer everything
+    private final VarDctStreamer lossy;
     private boolean finished;
 
     /**
-     * Plane layout everywhere: colour channels first (1 for greyscale, 3 for
-     * RGB), then an optional alpha plane; sample values in [0, 2^bits).
+     * Lossless. Plane layout everywhere: colour channels first (1 for
+     * greyscale, 3 for RGB), then an optional alpha plane; sample values in
+     * [0, 2^bits).
      */
     public JxlStreamingEncoder(OutputStream out, int width, int height, int bits,
             boolean grey, boolean alpha, boolean alphaAssociated) {
+        this(out, width, height, bits, grey, alpha, alphaAssociated, 0f);
+    }
+
+    /**
+     * Lossy when {@code distance} is positive — the Butteraugli-distance
+     * convention of cjxl, where 1 is roughly visually lossless and larger is
+     * smaller and worse — and lossless when it is zero. Alpha rides losslessly
+     * either way. The quantiser is set from the distance and left there; for
+     * quality that tracks the request across changing content, see
+     * {@link #targetingQuality}.
+     */
+    public JxlStreamingEncoder(OutputStream out, int width, int height, int bits,
+            boolean grey, boolean alpha, boolean alphaAssociated, float distance) {
+        this(out, width, height, bits, grey, alpha, alphaAssociated, distance, false);
+    }
+
+    /**
+     * Lossy with closed-loop rate control: each band's quantiser is set by
+     * measuring what it actually costs on the busiest group of that band, so
+     * content the distance alone would have coded worse than it promised is
+     * given the bits to reach it.
+     *
+     * <p>It only ever refines. {@link VarDctEncoder#encodeToTarget}, having the
+     * whole image, will also coarsen one it is coding <em>better</em> than asked
+     * — but that is a whole-image judgement, and made band by band it is a bad
+     * bargain: the bands that come out better than asked are the smooth ones,
+     * which were nearly free anyway, so coarsening them saves little and
+     * introduces banding that a mean-error target does not see. So this
+     * guarantees the requested quality as a floor rather than tracking it in
+     * both directions, and a band already past the floor is left alone.
+     *
+     * <p>Costs a few percent of the encode on wide images, more on narrow ones,
+     * since the measurement is a real encode and decode of one group.
+     */
+    public static JxlStreamingEncoder targetingQuality(OutputStream out, int width, int height,
+            int bits, boolean grey, boolean alpha, boolean alphaAssociated, float distance) {
+        if (distance <= 0) {
+            throw new IllegalArgumentException("rate control needs a positive distance");
+        }
+        return new JxlStreamingEncoder(out, width, height, bits, grey, alpha, alphaAssociated,
+                distance, true);
+    }
+
+    private JxlStreamingEncoder(OutputStream out, int width, int height, int bits,
+            boolean grey, boolean alpha, boolean alphaAssociated, float distance,
+            boolean rateControl) {
         if (width <= 0 || height <= 0) {
             throw new IllegalArgumentException("bad dimensions " + width + "x" + height);
         }
         if (bits < 1 || bits > 31) {
             throw new IllegalArgumentException("bits per sample must be in 1..31");
+        }
+        if (distance < 0) {
+            throw new IllegalArgumentException("distance must not be negative");
+        }
+        if (distance > 0 && bits > 16) {
+            throw new IllegalArgumentException("lossy bits per sample must be in 1..16");
         }
         this.out = out;
         this.width = width;
@@ -63,7 +125,9 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         this.grey = grey;
         this.alpha = alpha;
         this.alphaAssociated = alphaAssociated;
+        this.distance = distance;
         this.numInput = (grey ? 1 : 3) + (alpha ? 1 : 0);
+        this.rateControl = rateControl;
         this.groupColumns = JxlEncoder.ceilDiv(width, JxlEncoder.GROUP_DIM);
         int groupRows = JxlEncoder.ceilDiv(height, JxlEncoder.GROUP_DIM);
         if (groupColumns * groupRows == 1) {
@@ -72,10 +136,18 @@ public final class JxlStreamingEncoder implements AutoCloseable {
             this.whole = new int[numInput][width * height];
             this.band = null;
             this.sections = null;
+            this.lossy = null;
+        } else if (distance > 0) {
+            this.whole = null;
+            this.band = null;
+            this.sections = null;
+            this.lossy = new VarDctStreamer(out, width, height, bits, grey, alpha,
+                    alphaAssociated, distance, rateControl);
         } else {
             this.whole = null;
             this.band = new int[numInput][width * Math.min(JxlEncoder.GROUP_DIM, height)];
             this.sections = new byte[groupColumns * groupRows][];
+            this.lossy = null;
         }
     }
 
@@ -108,6 +180,11 @@ public final class JxlStreamingEncoder implements AutoCloseable {
                 System.arraycopy(rows[c], 0, whole[c], (int) rowsReceived * width,
                         rowCount * width);
             }
+            rowsReceived += rowCount;
+            return;
+        }
+        if (lossy != null) {
+            lossy.writeRows(rows, rowCount);
             rowsReceived += rowCount;
             return;
         }
@@ -264,9 +341,23 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         }
         finished = true;
         if (whole != null) {
-            out.write(JxlEncoder.encode(whole, width, height, bits, grey, alpha,
-                    alphaAssociated));
+            byte[] bytes;
+            if (distance <= 0) {
+                bytes = JxlEncoder.encode(whole, width, height, bits, grey, alpha,
+                        alphaAssociated);
+            } else if (rateControl) {
+                bytes = VarDctEncoder.encodeToTarget(whole, width, height, bits, grey, alpha,
+                        alphaAssociated, distance);
+            } else {
+                bytes = VarDctEncoder.encode(whole, width, height, bits, grey, alpha,
+                        alphaAssociated, distance);
+            }
+            out.write(bytes);
             out.flush();
+            return;
+        }
+        if (lossy != null) {
+            lossy.finish();
             return;
         }
         BitWriter w = new BitWriter();

@@ -106,6 +106,20 @@ public final class BitWriter {
         }
     }
 
+    /**
+     * Appends another writer's bits, whatever bit offset either sits at. Lets a
+     * caller build two candidate encodings, measure them, and splice in the
+     * shorter.
+     */
+    public void writeBits(BitWriter other) {
+        for (int i = 0; i < other.bytePos; i++) {
+            write(other.buf[i] & 0xff, 8);
+        }
+        if (other.nbits > 0) {
+            write((int) (other.acc & ((1L << other.nbits) - 1)), other.nbits);
+        }
+    }
+
     /** Appends whole bytes; the writer must be byte-aligned. */
     public void writeBytes(byte[] bytes) {
         if (nbits != 0) {

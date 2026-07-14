@@ -4,28 +4,46 @@ import com.ebremer.cygnus.jpegxl.entropy.HybridUintConfig;
 import com.ebremer.cygnus.jpegxl.io.BitWriter;
 
 /**
- * Entropy-coded stream writer using prefix codes, with optional LZ77 copies.
- * Values are first counted per context, contexts with similar statistics are
- * merged into at most eight clusters (the limit of the simple cluster-map
- * encoding), and the values are then emitted in a second pass.
+ * Entropy-coded stream writer using prefix or rANS codes, with optional LZ77
+ * copies. Values are first counted per context, contexts with similar
+ * statistics are merged into at most eight clusters, and the values are then
+ * emitted in a second pass.
+ *
+ * <p>An encoder that cannot see all its values before it must start writing
+ * them takes the other constructor and gives the clusters explicitly, settling
+ * each one's counts as they become known; see {@link #EntropyEncoder(int[], int)}.
  */
 final class EntropyEncoder {
 
     static final int MIN_SYMBOL = 224;
     static final int MIN_LENGTH = 3;
     private static final int MAX_CLUSTERS = 8;
-    private static final int ALPHABET = MIN_SYMBOL + 40;
+    static final int ALPHABET = MIN_SYMBOL + 40;
+    private static final HybridUintConfig VALUE_CONFIG = new HybridUintConfig(4, 1, 0);
 
     private final int numDist;      // contexts including the LZ77 distance context
     private final boolean lz77;
     private final boolean perContext;
     private final boolean allowAns;
-    private final HybridUintConfig config = new HybridUintConfig(4, 1, 0);
+    private final boolean explicit;    // clusters are given, not learned
+    private final HybridUintConfig config = VALUE_CONFIG;
     private final HybridUintConfig lenConfig = new HybridUintConfig(0, 0, 0);
-    private final long[][] histograms; // per context (or one shared histogram)
+    private final long[][] histograms; // per context, per cluster, or one shared
     private final int[] clusterMap;
     private PrefixEncoder[] codes;
     private final int[] scratch = new int[1];
+
+    /** Largest token a value can turn into, so a histogram can cover them all. */
+    static final int MAX_TOKEN = VALUE_CONFIG.maxToken;
+
+    /**
+     * Counts {@code value}'s symbol into a histogram held outside a coder — how
+     * a caller measures what a code would have to carry before deciding which
+     * code to use. {@code scratch} is a one-element int array the caller owns.
+     */
+    static void tally(long[] histogram, int value, int[] scratch) {
+        histogram[(int) VALUE_CONFIG.encode(value, scratch)]++;
+    }
 
     // rANS state (populated by writeSpec when ANS wins the cost comparison)
     private boolean useAns;
@@ -49,9 +67,56 @@ final class EntropyEncoder {
         this.lz77 = lz77;
         this.perContext = perContextClusters;
         this.allowAns = allowAns;
+        this.explicit = false;
         this.numDist = numCtx + (lz77 ? 1 : 0);
         this.histograms = new long[perContext ? numDist : 1][ALPHABET];
         this.clusterMap = new int[numDist];
+    }
+
+    /**
+     * Given clusters: {@code map} says which cluster each context is coded
+     * with, rather than the clusters being discovered by merging. Each
+     * cluster's histogram is settled by {@link #freezeCluster} the moment its
+     * content is known, and the values may then be emitted straight away —
+     * long before {@link #writeSpec} runs. That inversion is what lets an
+     * encoder that never sees the whole image still produce one code spec at
+     * the end: prefix codes, unlike rANS, are per-cluster independent, so a
+     * cluster settled early is not disturbed by one settled later.
+     */
+    EntropyEncoder(int[] map, int numClusters) {
+        this.lz77 = false;
+        this.perContext = true;
+        this.allowAns = false;
+        this.explicit = true;
+        this.numDist = map.length;
+        this.histograms = new long[numClusters][ALPHABET];
+        this.clusterMap = map;
+        this.codes = new PrefixEncoder[numClusters];
+    }
+
+    /**
+     * Settles one cluster's histogram and builds its code, so values in that
+     * cluster's contexts can be written before the spec is. {@link #writeSpec}
+     * rebuilds the identical code from the same frozen counts.
+     */
+    void freezeCluster(int cluster, long[] histogram) {
+        System.arraycopy(histogram, 0, histograms[cluster], 0, ALPHABET);
+        codes[cluster] = new PrefixEncoder(histograms[cluster], alphabetSize(histograms[cluster]));
+    }
+
+    /** Cost in bits of coding {@code histogram}'s values with a frozen cluster's code. */
+    long costWith(int cluster, long[] histogram) {
+        return codes[cluster].costBits(histogram);
+    }
+
+    private static int alphabetSize(long[] histogram) {
+        int max = 0;
+        for (int t = 0; t < ALPHABET; t++) {
+            if (histogram[t] > 0) {
+                max = t;
+            }
+        }
+        return max + 1;
     }
 
     EntropyEncoder(int numCtx, boolean perContextClusters, boolean lz77) {
@@ -62,9 +127,14 @@ final class EntropyEncoder {
         this(numCtx, perContextClusters, false, false);
     }
 
+    /** Which histogram a context's values are counted into. */
+    private int slot(int ctx) {
+        return explicit ? clusterMap[ctx] : perContext ? ctx : 0;
+    }
+
     /** Pass 1: account for {@code value} in context {@code ctx}. */
     void count(int ctx, int value) {
-        histograms[perContext ? ctx : 0][(int) config.encode(value, scratch)]++;
+        histograms[slot(ctx)][(int) config.encode(value, scratch)]++;
     }
 
     /** Pass 1: account for a copy of {@code len} values at distance value {@code distValue}. */
@@ -162,17 +232,13 @@ final class EntropyEncoder {
             numClusters = Math.max(numClusters, c + 1);
         }
         if (numDist > 1) {
-            out.writeBool(true); // simple cluster map
-            int nbits = numClusters > 1 ? 32 - Integer.numberOfLeadingZeros(numClusters - 1) : 0;
-            out.write(nbits, 2);
-            for (int i = 0; i < numDist; i++) {
-                out.write(clusterMap[i], nbits);
-            }
+            writeClusterMap(out, numClusters);
         }
         long[][] clustered = new long[numClusters][ALPHABET];
         int[] maxToken = new int[numClusters];
         for (int i = 0; i < histograms.length; i++) {
-            int cl = perContext ? clusterMap[i] : 0;
+            // in explicit mode the histograms are already the clusters
+            int cl = explicit ? i : perContext ? clusterMap[i] : 0;
             for (int t = 0; t < ALPHABET; t++) {
                 if (histograms[i][t] > 0) {
                     clustered[cl][t] += histograms[i][t];
@@ -253,6 +319,71 @@ final class EntropyEncoder {
         }
     }
 
+    /**
+     * Writes the context-to-cluster map, in whichever of the format's two
+     * encodings comes out shorter. The flat one spends a fixed index width on
+     * every context, which is fine for a handful of them and ruinous for the
+     * tens of thousands a multi-preset VarDCT code has — there the map is one
+     * long run per preset, and the entropy-coded form (move-to-front, so a run
+     * becomes a repeat of symbol zero) shrinks it to a few dozen bytes.
+     */
+    private void writeClusterMap(BitWriter out, int numClusters) {
+        int nbits = numClusters > 1 ? 32 - Integer.numberOfLeadingZeros(numClusters - 1) : 0;
+        BitWriter flat = new BitWriter();
+        flat.writeBool(true);   // is_simple
+        flat.write(nbits, 2);
+        for (int i = 0; i < numDist; i++) {
+            flat.write(clusterMap[i], nbits);
+        }
+        // only worth building the alternative once the flat map is big enough
+        // for its own overhead (a nested code spec and an rANS flush) to lose
+        BitWriter coded = null;
+        if (flat.bitLength() > 256) {
+            coded = new BitWriter();
+            coded.writeBool(false);  // !is_simple
+            coded.writeBool(true);   // move-to-front
+            int[] symbols = moveToFront(clusterMap);
+            EntropyEncoder nested = new EntropyEncoder(1, false, false, true);
+            for (int s : symbols) {
+                nested.count(0, s);
+            }
+            nested.writeSpec(coded);
+            for (int s : symbols) {
+                nested.write(coded, 0, s);
+            }
+            nested.finishSection(coded);
+        }
+        if (coded != null && coded.bitLength() < flat.bitLength()) {
+            out.writeBits(coded);
+        } else {
+            out.writeBits(flat);
+        }
+    }
+
+    /**
+     * Move-to-front over the cluster indices: each is replaced by its position
+     * in a list that then promotes it to the head, so a repeated index codes as
+     * zero. Mirrors the decoder's inverse transform.
+     */
+    private static int[] moveToFront(int[] values) {
+        int[] list = new int[256];
+        for (int i = 0; i < 256; i++) {
+            list[i] = i;
+        }
+        int[] symbols = new int[values.length];
+        for (int i = 0; i < values.length; i++) {
+            int v = values[i];
+            int j = 0;
+            while (list[j] != v) {
+                j++;
+            }
+            symbols[i] = j;
+            System.arraycopy(list, 0, list, 1, j);
+            list[0] = v;
+        }
+        return symbols;
+    }
+
     private static int ceilLog2(int v) {
         return v <= 1 ? 0 : 32 - Integer.numberOfLeadingZeros(v - 1);
     }
@@ -271,8 +402,8 @@ final class EntropyEncoder {
      * {@link #MAX_CLUSTERS} clusters, minimising the total entropy increase.
      */
     private void cluster() {
-        if (!perContext) {
-            return; // everything already shares cluster 0
+        if (!perContext || explicit) {
+            return; // already assigned: one shared cluster, or a given map
         }
         int n = numDist;
         long[][] hist = new long[n][];
@@ -357,6 +488,18 @@ final class EntropyEncoder {
         }
         codes[clusterMap[ctx]].writeSymbol(out, token);
         out.write(scratch[0], midBits);
+    }
+
+    /**
+     * Pass 2, from several threads at once: emits into the caller's own writer
+     * with the caller's own scratch, touching nothing shared but the frozen
+     * codes. Prefix codes only — rANS threads a running state through the whole
+     * section and cannot be split this way.
+     */
+    void writeShared(BitWriter out, int ctx, int value, int[] scratch) {
+        long enc = config.encode(value, scratch);
+        codes[clusterMap[ctx]].writeSymbol(out, (int) enc);
+        out.write(scratch[0], (int) (enc >>> 32));
     }
 
     /** Pass 2: emit a copy of {@code len} values at distance value {@code distValue}. */
