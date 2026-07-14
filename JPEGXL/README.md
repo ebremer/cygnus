@@ -11,8 +11,9 @@ for JDK 25, exposed through the standard Java ImageIO API.
   thumbnails, animation timing as native image metadata, and an explicit
   compression quality below 1.0 selects lossy encoding.
 - **Direct APIs** — `JxlDecoder` returns per-channel sample planes (integer
-  or float) with full metadata; `JxlEncoder` writes lossless codestreams and
-  `VarDctEncoder` basic lossy ones, for non-ImageIO use.
+  or float) with full metadata; `JxlEncoder` writes lossless codestreams
+  (integer or floating-point samples, optionally progressive) and
+  `VarDctEncoder` lossy ones, for non-ImageIO use.
 - **Streaming input** — decoding from an `ImageInputStream` reads section
   ranges on demand instead of buffering the whole file.
 - **Streaming output** — `JxlStreamingEncoder` takes rows top to bottom and
@@ -169,6 +170,16 @@ cropped result; reference, LF and preview frames always decode whole.
     `encodeToTarget` outright — that loop drives the error *averaged over the
     frame* to the target, and when most of the frame is blank, the average is the
     blank.
+- **Floating-point samples**: `JxlEncoder.encodeFloat` writes float images
+  losslessly — IEEE binary32, binary16, or any of the format's custom layouts
+  (2–8 exponent bits). The format carries a float as its bit pattern, coded as
+  an integer, so this is the ordinary lossless path with the samples
+  reinterpreted; it is bit-exact on negative zero, subnormals, infinities and
+  NaN, and a narrow layout refuses a sample it cannot hold rather than rounding
+  it. Float images are a good deal less compressible than the same picture as
+  integers — across a power of two the bit pattern jumps, and the predictors see
+  a cliff where the picture is smooth. That is the format's bargain, not this
+  encoder's.
 - **Progressive (responsive) lossless**: `JxlEncoder.encodeProgressive` applies
   the Squeeze transform — the channels become a small image of the picture
   followed by the detail that doubles it, repeatedly — and cuts the frame into

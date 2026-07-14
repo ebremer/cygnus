@@ -104,7 +104,8 @@ public final class JxlEncoder {
 
     private final int width;
     private final int height;
-    private final int bits;
+    private final BitDepth depth;
+    private final int bits;   // depth.bitsPerSample, used everywhere it always was
     private final boolean grey;
     private final boolean alpha;
     private final boolean alphaAssociated;
@@ -131,15 +132,16 @@ public final class JxlEncoder {
 
     private JxlEncoder(int[][] planes, int width, int height, int bits,
             boolean grey, boolean alpha, boolean alphaAssociated) {
-        this(planes, width, height, bits, grey, alpha, alphaAssociated, false);
+        this(planes, width, height, BitDepth.of(bits), grey, alpha, alphaAssociated, false);
     }
 
-    private JxlEncoder(int[][] planes, int width, int height, int bits, boolean grey,
+    private JxlEncoder(int[][] planes, int width, int height, BitDepth depth, boolean grey,
             boolean alpha, boolean alphaAssociated, boolean progressive) {
+        this.depth = depth;
         this.progressive = progressive;
         this.width = width;
         this.height = height;
-        this.bits = bits;
+        this.bits = depth.bitsPerSample;
         this.grey = grey;
         this.alpha = alpha;
         this.alphaAssociated = alphaAssociated;
@@ -170,7 +172,8 @@ public final class JxlEncoder {
         if (bits < 1 || bits > 31) {
             throw new IllegalArgumentException("bits per sample must be in 1..31");
         }
-        return new JxlEncoder(planes, width, height, bits, grey, alpha, alphaAssociated).run();
+        return new JxlEncoder(planes, width, height, BitDepth.of(bits), grey, alpha,
+                alphaAssociated, false).run();
     }
 
     /**
@@ -196,8 +199,68 @@ public final class JxlEncoder {
         if (bits < 1 || bits > 31) {
             throw new IllegalArgumentException("bits per sample must be in 1..31");
         }
-        return new JxlEncoder(planes, width, height, bits, grey, alpha, alphaAssociated, true)
+        return new JxlEncoder(planes, width, height, BitDepth.of(bits), grey, alpha,
+                alphaAssociated, true).run();
+    }
+
+    /**
+     * Encodes floating-point samples losslessly, as {@link BitDepth#float32()}
+     * unless a narrower layout is asked for.
+     *
+     * <p>A float is a sign, an exponent and a mantissa laid end to end, and that
+     * is exactly how the format carries one: the modular coder codes the bit
+     * pattern as an integer, and the decoder reads the bits back as a float. So
+     * this is the ordinary lossless encoder with the samples reinterpreted, and
+     * it is bit-exact — including negative zero, the subnormals, the infinities
+     * and NaN.
+     *
+     * <p>What it is <em>not</em> is a compressor of magnitudes. Neighbouring
+     * floats have neighbouring bit patterns only while they share an exponent;
+     * across a power of two the pattern jumps, and the predictors see a cliff
+     * where the picture is smooth. Float images therefore compress a good deal
+     * worse than the same picture quantised to integers — that is the format's
+     * bargain, not this encoder's.
+     *
+     * @param planes sample planes, colour channels first (1 for greyscale, 3 for
+     *               RGB), then an optional alpha plane, which rides at the same
+     *               depth
+     * @param depth  a floating-point {@link BitDepth}; anything narrower than
+     *               {@link BitDepth#float32()} refuses samples it cannot hold
+     *               exactly, rather than rounding them
+     */
+    public static byte[] encodeFloat(float[][] planes, int width, int height, BitDepth depth,
+            boolean grey, boolean alpha, boolean alphaAssociated) throws IOException {
+        if (width <= 0 || height <= 0) {
+            throw new IllegalArgumentException("bad dimensions " + width + "x" + height);
+        }
+        if (!depth.floatingPoint) {
+            throw new IllegalArgumentException("encodeFloat needs a floating-point depth");
+        }
+        int numInput = (grey ? 1 : 3) + (alpha ? 1 : 0);
+        if (planes.length != numInput) {
+            throw new IllegalArgumentException("expected " + numInput + " planes, got "
+                    + planes.length);
+        }
+        int[][] bits = new int[numInput][];
+        for (int c = 0; c < numInput; c++) {
+            if (planes[c].length != width * height) {
+                throw new IllegalArgumentException("plane " + c + " has wrong size");
+            }
+            int[] out = new int[width * height];
+            for (int i = 0; i < out.length; i++) {
+                out[i] = depth.floatToSample(planes[c][i]);
+            }
+            bits[c] = out;
+        }
+        return new JxlEncoder(bits, width, height, depth, grey, alpha, alphaAssociated, false)
                 .run();
+    }
+
+    /** Encodes float samples as IEEE binary32, the depth that holds any of them. */
+    public static byte[] encodeFloat(float[][] planes, int width, int height,
+            boolean grey, boolean alpha, boolean alphaAssociated) throws IOException {
+        return encodeFloat(planes, width, height, BitDepth.float32(), grey, alpha,
+                alphaAssociated);
     }
 
     /**
@@ -219,7 +282,7 @@ public final class JxlEncoder {
         out.write(0xff, 8);
         out.write(0x0a, 8);
         new SizeHeader(width, height).write(out);
-        ImageMetadata meta = buildMetadata(bits, grey, alpha, alphaAssociated);
+        ImageMetadata meta = buildMetadata(BitDepth.of(bits), grey, alpha, alphaAssociated);
         meta.previewWidth = previewWidth;
         meta.previewHeight = previewHeight;
         meta.write(out);
@@ -233,7 +296,7 @@ public final class JxlEncoder {
         out.write(0xff, 8);
         out.write(0x0a, 8);
         new SizeHeader(width, height).write(out);
-        buildMetadata(bits, grey, alpha, alphaAssociated).write(out);
+        buildMetadata(depth, grey, alpha, alphaAssociated).write(out);
         writeFrame(out);
         return out.toByteArray();
     }
@@ -965,14 +1028,19 @@ public final class JxlEncoder {
 
     static ImageMetadata buildMetadata(int bits, boolean grey, boolean alpha,
             boolean alphaAssociated) {
+        return buildMetadata(BitDepth.of(bits), grey, alpha, alphaAssociated);
+    }
+
+    static ImageMetadata buildMetadata(BitDepth depth, boolean grey, boolean alpha,
+            boolean alphaAssociated) {
         ImageMetadata meta = new ImageMetadata();
-        meta.bitDepth = BitDepth.of(bits);
-        meta.modular16BitBuffers = bits <= 12;
+        meta.bitDepth = depth;
+        meta.modular16BitBuffers = !depth.floatingPoint && depth.bitsPerSample <= 12;
         meta.xybEncoded = false;
         if (alpha) {
             ExtraChannelInfo ec = new ExtraChannelInfo();
             ec.type = ExtraChannelInfo.TYPE_ALPHA;
-            ec.bitDepth = BitDepth.of(bits);
+            ec.bitDepth = depth;   // alpha rides at the image's own depth, float included
             ec.alphaAssociated = alphaAssociated;
             meta.extraChannels.add(ec);
         }
