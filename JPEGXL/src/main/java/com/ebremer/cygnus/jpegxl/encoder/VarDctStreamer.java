@@ -53,8 +53,15 @@ final class VarDctStreamer {
 
     /**
      * How much of the error a finer quantiser must actually remove before rate
-     * control keeps it. Below this it has hit the floor the decoder's own
-     * smoothing puts under the error, and is paying bits for nothing.
+     * control keeps it; below this it is paying bits for nothing and stops.
+     *
+     * <p>This was once load-bearing, for the wrong reason. The encoder's gaborish
+     * inversion did not converge, and the error it left behind did not shrink with
+     * the quantiser — so on noisy content rate control would climb forever against
+     * a wall. This guard noticed the wall. Now that the inversion converges there
+     * is no wall, and on every image measured the guard never fires at all. It
+     * stays because the near-lossless end has a real floor of its own — eight-bit
+     * output rounding — and stopping there is still the right thing to do.
      */
     private static final double FLOOR_GAIN = 0.93;
 

@@ -2,8 +2,16 @@ package com.ebremer.cygnus.jpegxl.decoder;
 
 import com.ebremer.cygnus.jpegxl.codestream.RestorationFilter;
 
-/** Gaborish smoothing and the edge-preserving filter, applied on colour planes. */
-final class RestorationFilters {
+/**
+ * Gaborish smoothing and the edge-preserving filter, applied on colour planes.
+ *
+ * <p>Public because the encoder runs them too: it pre-sharpens its input so that
+ * the decoder's gaborish lands back on the source, and it decides each block's
+ * EPF sharpness by running this very filter over its own reconstruction and
+ * keeping whichever answer comes out closer. Both only work if what the encoder
+ * predicts and what the decoder does are the same code.
+ */
+public final class RestorationFilters {
 
     private RestorationFilters() {
     }
@@ -15,7 +23,7 @@ final class RestorationFilters {
      * the visible frame bounds ({@code mirrorW} x {@code mirrorH}), not the
      * padded plane edge, matching libjxl's border handling.
      */
-    static void gaborish(RestorationFilter rf, float[][] planes, int width, int height,
+    public static void gaborish(RestorationFilter rf, float[][] planes, int width, int height,
             int mirrorW, int mirrorH, int yFrom, int yTo) throws java.io.IOException {
         int lastX = mirrorW - 1;
         int yEnd = Math.min(yTo, mirrorH);
@@ -61,7 +69,7 @@ final class RestorationFilters {
      * reach of at most 3 rows, pixels further than 9 rows inside the band are
      * identical to a full-frame run.
      */
-    static void epf(RestorationFilter rf, float[][] planes, int width, int height,
+    public static void epf(RestorationFilter rf, float[][] planes, int width, int height,
             int mirrorW, int mirrorH, float[] inverseSigmaPerBlock, int blockStride,
             float sigmaForModular, int yFrom, int yTo) throws java.io.IOException {
         float stepMultiplier = (float) (1.65 * 4 * (1 - Math.sqrt(0.5)));

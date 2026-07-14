@@ -253,4 +253,75 @@ class VarDctEncoderTest {
         assertTrue(sum / (double) (w * h * 3) <= 2.0,
                 "mean diff " + sum / (double) (w * h * 3));
     }
+
+    /** Mean absolute error of a self-decode, on the 8-bit scale. */
+    private static double selfError(int[][] src, int w, int h, float distance)
+            throws Exception {
+        byte[] jxl = VarDctEncoder.encode(src, w, h, distance);
+        int[][] out = JxlDecoder.decode(jxl).frames.get(0).channels;
+        long sum = 0;
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < w * h; i++) {
+                sum += Math.abs(out[c][i] - src[c][i]);
+            }
+        }
+        return sum / (3.0 * w * h);
+    }
+
+    /** High-frequency content: the hardest thing for the encoder to hand back. */
+    private static int[][] fine(int w, int h) {
+        int[][] p = new int[3][w * h];
+        java.util.Random rnd = new java.util.Random(7);
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < w * h; i++) {
+                int x = i % w;
+                int y = i / w;
+                // a checkerboard at the Nyquist limit, plus noise, plus a ramp
+                int detail = ((x + y) & 1) == 0 ? 60 : -60;
+                p[c][i] = Math.max(0, Math.min(255,
+                        128 + detail + rnd.nextInt(21) - 10 + (x * 40) / w));
+            }
+        }
+        return p;
+    }
+
+    /**
+     * A finer quantiser has to keep buying quality all the way down.
+     *
+     * <p>It did not. The encoder pre-sharpens its input so that the decoder's
+     * gaborish blur lands back on the source, and that pre-sharpening is a solve,
+     * run as a fixed-point iteration — but it was stopped after three steps, which
+     * at the frequencies gaborish attenuates most is nowhere near converged. What
+     * was left over did not depend on the quantiser, so it sat under every lossy
+     * encode as a floor: this image used to come back with a mean error of about
+     * 6/255 at distance 2 and about 6/255 at distance 0.1, no matter how many bits
+     * it was given. Nothing measured the ceiling, so nothing noticed.
+     */
+    @Test
+    void fineDistanceKeepsBuyingQuality() throws Exception {
+        int w = 128;
+        int h = 128;
+        int[][] src = fine(w, h);
+        double coarse = selfError(src, w, h, 2.0f);
+        double fine = selfError(src, w, h, 0.1f);
+        assertTrue(fine < 0.5,
+                "distance 0.1 should be near-exact, got mean error " + fine);
+        assertTrue(fine < coarse / 4,
+                "a 20x finer quantiser bought almost nothing: " + coarse + " -> " + fine);
+    }
+
+    /** And the error has to fall monotonically as the quantiser tightens. */
+    @Test
+    void errorFallsWithDistance() throws Exception {
+        int w = 128;
+        int h = 128;
+        int[][] src = fine(w, h);
+        double previous = Double.MAX_VALUE;
+        for (float d : new float[] {3f, 2f, 1.5f, 1f, 0.5f, 0.25f}) {
+            double err = selfError(src, w, h, d);
+            assertTrue(err < previous,
+                    "distance " + d + " gave " + err + ", no better than " + previous);
+            previous = err;
+        }
+    }
 }

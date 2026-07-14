@@ -148,6 +148,17 @@ cropped result; reference, LF and preview frames always decode whole.
   (`VarDctEncoder.encode(rgb, w, h, distance)`), and an iterative
   rate-control mode (`encodeToTarget`) that refines the quantiser against
   the achieved error; the ImageIO quality knob uses the latter.
+- **Both restoration filters are accounted for on encode.** The decoder blurs
+  every frame with gaborish and then runs an edge-preserving filter over it, and
+  an encoder that ignores either is aiming at the wrong target. Gaborish is
+  linear, so it is *inverted*: the input is pre-sharpened by a relaxed
+  fixed-point solve until the decoder's blur lands back on the source. EPF is a
+  bilateral filter and cannot be inverted, so instead it is *steered* — the
+  encoder reconstructs what the decoder will see, runs the decoder's own filters
+  over it, and uses the format's per-block sharpness field to ask for the filter
+  only on the blocks it measurably helps. Together these are what let a fine
+  distance actually buy quality: a greyscale image at distance 0.3 comes back
+  bit-exact.
 - **Streaming (chunked) encoding, lossless or lossy**: `JxlStreamingEncoder`
   consumes rows top to bottom and compresses each 256-row band of groups as it
   completes, so peak memory is one band plus the compressed sections — the image

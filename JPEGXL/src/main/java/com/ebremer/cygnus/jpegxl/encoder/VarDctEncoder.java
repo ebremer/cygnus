@@ -2,7 +2,9 @@ package com.ebremer.cygnus.jpegxl.encoder;
 
 import com.ebremer.cygnus.jpegxl.codestream.BitDepth;
 import com.ebremer.cygnus.jpegxl.codestream.ImageMetadata;
+import com.ebremer.cygnus.jpegxl.codestream.RestorationFilter;
 import com.ebremer.cygnus.jpegxl.codestream.SizeHeader;
+import com.ebremer.cygnus.jpegxl.decoder.RestorationFilters;
 import com.ebremer.cygnus.jpegxl.io.BitWriter;
 import com.ebremer.cygnus.jpegxl.io.Bits;
 import com.ebremer.cygnus.jpegxl.vardct.Dct;
@@ -30,14 +32,37 @@ public final class VarDctEncoder {
     static final int GROUP_DIM = 256;
 
     /**
-     * Rows of context the gaborish pre-sharpening needs on each side of a
-     * window. Its fixed-point iteration is a 3x3 convolution run three times,
-     * so a row's final value depends on rows up to three away; give it that
-     * much and the window's own rows come out exactly as they would have in
-     * the whole image. Rows nearer the buffer edge than that are contaminated
-     * by the edge clamp — which is why they are halo and not output.
+     * Steps of the gaborish pre-sharpening's fixed-point iteration.
+     *
+     * <p>Gaborish is a symmetric blur whose frequency response runs from 1 at DC
+     * down to 0.443 at the worst corner, so inverting it is a well-conditioned
+     * solve (condition number 2.26) — but a solve, and the iteration has to be
+     * run out. Under-relaxed at {@link #GABORISH_OMEGA} = 1 it contracts by only
+     * 0.557 a step at that corner, and the three steps this used to take left a
+     * sixth of the high-frequency error standing. That residual does not shrink
+     * with the quantiser, so it became the floor under every lossy encode: a
+     * greyscale image at distance 0.1 came back with a mean error of 1.24 out of
+     * 255 no matter how many bits it was given.
      */
-    static final int GABORISH_HALO = 3;
+    private static final int GABORISH_STEPS = 8;
+
+    /**
+     * Relaxation for that iteration: {@code 2 / (lambdaMin + lambdaMax)}, the
+     * factor that minimises the worst-case contraction over gaborish's spectrum.
+     * It takes the per-step contraction from 0.557 to 0.386, which is most of the
+     * reason eight steps are enough where twelve would otherwise be needed — and
+     * every step is a row of halo.
+     */
+    private static final float GABORISH_OMEGA = 1.3863f;
+
+    /**
+     * Rows of context the gaborish pre-sharpening needs on each side of a
+     * window. Each step is one 3x3 convolution, so contamination from the
+     * buffer's edge clamp creeps exactly one row inward per step: give the
+     * window that many rows and its own rows come out as they would have in the
+     * whole image. Rows nearer the buffer edge than that are halo, not output.
+     */
+    static final int GABORISH_HALO = GABORISH_STEPS;
 
     /** The default HF block context map (readHfBlockContext's default). */
     private static final int[] DEFAULT_CTX_MAP = {
@@ -77,6 +102,7 @@ public final class VarDctEncoder {
     private final float[] baseSfc = new float[3];   // before the block multiplier
     private final float[][][] weightsOf;            // [parameterIndex][channel]
     private final ImageMetadata opsin;              // defaults: opsin matrix, quant biases
+    private final RestorationFilter filter = RestorationFilter.defaults();
     final int w8;                                   // cell columns, whole image
     final int h8Total;                              // cell rows, whole image
     private final int tilesX;                       // CfL tile columns, whole image
@@ -95,6 +121,7 @@ public final class VarDctEncoder {
     private float[] activity;    // per cell, before normalisation
     private byte[] blockType;    // per cell: transform type at origins, negative if covered
     private int[] blockMul;      // per cell: the block's quantisation multiplier
+    private byte[] sharp;        // per cell: EPF sharpness, 0 = leave the block alone
     private int[][] dcQuant;
     private int[][][] hfQuant;   // [channel][origin cell] -> natural coefficients
 
@@ -127,6 +154,7 @@ public final class VarDctEncoder {
         final int row0;     // image cell row of the first row held
         final byte[] type;
         final int[] mul;
+        final byte[] sharp;
         final int[][] dc;
         final int[] xFromY;
         final int[] bFromY;
@@ -135,6 +163,7 @@ public final class VarDctEncoder {
             this.row0 = row0;
             this.type = new byte[w8 * rows];
             this.mul = new int[w8 * rows];
+            this.sharp = new byte[w8 * rows];
             this.dc = new int[3][w8 * rows];
             this.xFromY = new int[tilesX * ceilDiv(rows, 8)];
             this.bFromY = new int[tilesX * ceilDiv(rows, 8)];
@@ -332,10 +361,11 @@ public final class VarDctEncoder {
 
     /**
      * Pre-sharpens the XYB buffer so the decoder's gaborish convolution lands
-     * back on the source: x is refined so gab(x) = original, three fixed-point
-     * steps of x += original - gab(x). Kernel and edge clamping mirror the
-     * decoder's. Contamination from the buffer's own edges creeps inward one
-     * row per step, which is exactly what {@link #GABORISH_HALO} pays for.
+     * back on the source: x is refined until gab(x) = original, by
+     * {@link #GABORISH_STEPS} relaxed fixed-point steps of
+     * {@code x += omega * (original - gab(x))}. Kernel and edge clamping mirror
+     * the decoder's, and contamination from the buffer's own edges creeps inward
+     * one row per step — which is what {@link #GABORISH_HALO} pays for.
      */
     private void inverseGaborish() {
         if (NO_FILTERS) {
@@ -347,6 +377,7 @@ public final class VarDctEncoder {
         float base = mult;
         float adjW = w1 * mult;
         float diagW = w2 * mult;
+        float omega = GABORISH_OMEGA;
         int w = paddedWidth;
         int h = bufRows;
         int lastX = w - 1;
@@ -354,7 +385,7 @@ public final class VarDctEncoder {
         for (int c = 0; c < 3; c++) {
             float[] target = xyb[c];
             float[] x = target.clone();
-            for (int iter = 0; iter < 3; iter++) {
+            for (int iter = 0; iter < GABORISH_STEPS; iter++) {
                 sweep(h, y -> {
                     int row = y * w;
                     int rowN = (y == 0 ? y : y - 1) * w;
@@ -369,7 +400,7 @@ public final class VarDctEncoder {
                 });
                 sweep(h, y -> {
                     for (int i = y * w; i < y * w + w; i++) {
-                        x[i] += target[i] - g[i];
+                        x[i] += omega * (target[i] - g[i]);
                     }
                 });
             }
@@ -519,7 +550,7 @@ public final class VarDctEncoder {
      * {@link Double#NaN} to use the window's own mean — which, for a window
      * that is the whole image, is the whole image's mean.
      */
-    void quantiseWindow(double meanActivity) {
+    void quantiseWindow(double meanActivity) throws IOException {
         if (activity == null) {
             measureWindow();
         }
@@ -564,6 +595,7 @@ public final class VarDctEncoder {
                 }
             }
         });
+        chooseSharpness();
     }
 
     private static final int[] Y_FIRST = {1, 0, 2};
@@ -737,11 +769,179 @@ public final class VarDctEncoder {
         return Math.max(1, Math.min(255, mul));
     }
 
+    // ------------------------------------------------------- EPF sharpness
+
+    /**
+     * Sharpness the encoder offers a block it wants filtered. The decoder's
+     * sigma is proportional to {@code epfSharpLut[sharpness]}, whose zeroth entry
+     * is zero — so sharpness 0 drives sigma to zero, trips the decoder's
+     * {@code sigma < 0.3} skip, and leaves the block exactly as it found it. The
+     * choice is therefore between "filter this block as hard as the format
+     * allows" and "do not touch it", which is what the blocks themselves ask for:
+     * given the whole ladder to choose from, they overwhelmingly pick an end.
+     */
+    private static final int SHARP_ON = 7;
+
+    /** Below this the decoder skips a block outright; see {@code RestorationFilters.epf}. */
+    private static final float MIN_SIGMA = 0.3f;
+
+    /**
+     * Picks each block's EPF sharpness by running the decoder's own filter over
+     * the encoder's own reconstruction and keeping whichever came out closer to
+     * the source.
+     *
+     * <p>This is the same trick as the gaborish pre-sharpening, played the other
+     * way round. Gaborish is linear, so the encoder can invert it and hand the
+     * decoder something that comes back right. EPF is not — it is a bilateral
+     * filter whose weights depend on the decoded pixels — so there is nothing to
+     * invert. But the encoder can predict it exactly, because it knows what the
+     * decoder will reconstruct, and the format lets it say per block whether the
+     * filter should run at all. So: reconstruct, filter, measure, choose.
+     *
+     * <p>What the decoder does is R -> gaborish -> EPF. The encoder holds the
+     * pre-sharpened target x, and by construction gab(x) is the source — so it
+     * recovers the source with one forward convolution rather than keeping a
+     * second copy of it around.
+     */
+    private void chooseSharpness() throws IOException {
+        sharp = new byte[w8 * h8];
+        if (NO_FILTERS) {
+            return;
+        }
+        int cells = w8 * h8;
+        float[] sigma = new float[cells];
+        float[] invSigma = new float[cells];
+        boolean live = false;
+        float lut = filter.epfSharpLut[SHARP_ON];
+        for (int k = 0; k < cells; k++) {
+            sigma[k] = (65536f / globalScale) * lut / blockMul[k];
+            invSigma[k] = 1f / sigma[k];
+            live |= sigma[k] >= MIN_SIGMA;
+        }
+        if (!live) {
+            // Even at full strength the decoder would skip every block, so say
+            // sharpness 0 and be done: no simulation to run, and a flat plane
+            // codes for nothing where a flat 4 was costing a bit a block to ask
+            // for a filter that never ran.
+            return;
+        }
+        int rows = h8 << 3;
+        float[][] recon = reconstructWindow();
+        float[][] source = new float[3][];
+        for (int c = 0; c < 3; c++) {
+            source[c] = java.util.Arrays.copyOfRange(xyb[c], y0 * paddedWidth,
+                    (y0 + rows) * paddedWidth);
+        }
+        // The decoder runs gaborish and then EPF. gab(x) is the source, by the
+        // construction of x; gab(R) is what it will hand to EPF.
+        RestorationFilters.gaborish(filter, source, paddedWidth, rows, paddedWidth, rows, 0, rows);
+        RestorationFilters.gaborish(filter, recon, paddedWidth, rows, paddedWidth, rows, 0, rows);
+        double[] unfiltered = cellError(recon, source, rows);
+        RestorationFilters.epf(filter, recon, paddedWidth, rows, paddedWidth, rows,
+                invSigma, w8, filter.epfSigmaForModular, 0, rows);
+        double[] filtered = cellError(recon, source, rows);
+        for (int k = 0; k < cells; k++) {
+            if (sigma[k] >= MIN_SIGMA && filtered[k] < unfiltered[k]) {
+                sharp[k] = SHARP_ON;
+            }
+        }
+    }
+
+    /**
+     * Absolute XYB error of every cell, the channels weighted the way the filter
+     * itself weights them — the format's own statement of what a difference in
+     * each is worth.
+     */
+    private double[] cellError(float[][] got, float[][] want, int rows) {
+        double[] err = new double[w8 * h8];
+        sweep(h8, by -> {
+            for (int y = by * 8; y < by * 8 + 8 && y < rows; y++) {
+                for (int x = 0; x < paddedWidth; x++) {
+                    int i = y * paddedWidth + x;
+                    double e = 0;
+                    for (int c = 0; c < 3; c++) {
+                        e += filter.epfChannelScale[c] * Math.abs(got[c][i] - want[c][i]);
+                    }
+                    err[by * w8 + (x >> 3)] += e;
+                }
+            }
+        });
+        return err;
+    }
+
+    /**
+     * The window's pixels as the decoder will rebuild them: every block's
+     * coefficients dequantised, chroma-from-luma added back and inverse
+     * transformed. Exact, because the frame header turns off adaptive DC
+     * smoothing — the one part of the decoder's LF path the encoder does not
+     * model.
+     */
+    private float[][] reconstructWindow() {
+        int rows = h8 << 3;
+        float[][] out = new float[3][paddedWidth * rows];
+        sweep(h8, by -> {
+            float[] deq = new float[256];
+            float[] dqY = new float[256];
+            float[] dcT = new float[4];
+            float[] llf = new float[4];
+            float[] s0 = new float[256];
+            float[] s1 = new float[256];
+            for (int bx = 0; bx < w8; bx++) {
+                int k = by * w8 + bx;
+                byte type = blockType[k];
+                if (type < 0) {
+                    continue; // covered by the 16x16 block that owns the cell
+                }
+                TransformType tt = type == DCT16.type ? DCT16 : DCT8;
+                int dim = type == DCT16.type ? 16 : 8;
+                int llfDim = dim >> 3;
+                for (int ci = 0; ci < 3; ci++) {
+                    int c = Y_FIRST[ci];
+                    float cfl = cflFactor(c, by, bx);
+                    float sfc = baseSfc[c] / blockMul[k];
+                    float[] wc = weightsOf[tt.parameterIndex][c];
+                    int[] q = hfQuant[c][k];
+                    for (int y = 0; y < dim; y++) {
+                        for (int x = 0; x < dim; x++) {
+                            if (y < llfDim && x < llfDim) {
+                                continue; // LLF comes from the DC image, below
+                            }
+                            int j = y * dim + x;
+                            float hf = q[j] * sfc * wc[x * dim + y];
+                            deq[j] = hf + cfl * dqY[j];
+                            if (c == 1) {
+                                dqY[j] = hf;
+                            }
+                        }
+                    }
+                    // The DC entries were derived from the LLF coefficients by an
+                    // llfDim-square inverse DCT; run it forwards to get them back.
+                    if (llfDim == 1) {
+                        deq[0] = dcQuant[c][k] * scaledDequant[c];
+                    } else {
+                        for (int i = 0; i < 4; i++) {
+                            int cell = (by + (i >> 1)) * w8 + bx + (i & 1);
+                            dcT[i] = dcQuant[c][cell] * scaledDequant[c];
+                        }
+                        Dct.forward2D(dcT, 0, 2, llf, 0, 2, 2, 2, s0, s1);
+                        for (int i = 0; i < 4; i++) {
+                            deq[(i >> 1) * dim + (i & 1)] = llf[i] * tt.llfScale[i];
+                        }
+                    }
+                    Dct.inverse2D(deq, 0, dim, out[c], by * 8 * paddedWidth + bx * 8,
+                            paddedWidth, dim, dim, s0, s1, false);
+                }
+            }
+        });
+        return out;
+    }
+
     /** Copies the quantised window's per-cell decisions into an LF group's store. */
     void storeCells(Cells cells) {
         int off = (cellRow0 - cells.row0) * w8;
         System.arraycopy(blockType, 0, cells.type, off, w8 * h8);
         System.arraycopy(blockMul, 0, cells.mul, off, w8 * h8);
+        System.arraycopy(sharp, 0, cells.sharp, off, w8 * h8);
         for (int c = 0; c < 3; c++) {
             System.arraycopy(dcQuant[c], 0, cells.dc[c], off, w8 * h8);
         }
@@ -1371,9 +1571,11 @@ public final class VarDctEncoder {
                 metaPx[1][ty * tileW + tx] = cells.bFromY[gt];
             }
         }
-        if (!NO_FILTERS) {
-            // mid sharpness activates the decoder's EPF with distance-scaled sigma
-            java.util.Arrays.fill(metaPx[3], 4);
+        for (int y = 0; y < bh; y++) {
+            for (int x = 0; x < bw; x++) {
+                metaPx[3][y * bw + x] =
+                        cells.sharp[(cellY0 + y) * w8 + col * lfBlockDim + x];
+            }
         }
         ModularSub.write(w, metaPx,
                 new int[] {tileW, tileW, nbBlocks, bw},

@@ -24,6 +24,24 @@ public final class RestorationFilter {
         }
     }
 
+    /**
+     * The all-default filter, exactly as {@link #read} builds it for a frame
+     * whose restoration bundle is all_default — quant multiplier already folded
+     * into the sharpness LUT. The encoder needs this to predict what the decoder
+     * will do to its own reconstruction.
+     */
+    public static RestorationFilter defaults() {
+        RestorationFilter rf = new RestorationFilter();
+        rf.foldQuantMul();
+        return rf;
+    }
+
+    private void foldQuantMul() {
+        for (int i = 0; i < 8; i++) {
+            epfSharpLut[i] *= epfQuantMul;
+        }
+    }
+
     public static RestorationFilter read(Bits in, boolean modular) throws IOException {
         RestorationFilter rf = new RestorationFilter();
         boolean allDefault = in.bool();
@@ -62,9 +80,7 @@ public final class RestorationFilter {
             }
             ImageMetadata.readExtensions(in);
         }
-        for (int i = 0; i < 8; i++) {
-            rf.epfSharpLut[i] *= rf.epfQuantMul;
-        }
+        rf.foldQuantMul();
         return rf;
     }
 }
