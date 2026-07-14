@@ -2,6 +2,7 @@ package com.ebremer.cygnus.jpegxl.imageio;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.awt.image.BufferedImage;
@@ -103,6 +104,146 @@ class ImageIOPluginTest {
         } finally {
             reader.dispose();
         }
+    }
+
+    /**
+     * A float raster in and a float raster out. The reader has always handed
+     * float images back on a TYPE_FLOAT component raster; the writer now takes
+     * one, so the round trip closes and a float image can go through plain
+     * {@code ImageIO.write} / {@code ImageIO.read} without ever being quantised.
+     */
+    @Test
+    void floatRasterRoundTripsBitExactly() throws IOException {
+        for (boolean alpha : new boolean[] {false, true}) {
+            BufferedImage img = floatImage(211, 137, alpha);
+            BufferedImage back = writeAndRead(img);
+            assertEquals(java.awt.image.DataBuffer.TYPE_FLOAT,
+                    back.getRaster().getDataBuffer().getDataType(),
+                    "a float image should come back as floats");
+            int bands = img.getRaster().getNumBands();
+            for (int y = 0; y < img.getHeight(); y++) {
+                for (int x = 0; x < img.getWidth(); x++) {
+                    for (int b = 0; b < bands; b++) {
+                        assertEquals(
+                                Float.floatToRawIntBits(img.getRaster().getSampleFloat(x, y, b)),
+                                Float.floatToRawIntBits(back.getRaster().getSampleFloat(x, y, b)),
+                                "alpha=" + alpha + " sample " + x + "," + y + " band " + b);
+                    }
+                }
+            }
+        }
+    }
+
+    /** And lossily, where the point is that nothing is quantised onto an integer grid first. */
+    @Test
+    void floatRasterWritesLossily() throws IOException {
+        BufferedImage img = floatImage(200, 150, false);
+        javax.imageio.ImageWriter writer = ImageIO.getImageWritersByFormatName("jxl").next();
+        javax.imageio.ImageWriteParam param = writer.getDefaultWriteParam();
+        param.setCompressionMode(javax.imageio.ImageWriteParam.MODE_EXPLICIT);
+        param.setCompressionType("lossy");
+        param.setCompressionQuality(0.9f);
+
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        try (javax.imageio.stream.ImageOutputStream ios = ImageIO.createImageOutputStream(bos)) {
+            writer.setOutput(ios);
+            writer.write(null, new javax.imageio.IIOImage(img, null, null), param);
+        }
+        writer.dispose();
+        BufferedImage back = ImageIO.read(new ByteArrayInputStream(bos.toByteArray()));
+        assertEquals(java.awt.image.DataBuffer.TYPE_FLOAT,
+                back.getRaster().getDataBuffer().getDataType());
+        double error = 0;
+        int n = 0;
+        for (int y = 0; y < img.getHeight(); y++) {
+            for (int x = 0; x < img.getWidth(); x++) {
+                for (int b = 0; b < 3; b++) {
+                    error += Math.abs(img.getRaster().getSampleFloat(x, y, b)
+                            - back.getRaster().getSampleFloat(x, y, b));
+                    n++;
+                }
+            }
+        }
+        assertTrue(error / n < 0.1, "mean error " + (error / n) + " on samples running to +-2");
+    }
+
+    /**
+     * The progressive knob is the standard one. A prefix of the bytes it produces
+     * is the whole picture at low resolution, where a prefix of an ordinary file
+     * is part of the picture and a lot of black.
+     */
+    @Test
+    void progressiveModeWritesAResponsiveFile() throws IOException {
+        BufferedImage img = testImage(BufferedImage.TYPE_INT_RGB, 600, 400, false);
+        javax.imageio.ImageWriter writer = ImageIO.getImageWritersByFormatName("jxl").next();
+        javax.imageio.ImageWriteParam param = writer.getDefaultWriteParam();
+        param.setProgressiveMode(javax.imageio.ImageWriteParam.MODE_DEFAULT);
+
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        try (javax.imageio.stream.ImageOutputStream ios = ImageIO.createImageOutputStream(bos)) {
+            writer.setOutput(ios);
+            writer.write(null, new javax.imageio.IIOImage(img, null, null), param);
+        }
+        writer.dispose();
+        byte[] jxl = bos.toByteArray();
+
+        BufferedImage back = ImageIO.read(new ByteArrayInputStream(jxl));
+        for (int y = 0; y < img.getHeight(); y++) {
+            for (int x = 0; x < img.getWidth(); x++) {
+                assertEquals(img.getRGB(x, y) | 0xff000000, back.getRGB(x, y),
+                        "progressive must still be lossless: pixel " + x + "," + y);
+            }
+        }
+
+        int[][] coarse = com.ebremer.cygnus.jpegxl.decoder.JxlDecoder
+                .decodePartial(java.util.Arrays.copyOf(jxl, jxl.length / 5))
+                .frames.get(0).channels;
+        int covered = 0;
+        for (int i = 0; i < 600 * 400; i++) {
+            if (coarse[0][i] != 0 || coarse[1][i] != 0 || coarse[2][i] != 0) {
+                covered++;
+            }
+        }
+        assertEquals(600 * 400, covered,
+                "a fifth of a progressive file should already cover the whole image");
+    }
+
+    /** A float raster and squeeze do not go together, and it says so. */
+    @Test
+    void progressiveRefusesFloatSamples() {
+        BufferedImage img = floatImage(64, 64, false);
+        javax.imageio.ImageWriter writer = ImageIO.getImageWritersByFormatName("jxl").next();
+        javax.imageio.ImageWriteParam param = writer.getDefaultWriteParam();
+        param.setProgressiveMode(javax.imageio.ImageWriteParam.MODE_DEFAULT);
+        assertThrows(UnsupportedOperationException.class, () -> {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            try (javax.imageio.stream.ImageOutputStream ios =
+                    ImageIO.createImageOutputStream(bos)) {
+                writer.setOutput(ios);
+                writer.write(null, new javax.imageio.IIOImage(img, null, null), param);
+            }
+        });
+    }
+
+    /** A TYPE_FLOAT component raster, the shape the reader hands back. */
+    private static BufferedImage floatImage(int w, int h, boolean alpha) {
+        java.awt.image.ComponentColorModel cm = new java.awt.image.ComponentColorModel(
+                java.awt.color.ColorSpace.getInstance(java.awt.color.ColorSpace.CS_sRGB),
+                alpha, false,
+                alpha ? java.awt.Transparency.TRANSLUCENT : java.awt.Transparency.OPAQUE,
+                java.awt.image.DataBuffer.TYPE_FLOAT);
+        java.awt.image.WritableRaster raster = cm.createCompatibleWritableRaster(w, h);
+        Random r = new Random(3);
+        int bands = raster.getNumBands();
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                for (int b = 0; b < bands; b++) {
+                    raster.setSample(x, y, b, (float) (Math.sin(x * 0.05 + b)
+                            * Math.cos(y * 0.04) * 2 + 0.001 * r.nextGaussian()));
+                }
+            }
+        }
+        return new BufferedImage(cm, raster, false, null);
     }
 
     @Test

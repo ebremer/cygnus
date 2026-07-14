@@ -37,10 +37,14 @@ public final class JXLImageWriterSpi extends ImageWriterSpi {
         if (bands < 1 || bands > 4) {
             return false;
         }
-        for (int i = 0; i < bands; i++) {
-            int size = sm.getSampleSize(i);
-            if (size < 1 || size > 16) {
-                return false;
+        // a float raster's sample size is 32 and means something else entirely:
+        // the samples are colour values, not fractions of full scale
+        if (sm.getDataType() != java.awt.image.DataBuffer.TYPE_FLOAT) {
+            for (int i = 0; i < bands; i++) {
+                int size = sm.getSampleSize(i);
+                if (size < 1 || size > 16) {
+                    return false;
+                }
             }
         }
         return cm.getColorSpace().getType() == java.awt.color.ColorSpace.TYPE_RGB

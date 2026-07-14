@@ -9,6 +9,8 @@ import com.ebremer.cygnus.jpegxl.codestream.BitDepth;
 import com.ebremer.cygnus.jpegxl.decoder.JxlDecoder;
 import com.ebremer.cygnus.jpegxl.decoder.JxlImage;
 import com.ebremer.cygnus.jpegxl.encoder.JxlEncoder;
+import com.ebremer.cygnus.jpegxl.encoder.JxlStreamingEncoder;
+import com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder;
 import java.io.IOException;
 import java.util.Random;
 import java.util.stream.Stream;
@@ -199,6 +201,117 @@ class FloatEncodingTest {
         }
     }
 
+    /**
+     * Float rows through the streaming encoder, which is where a float image too
+     * big to hold has to go. Nothing about it is special — a float sample is an
+     * integer bit pattern, so the coder carries one without knowing — and the
+     * output should be the whole-image encoder's, to within what streaming always
+     * costs.
+     */
+    @ParameterizedTest(name = "{0}x{1}, {2} planes")
+    @MethodSource("shapes")
+    void floatRowsStreamBitExactly(int w, int h, int planes, boolean alpha) throws IOException {
+        float[][] px = awkward(w, h, planes);
+        boolean grey = planes == 1;
+        byte[] streamed = streamFloat(px, w, h, BitDepth.float32(), grey, alpha, 0f, 37);
+        assertArrayEquals(streamed, streamFloat(px, w, h, BitDepth.float32(), grey, alpha, 0f, 1),
+                "row batching must not reach the output");
+
+        JxlImage image = JxlDecoder.decode(streamed);
+        assertEquals(w, image.width);
+        assertEquals(h, image.height);
+        for (int c = 0; c < planes; c++) {
+            assertBitEqual(px[c], image.frames.get(0).floatChannels[c], "plane " + c);
+        }
+        byte[] whole = JxlEncoder.encodeFloat(px, w, h, grey, alpha, false);
+        assertTrue(streamed.length < whole.length * 1.15,
+                "streamed " + streamed.length + " vs whole-image " + whole.length);
+    }
+
+    /** And lossily, which is the combination a large HDR image actually wants. */
+    @Test
+    void floatRowsStreamLossily() throws IOException {
+        int w = 400;
+        int h = 700;   // several bands
+        float[][] px = smooth(w, h, 3, -2, 2);
+        byte[] jxl = streamFloat(px, w, h, BitDepth.float32(), false, false, 1.0f, 64);
+        float[][] out = JxlDecoder.decode(jxl).frames.get(0).floatChannels;
+        for (int c = 0; c < 3; c++) {
+            assertTrue(meanAbs(px[c], out[c]) < 0.05,
+                    "plane " + c + " mean error " + meanAbs(px[c], out[c]) + " on a [-2,2] field");
+        }
+    }
+
+    /**
+     * Lossy float, and why it is worth having. Coding a float image through the
+     * integer path means quantising it first, and integers have nowhere to put a
+     * negative sample — so on a field that runs below zero, quantising first costs
+     * more than the lossy coding itself does, by a wide margin.
+     */
+    @Test
+    void lossyFloatKeepsWhatQuantisingFirstWouldThrowAway() throws IOException {
+        int w = 300;
+        int h = 200;
+        int n = w * h;
+        float[][] px = smooth(w, h, 3, -2, 2);
+
+        byte[] jxl = VarDctEncoder.encodeFloat(px, w, h, false, false, false, 1.0f);
+        float[][] out = JxlDecoder.decode(jxl).frames.get(0).floatChannels;
+        double asFloat = 0;
+        for (int c = 0; c < 3; c++) {
+            asFloat += meanAbs(px[c], out[c]) / 3;
+        }
+
+        // what the caller had to do before: scale onto a 16-bit grid, losing the sign
+        float max = 0;
+        for (float[] p : px) {
+            for (float v : p) {
+                max = Math.max(max, Math.abs(v));
+            }
+        }
+        int[][] q = new int[3][n];
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < n; i++) {
+                q[c][i] = Math.max(0, Math.min(65535, Math.round(px[c][i] / max * 65535f)));
+            }
+        }
+        byte[] qjxl = VarDctEncoder.encode(q, w, h, 16, false, false, false, 1.0f);
+        int[][] qout = JxlDecoder.decode(qjxl).frames.get(0).channels;
+        double quantisedFirst = 0;
+        for (int c = 0; c < 3; c++) {
+            float[] rec = new float[n];
+            for (int i = 0; i < n; i++) {
+                rec[i] = qout[c][i] / 65535f * max;
+            }
+            quantisedFirst += meanAbs(px[c], rec) / 3;
+        }
+
+        assertTrue(asFloat * 10 < quantisedFirst,
+                "coding the floats gave " + asFloat + ", quantising first gave " + quantisedFirst
+                        + " — the float path should be far better, not marginally");
+    }
+
+    /** Above the display range nothing clamps, and the error stays proportional. */
+    @Test
+    void lossyFloatCarriesMoreThanTheDisplayRange() throws IOException {
+        int w = 300;
+        int h = 200;
+        float[][] px = smooth(w, h, 3, 0, 400);
+        byte[] jxl = VarDctEncoder.encodeFloat(px, w, h, false, false, false, 1.0f);
+        float[][] out = JxlDecoder.decode(jxl).frames.get(0).floatChannels;
+        double peak = 0;
+        double rel = 0;
+        int n = w * h;
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < n; i++) {
+                peak = Math.max(peak, out[c][i]);
+                rel += Math.abs(out[c][i] - px[c][i]) / Math.max(px[c][i], 1e-3) / (3.0 * n);
+            }
+        }
+        assertTrue(peak > 300, "the bright end was clamped away: peak came back as " + peak);
+        assertTrue(rel < 0.05, "mean relative error " + rel + " on a field running to 400");
+    }
+
     @Test
     void rejectsWrongUsage() {
         float[][] px = new float[3][100];
@@ -208,6 +321,63 @@ class FloatEncodingTest {
                 () -> JxlEncoder.encodeFloat(px, 10, 10, true, false, false));   // 3 planes, grey
         assertThrows(IllegalArgumentException.class, () -> BitDepth.ofFloat(16, 14));
         assertThrows(IllegalStateException.class, () -> BitDepth.of(8).floatToSample(1f));
+
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        // a float stream needs a float depth
+        assertThrows(IllegalArgumentException.class, () -> JxlStreamingEncoder.floatSamples(
+                out, 400, 400, BitDepth.of(8), false, false, false, 0f));
+        // and an integer stream will not take float rows
+        assertThrows(IllegalStateException.class, () -> {
+            JxlStreamingEncoder enc =
+                    new JxlStreamingEncoder(out, 400, 400, 8, false, false, false);
+            enc.writeFloatRows(new float[3][400 * 10], 10);
+        });
+    }
+
+    // ------------------------------------------------------------------ helpers
+
+    private static byte[] streamFloat(float[][] px, int w, int h, BitDepth depth, boolean grey,
+            boolean alpha, float distance, int chunk) throws IOException {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        try (JxlStreamingEncoder enc = JxlStreamingEncoder.floatSamples(
+                out, w, h, depth, grey, alpha, false, distance)) {
+            for (int y = 0; y < h; y += chunk) {
+                int n = Math.min(chunk, h - y);
+                float[][] rows = new float[px.length][n * w];
+                for (int c = 0; c < px.length; c++) {
+                    System.arraycopy(px[c], y * w, rows[c], 0, n * w);
+                }
+                enc.writeFloatRows(rows, n);
+            }
+        }
+        return out.toByteArray();
+    }
+
+    private static double meanAbs(float[] a, float[] b) {
+        double s = 0;
+        for (int i = 0; i < a.length; i++) {
+            s += Math.abs(a[i] - b[i]);
+        }
+        return s / a.length;
+    }
+
+    /** A smooth field scaled into a range, which is what a float image usually is. */
+    private static float[][] smooth(int w, int h, int planes, double lo, double hi) {
+        Random r = new Random(7);
+        float[][] px = new float[planes][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                double u = x / (double) w;
+                double v = y / (double) h;
+                double t = 0.5 + 0.5 * Math.sin(u * 6) * Math.cos(v * 5);
+                for (int c = 0; c < planes; c++) {
+                    double tint = Math.min(1, Math.max(0, t * (1 + 0.2 * Math.sin(c * 2.1 + u * 3))));
+                    px[c][i] = (float) (lo + (hi - lo) * tint + 0.001 * (hi - lo) * r.nextGaussian());
+                }
+            }
+        }
+        return px;
     }
 
     // ------------------------------------------------------------------ helpers

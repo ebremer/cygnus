@@ -1,5 +1,6 @@
 package com.ebremer.cygnus.jpegxl.encoder;
 
+import com.ebremer.cygnus.jpegxl.codestream.BitDepth;
 import com.ebremer.cygnus.jpegxl.codestream.SizeHeader;
 import com.ebremer.cygnus.jpegxl.io.BitWriter;
 import java.io.IOException;
@@ -35,6 +36,7 @@ public final class JxlStreamingEncoder implements AutoCloseable {
     private final OutputStream out;
     private final int width;
     private final int height;
+    private final BitDepth depth;
     private final int bits;
     private final boolean grey;
     private final boolean alpha;
@@ -73,7 +75,8 @@ public final class JxlStreamingEncoder implements AutoCloseable {
      */
     public JxlStreamingEncoder(OutputStream out, int width, int height, int bits,
             boolean grey, boolean alpha, boolean alphaAssociated, float distance) {
-        this(out, width, height, bits, grey, alpha, alphaAssociated, distance, false);
+        this(out, width, height, BitDepth.of(bits), grey, alpha, alphaAssociated, distance,
+                false);
     }
 
     /**
@@ -99,29 +102,52 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         if (distance <= 0) {
             throw new IllegalArgumentException("rate control needs a positive distance");
         }
-        return new JxlStreamingEncoder(out, width, height, bits, grey, alpha, alphaAssociated,
-                distance, true);
+        return new JxlStreamingEncoder(out, width, height, BitDepth.of(bits), grey, alpha,
+                alphaAssociated, distance, true);
     }
 
-    private JxlStreamingEncoder(OutputStream out, int width, int height, int bits,
+    /**
+     * Floating-point samples, streamed. Rows go in through
+     * {@link #writeFloatRows}; everything else is as above, lossless at distance
+     * zero and VarDCT above it.
+     *
+     * <p>There is nothing special about a float here, which is rather the point:
+     * a float sample <em>is</em> an integer bit pattern, so the lossless coder
+     * carries one without knowing it, and the lossy one hands it to the XYB
+     * conversion instead of a fraction of full scale. What this unlocks is the
+     * combination — a float image too big to hold, which is where scientific and
+     * HDR imagery mostly lives.
+     */
+    public static JxlStreamingEncoder floatSamples(OutputStream out, int width, int height,
+            BitDepth depth, boolean grey, boolean alpha, boolean alphaAssociated,
+            float distance) {
+        if (!depth.floatingPoint) {
+            throw new IllegalArgumentException("floatSamples needs a floating-point depth");
+        }
+        return new JxlStreamingEncoder(out, width, height, depth, grey, alpha, alphaAssociated,
+                distance, false);
+    }
+
+    private JxlStreamingEncoder(OutputStream out, int width, int height, BitDepth depth,
             boolean grey, boolean alpha, boolean alphaAssociated, float distance,
             boolean rateControl) {
         if (width <= 0 || height <= 0) {
             throw new IllegalArgumentException("bad dimensions " + width + "x" + height);
         }
-        if (bits < 1 || bits > 31) {
+        if (!depth.floatingPoint && (depth.bitsPerSample < 1 || depth.bitsPerSample > 31)) {
             throw new IllegalArgumentException("bits per sample must be in 1..31");
         }
         if (distance < 0) {
             throw new IllegalArgumentException("distance must not be negative");
         }
-        if (distance > 0 && bits > 16) {
-            throw new IllegalArgumentException("lossy bits per sample must be in 1..16");
+        if (distance > 0 && !depth.floatingPoint && depth.bitsPerSample > 16) {
+            throw new IllegalArgumentException("lossy integer samples must be 1..16 bits");
         }
         this.out = out;
         this.width = width;
         this.height = height;
-        this.bits = bits;
+        this.depth = depth;
+        this.bits = depth.bitsPerSample;
         this.grey = grey;
         this.alpha = alpha;
         this.alphaAssociated = alphaAssociated;
@@ -141,7 +167,7 @@ public final class JxlStreamingEncoder implements AutoCloseable {
             this.whole = null;
             this.band = null;
             this.sections = null;
-            this.lossy = new VarDctStreamer(out, width, height, bits, grey, alpha,
+            this.lossy = new VarDctStreamer(out, width, height, depth, grey, alpha,
                     alphaAssociated, distance, rateControl);
         } else {
             this.whole = null;
@@ -149,6 +175,33 @@ public final class JxlStreamingEncoder implements AutoCloseable {
             this.sections = new byte[groupColumns * groupRows][];
             this.lossy = null;
         }
+    }
+
+    /**
+     * Consumes the next {@code rowCount} rows of a float image, laying each
+     * sample out the way this encoder's depth lays it out. Only for an encoder
+     * made by {@link #floatSamples}; a narrow depth refuses a sample it cannot
+     * hold exactly, rather than rounding one.
+     */
+    public void writeFloatRows(float[][] rows, int rowCount) throws IOException {
+        if (!depth.floatingPoint) {
+            throw new IllegalStateException("this encoder is coding integer samples");
+        }
+        if (rows.length != numInput) {
+            throw new IllegalArgumentException("expected " + numInput + " planes, got "
+                    + rows.length);
+        }
+        int[][] packed = new int[numInput][rowCount * width];
+        for (int c = 0; c < numInput; c++) {
+            if (rows[c].length < rowCount * width) {
+                throw new IllegalArgumentException("plane " + c + " holds fewer than "
+                        + rowCount + " rows");
+            }
+            for (int i = 0; i < packed[c].length; i++) {
+                packed[c][i] = depth.floatToSample(rows[c][i]);
+            }
+        }
+        writeRows(packed, rowCount);
     }
 
     /**
@@ -343,13 +396,13 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         if (whole != null) {
             byte[] bytes;
             if (distance <= 0) {
-                bytes = JxlEncoder.encode(whole, width, height, bits, grey, alpha,
+                bytes = JxlEncoder.encodeSamples(whole, width, height, depth, grey, alpha,
                         alphaAssociated);
             } else if (rateControl) {
-                bytes = VarDctEncoder.encodeToTarget(whole, width, height, bits, grey, alpha,
+                bytes = VarDctEncoder.toTarget(whole, width, height, depth, grey, alpha,
                         alphaAssociated, distance);
             } else {
-                bytes = VarDctEncoder.encode(whole, width, height, bits, grey, alpha,
+                bytes = VarDctEncoder.encodeSamples(whole, width, height, depth, grey, alpha,
                         alphaAssociated, distance);
             }
             out.write(bytes);
@@ -364,7 +417,7 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         w.write(0xff, 8);
         w.write(0x0a, 8);
         new SizeHeader(width, height).write(w);
-        JxlEncoder.buildMetadata(bits, grey, alpha, alphaAssociated).write(w);
+        JxlEncoder.buildMetadata(depth, grey, alpha, alphaAssociated).write(w);
         JxlEncoder.writeFrameHeader(w, alpha);
         w.writeBool(false); // TOC not permuted
         w.zeroPadToByte();

@@ -236,24 +236,8 @@ public final class JxlEncoder {
         if (!depth.floatingPoint) {
             throw new IllegalArgumentException("encodeFloat needs a floating-point depth");
         }
-        int numInput = (grey ? 1 : 3) + (alpha ? 1 : 0);
-        if (planes.length != numInput) {
-            throw new IllegalArgumentException("expected " + numInput + " planes, got "
-                    + planes.length);
-        }
-        int[][] bits = new int[numInput][];
-        for (int c = 0; c < numInput; c++) {
-            if (planes[c].length != width * height) {
-                throw new IllegalArgumentException("plane " + c + " has wrong size");
-            }
-            int[] out = new int[width * height];
-            for (int i = 0; i < out.length; i++) {
-                out[i] = depth.floatToSample(planes[c][i]);
-            }
-            bits[c] = out;
-        }
-        return new JxlEncoder(bits, width, height, depth, grey, alpha, alphaAssociated, false)
-                .run();
+        return encodeSamples(pack(planes, width, height, depth, grey, alpha), width, height,
+                depth, grey, alpha, alphaAssociated);
     }
 
     /** Encodes float samples as IEEE binary32, the depth that holds any of them. */
@@ -261,6 +245,41 @@ public final class JxlEncoder {
             boolean grey, boolean alpha, boolean alphaAssociated) throws IOException {
         return encodeFloat(planes, width, height, BitDepth.float32(), grey, alpha,
                 alphaAssociated);
+    }
+
+    /**
+     * Encodes samples already laid out as {@code depth} lays them out — a float
+     * sample being an integer bit pattern, this is the same coder either way.
+     */
+    static byte[] encodeSamples(int[][] planes, int width, int height, BitDepth depth,
+            boolean grey, boolean alpha, boolean alphaAssociated) throws IOException {
+        return new JxlEncoder(planes, width, height, depth, grey, alpha, alphaAssociated, false)
+                .run();
+    }
+
+    /** Lays float planes out as the samples the coder will carry. */
+    static int[][] pack(float[][] planes, int width, int height, BitDepth depth,
+            boolean grey, boolean alpha) {
+        if (!depth.floatingPoint) {
+            throw new IllegalArgumentException("float samples need a floating-point depth");
+        }
+        int numInput = (grey ? 1 : 3) + (alpha ? 1 : 0);
+        if (planes.length != numInput) {
+            throw new IllegalArgumentException("expected " + numInput + " planes, got "
+                    + planes.length);
+        }
+        int[][] out = new int[numInput][];
+        for (int c = 0; c < numInput; c++) {
+            if (planes[c].length != width * height) {
+                throw new IllegalArgumentException("plane " + c + " has wrong size");
+            }
+            int[] p = new int[width * height];
+            for (int i = 0; i < p.length; i++) {
+                p[i] = depth.floatToSample(planes[c][i]);
+            }
+            out[c] = p;
+        }
+        return out;
     }
 
     /**

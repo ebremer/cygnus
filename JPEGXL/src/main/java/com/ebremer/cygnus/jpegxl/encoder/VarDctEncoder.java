@@ -1,5 +1,6 @@
 package com.ebremer.cygnus.jpegxl.encoder;
 
+import com.ebremer.cygnus.jpegxl.codestream.BitDepth;
 import com.ebremer.cygnus.jpegxl.codestream.ImageMetadata;
 import com.ebremer.cygnus.jpegxl.codestream.SizeHeader;
 import com.ebremer.cygnus.jpegxl.io.BitWriter;
@@ -65,7 +66,9 @@ public final class VarDctEncoder {
     private final int height;
     private final int paddedWidth;
     private final int paddedHeight;
+    private final BitDepth depth;
     private final int bits;
+    private final double maxVal;   // integer samples only
     private final boolean grey;
     private final boolean hasAlpha;
     private final int globalScale;
@@ -145,11 +148,18 @@ public final class VarDctEncoder {
      * time through {@link #loadWindow}.
      */
     VarDctEncoder(int width, int height, int bits, boolean grey, boolean alpha, float distance) {
+        this(width, height, BitDepth.of(bits), grey, alpha, distance);
+    }
+
+    VarDctEncoder(int width, int height, BitDepth depth, boolean grey, boolean alpha,
+            float distance) {
         this.width = width;
         this.height = height;
         this.paddedWidth = (width + 7) & ~7;
         this.paddedHeight = (height + 7) & ~7;
-        this.bits = bits;
+        this.depth = depth;
+        this.bits = depth.bitsPerSample;
+        this.maxVal = depth.floatingPoint ? 1 : (1 << depth.bitsPerSample) - 1;
         this.grey = grey;
         this.hasAlpha = alpha;
         float d = Math.max(0.1f, distance);
@@ -246,7 +256,6 @@ public final class VarDctEncoder {
         double[] bias = {opsin.opsinBias[0], opsin.opsinBias[1], opsin.opsinBias[2]};
         double[] cbrtBias = {Math.cbrt(bias[0]), Math.cbrt(bias[1]), Math.cbrt(bias[2])};
 
-        double maxVal = (1 << bits) - 1;
         for (int c = 0; c < 3; c++) {
             xyb[c] = new float[paddedWidth * bufRows];
         }
@@ -261,9 +270,9 @@ public final class VarDctEncoder {
             for (int x = 0; x < paddedWidth; x++) {
                 int sx = Math.min(x, width - 1);
                 int i = sy * width + sx;
-                double r = srgbToLinear(src[0][i] / maxVal);
-                double g = grey ? r : srgbToLinear(src[1][i] / maxVal);
-                double b = grey ? r : srgbToLinear(src[2][i] / maxVal);
+                double r = srgbToLinear(colour(src[0][i]));
+                double g = grey ? r : srgbToLinear(colour(src[1][i]));
+                double b = grey ? r : srgbToLinear(colour(src[2][i]));
                 double mixL = fwd[0] * r + fwd[1] * g + fwd[2] * b;
                 double mixM = fwd[3] * r + fwd[4] * g + fwd[5] * b;
                 double mixS = fwd[6] * r + fwd[7] * g + fwd[8] * b;
@@ -278,7 +287,28 @@ public final class VarDctEncoder {
         });
     }
 
+    /**
+     * The colour value a coded sample stands for. An integer sample is a
+     * fraction of full scale; a float sample already <em>is</em> the value, which
+     * is the whole point of coding one — no quantisation grid stands between the
+     * caller's number and the colour it meant.
+     */
+    private double colour(int sample) {
+        return depth.floatingPoint ? depth.sampleToFloat(sample) : sample / maxVal;
+    }
+
+    /**
+     * The inverse of the decoder's {@code Transfer.srgbFromLinear}, mirror and
+     * all. Integer samples are never negative so the mirror never mattered, but
+     * float samples are — the conformance corpus's own float image runs from -2
+     * to 2 — and the decoder encodes a negative through the sign-mirrored curve,
+     * so this has to undo exactly that. Neither side clamps above 1 either, which
+     * is what lets a float carry more than the display range.
+     */
     private static double srgbToLinear(double v) {
+        if (v < 0) {
+            return -srgbToLinear(-v);
+        }
         return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
     }
 
@@ -745,11 +775,77 @@ public final class VarDctEncoder {
     public static byte[] encode(int[][] planes, int width, int height, int bits,
             boolean grey, boolean alpha, boolean alphaAssociated, float distance)
             throws IOException {
-        checkInput(planes, width, height, bits, grey, alpha);
-        VarDctEncoder enc = new VarDctEncoder(width, height, bits, grey, alpha, distance);
+        return encodeSamples(planes, width, height, BitDepth.of(bits), grey, alpha,
+                alphaAssociated, distance);
+    }
+
+    /**
+     * Encodes floating-point samples lossily.
+     *
+     * <p>The float goes straight into the XYB conversion, and that is the whole
+     * point: feeding a float image through the integer path means quantising it
+     * first, which throws away exactly the precision it was kept in float to
+     * hold — and then quantising it again, in XYB, where the throwing-away
+     * actually buys something.
+     *
+     * <p>Nothing clamps to the display range. The transfer curve extends above 1
+     * and mirrors below 0, and so does the decoder's, so a sample outside [0, 1]
+     * survives — and survives well, because the quantiser works in XYB, on the
+     * far side of a curve that is already perceptual, so its steps scale with the
+     * value rather than with full scale. On a field running to 400, distance 1
+     * holds the mean error to 0.2% of each sample. Where the difference really
+     * tells is below zero: quantising to integers first has nowhere to put a
+     * negative sample, and on a field from -2 to 2 that costs a factor of
+     * seventy in error against coding the floats directly.
+     */
+    public static byte[] encodeFloat(float[][] planes, int width, int height, BitDepth depth,
+            boolean grey, boolean alpha, boolean alphaAssociated, float distance)
+            throws IOException {
+        return encodeSamples(pack(planes, width, height, depth, grey, alpha), width, height,
+                depth, grey, alpha, alphaAssociated, distance);
+    }
+
+    /** {@link #encodeFloat} at IEEE binary32, the depth that holds any float. */
+    public static byte[] encodeFloat(float[][] planes, int width, int height, boolean grey,
+            boolean alpha, boolean alphaAssociated, float distance) throws IOException {
+        return encodeFloat(planes, width, height, BitDepth.float32(), grey, alpha,
+                alphaAssociated, distance);
+    }
+
+    /** Encodes samples already laid out as {@code depth} lays them out. */
+    static byte[] encodeSamples(int[][] planes, int width, int height, BitDepth depth,
+            boolean grey, boolean alpha, boolean alphaAssociated, float distance)
+            throws IOException {
+        checkInput(planes, width, height, depth, grey, alpha);
+        VarDctEncoder enc = new VarDctEncoder(width, height, depth, grey, alpha, distance);
         enc.loadWhole(planes);
         enc.quantiseWindow(Double.NaN);
         return enc.standalone(alpha ? planes[grey ? 1 : 3] : null, alphaAssociated);
+    }
+
+    /** Lays float planes out as the samples the coder will carry. */
+    static int[][] pack(float[][] planes, int width, int height, BitDepth depth,
+            boolean grey, boolean alpha) {
+        if (!depth.floatingPoint) {
+            throw new IllegalArgumentException("encodeFloat needs a floating-point depth");
+        }
+        int numInput = (grey ? 1 : 3) + (alpha ? 1 : 0);
+        if (planes.length != numInput) {
+            throw new IllegalArgumentException("expected " + numInput + " planes, got "
+                    + planes.length);
+        }
+        int[][] out = new int[numInput][];
+        for (int c = 0; c < numInput; c++) {
+            if (planes[c].length != width * height) {
+                throw new IllegalArgumentException("plane " + c + " has wrong size");
+            }
+            int[] p = new int[width * height];
+            for (int i = 0; i < p.length; i++) {
+                p[i] = depth.floatToSample(planes[c][i]);
+            }
+            out[c] = p;
+        }
+        return out;
     }
 
     /**
@@ -763,20 +859,20 @@ public final class VarDctEncoder {
         out.write(0xff, 8);
         out.write(0x0a, 8);
         new SizeHeader(width, height).write(out);
-        ImageMetadata meta = JxlEncoder.buildMetadata(bits, grey, hasAlpha, alphaAssociated);
+        ImageMetadata meta = JxlEncoder.buildMetadata(depth, grey, hasAlpha, alphaAssociated);
         meta.xybEncoded = true;
         meta.write(out);
         writeFrame(out, alphaPlane);
         return out.toByteArray();
     }
 
-    static void checkInput(int[][] planes, int width, int height, int bits,
+    static void checkInput(int[][] planes, int width, int height, BitDepth depth,
             boolean grey, boolean alpha) {
         if (width <= 0 || height <= 0) {
             throw new IllegalArgumentException("bad dimensions");
         }
-        if (bits < 1 || bits > 16) {
-            throw new IllegalArgumentException("lossy bits per sample must be in 1..16");
+        if (!depth.floatingPoint && (depth.bitsPerSample < 1 || depth.bitsPerSample > 16)) {
+            throw new IllegalArgumentException("lossy integer samples must be 1..16 bits");
         }
         int numInput = (grey ? 1 : 3) + (alpha ? 1 : 0);
         if (planes.length != numInput) {
@@ -801,14 +897,30 @@ public final class VarDctEncoder {
     public static byte[] encodeToTarget(int[][] planes, int width, int height, int bits,
             boolean grey, boolean alpha, boolean alphaAssociated, float distance)
             throws IOException {
+        return toTarget(planes, width, height, BitDepth.of(bits), grey, alpha, alphaAssociated,
+                distance);
+    }
+
+    /** {@link #encodeToTarget} for float samples. */
+    public static byte[] encodeFloatToTarget(float[][] planes, int width, int height,
+            BitDepth depth, boolean grey, boolean alpha, boolean alphaAssociated, float distance)
+            throws IOException {
+        return toTarget(pack(planes, width, height, depth, grey, alpha), width, height, depth,
+                grey, alpha, alphaAssociated, distance);
+    }
+
+    static byte[] toTarget(int[][] planes, int width, int height, BitDepth depth,
+            boolean grey, boolean alpha, boolean alphaAssociated, float distance)
+            throws IOException {
         float d = Math.max(0.1f, distance);
         double target = targetError(d);
         byte[] best = null;
         double bestMiss = Double.MAX_VALUE;
         float tryD = d;
         for (int round = 0; round < 3; round++) {
-            byte[] jxl = encode(planes, width, height, bits, grey, alpha, alphaAssociated, tryD);
-            double err = measureError(planes, width, height, bits, grey, jxl);
+            byte[] jxl = encodeSamples(planes, width, height, depth, grey, alpha,
+                    alphaAssociated, tryD);
+            double err = measureError(planes, width, height, depth, grey, jxl);
             double miss = Math.abs(Math.log(Math.max(err, 1e-3) / target));
             if (miss < bestMiss) {
                 bestMiss = miss;
@@ -862,27 +974,41 @@ public final class VarDctEncoder {
 
     /**
      * Weighted mean absolute colour error (G counted twice) after a
-     * self-decode, normalised to the 8-bit scale the target model uses.
+     * self-decode, normalised to the 8-bit scale the target model uses. Float
+     * samples are already colour values, so full scale for them is 1.
      */
-    static double measureError(int[][] planes, int width, int height, int bits,
+    static double measureError(int[][] planes, int width, int height, BitDepth depth,
             boolean grey, byte[] jxl) throws IOException {
-        com.ebremer.cygnus.jpegxl.decoder.JxlImage image =
-                com.ebremer.cygnus.jpegxl.decoder.JxlDecoder.decode(jxl);
-        int[][] out = image.frames.get(0).channels;
-        long sum = 0;
+        com.ebremer.cygnus.jpegxl.decoder.JxlFrame frame =
+                com.ebremer.cygnus.jpegxl.decoder.JxlDecoder.decode(jxl).frames.get(0);
         int n = width * height;
+        double sum = 0;
+        if (depth.floatingPoint) {
+            float[][] out = frame.floatChannels;
+            for (int i = 0; i < n; i++) {
+                if (grey) {
+                    sum += 4.0 * Math.abs(out[0][i] - depth.sampleToFloat(planes[0][i]));
+                } else {
+                    sum += Math.abs(out[0][i] - depth.sampleToFloat(planes[0][i]))
+                            + 2.0 * Math.abs(out[1][i] - depth.sampleToFloat(planes[1][i]))
+                            + Math.abs(out[2][i] - depth.sampleToFloat(planes[2][i]));
+                }
+            }
+            return sum / (4.0 * n) * 255.0;
+        }
+        int[][] out = frame.channels;
         if (grey) {
             for (int i = 0; i < n; i++) {
-                sum += 4L * Math.abs(out[0][i] - planes[0][i]);
+                sum += 4.0 * Math.abs(out[0][i] - planes[0][i]);
             }
         } else {
             for (int i = 0; i < n; i++) {
                 sum += Math.abs(out[0][i] - planes[0][i])
-                        + 2L * Math.abs(out[1][i] - planes[1][i])
+                        + 2.0 * Math.abs(out[1][i] - planes[1][i])
                         + Math.abs(out[2][i] - planes[2][i]);
             }
         }
-        return sum / (4.0 * n) * (255.0 / ((1 << bits) - 1));
+        return sum / (4.0 * n) * (255.0 / ((1 << depth.bitsPerSample) - 1));
     }
 
     // --------------------------------------------------------------- frame

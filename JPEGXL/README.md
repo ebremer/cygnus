@@ -8,8 +8,10 @@ for JDK 25, exposed through the standard Java ImageIO API.
 - **ImageIO plug-ins** — auto-registered via `META-INF/services`; plain
   `ImageIO.read(...)` and `ImageIO.write(image, "jxl", ...)` work for both
   bare codestreams and ISOBMFF `.jxl` containers. Previews surface as
-  thumbnails, animation timing as native image metadata, and an explicit
-  compression quality below 1.0 selects lossy encoding.
+  thumbnails, animation timing as native image metadata, an explicit
+  compression quality below 1.0 selects lossy encoding, `setProgressiveMode`
+  selects the responsive layout, and a `TYPE_FLOAT` raster is written (and read
+  back) as a floating-point image.
 - **Direct APIs** — `JxlDecoder` returns per-channel sample planes (integer
   or float) with full metadata; `JxlEncoder` writes lossless codestreams
   (integer or floating-point samples, optionally progressive) and
@@ -17,8 +19,8 @@ for JDK 25, exposed through the standard Java ImageIO API.
 - **Streaming input** — decoding from an `ImageInputStream` reads section
   ranges on demand instead of buffering the whole file.
 - **Streaming output** — `JxlStreamingEncoder` takes rows top to bottom and
-  never holds the image, lossless or lossy: gigapixel encodes run in a heap
-  sized by the image's width, not its area.
+  never holds the image, lossless or lossy, integer or float: gigapixel encodes
+  run in a heap sized by the image's width, not its area.
 - **Validated against libjxl** — the test suite cross-checks against the
   reference implementation (cjxl/djxl and ffmpeg's libjxl) plus the official
   conformance test corpus: lossless paths bit-exactly (including 32-bit
@@ -170,24 +172,33 @@ cropped result; reference, LF and preview frames always decode whole.
     `encodeToTarget` outright — that loop drives the error *averaged over the
     frame* to the target, and when most of the frame is blank, the average is the
     blank.
-- **Floating-point samples**: `JxlEncoder.encodeFloat` writes float images
-  losslessly — IEEE binary32, binary16, or any of the format's custom layouts
-  (2–8 exponent bits). The format carries a float as its bit pattern, coded as
-  an integer, so this is the ordinary lossless path with the samples
-  reinterpreted; it is bit-exact on negative zero, subnormals, infinities and
-  NaN, and a narrow layout refuses a sample it cannot hold rather than rounding
-  it. Float images are a good deal less compressible than the same picture as
-  integers — across a power of two the bit pattern jumps, and the predictors see
-  a cliff where the picture is smooth. That is the format's bargain, not this
-  encoder's.
+- **Floating-point samples**, everywhere the integer path goes: whole-image
+  (`JxlEncoder.encodeFloat`), streaming (`JxlStreamingEncoder.floatSamples`),
+  lossy (`VarDctEncoder.encodeFloat`), and through ImageIO on a `TYPE_FLOAT`
+  raster. IEEE binary32, binary16, or any of the format's custom layouts (2–8
+  exponent bits).
+  - *Losslessly*, the format carries a float as its bit pattern coded as an
+    integer, so this is the ordinary lossless path with the samples
+    reinterpreted: bit-exact on negative zero, subnormals, infinities and NaN,
+    and a narrow layout refuses a sample it cannot hold rather than rounding it.
+    Float images are less compressible than the same picture as integers —
+    across a power of two the bit pattern jumps, and the predictors see a cliff
+    where the picture is smooth. That is the format's bargain, not this
+    encoder's.
+  - *Lossily*, the float goes straight into the XYB conversion instead of being
+    quantised onto an integer grid first. On a field running from −2 to 2 that
+    is **70× more accurate** than quantising first, which has nowhere to put a
+    negative sample; on one running to 400 it holds the relative error at 0.2%.
+    Nothing clamps to the display range in either direction.
 - **Progressive (responsive) lossless**: `JxlEncoder.encodeProgressive` applies
   the Squeeze transform — the channels become a small image of the picture
   followed by the detail that doubles it, repeatedly — and cuts the frame into
   passes, coarsest first. A fifth of the bytes then decodes to the **whole**
   image at low resolution, where a fifth of an ordinary file decodes to a fifth
   of the image and leaves the rest black. Read a prefix with
-  `JxlDecoder.decodePartial`. Squeeze buys the layout, not the ratio: files run
-  a few percent larger.
+  `JxlDecoder.decodePartial`, or select the layout through ImageIO with
+  `ImageWriteParam.setProgressiveMode`. Squeeze buys the layout, not the ratio:
+  files run a few percent larger.
 - **JPEG → JPEG XL recompression**: `JpegRecompressor.encode(jpegBytes)`
   losslessly repacks a JPEG as a JPEG XL container with reconstruction data
   (`jbrd`), the write-side twin of `JpegReconstructor` — the quantised DCT

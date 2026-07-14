@@ -1,5 +1,6 @@
 package com.ebremer.cygnus.jpegxl.encoder;
 
+import com.ebremer.cygnus.jpegxl.codestream.BitDepth;
 import com.ebremer.cygnus.jpegxl.codestream.ImageMetadata;
 import com.ebremer.cygnus.jpegxl.codestream.SizeHeader;
 import com.ebremer.cygnus.jpegxl.io.BitWriter;
@@ -60,6 +61,7 @@ final class VarDctStreamer {
     private final OutputStream out;
     private final int width;
     private final int height;
+    private final BitDepth depth;
     private final int bits;
     private final boolean grey;
     private final boolean alpha;
@@ -104,13 +106,14 @@ final class VarDctStreamer {
     private final byte[][] lfGroupBytes;
     private boolean finished;
 
-    VarDctStreamer(OutputStream out, int width, int height, int bits, boolean grey,
+    VarDctStreamer(OutputStream out, int width, int height, BitDepth depth, boolean grey,
             boolean alpha, boolean alphaAssociated, float distance, boolean rateControl) {
         this.out = out;
         this.rateControl = rateControl;
         this.width = width;
         this.height = height;
-        this.bits = bits;
+        this.depth = depth;
+        this.bits = depth.bitsPerSample;
         this.grey = grey;
         this.alpha = alpha;
         this.alphaAssociated = alphaAssociated;
@@ -126,7 +129,7 @@ final class VarDctStreamer {
         this.lfColumns = VarDctEncoder.ceilDiv(width, lfDim);
         this.numLfGroups = lfColumns * VarDctEncoder.ceilDiv(height, lfDim);
 
-        this.enc = new VarDctEncoder(width, height, bits, grey, alpha, distance);
+        this.enc = new VarDctEncoder(width, height, depth, grey, alpha, distance);
         this.books = Math.min(numBands, MAX_BOOKS);
         this.bookPerBand = numBands <= MAX_BOOKS;
         int[] map = new int[books * VarDctEncoder.CONTEXTS_PER_PRESET];
@@ -365,13 +368,13 @@ final class VarDctStreamer {
         int prevMul = 0;
         double prevErr = 0;
         for (int round = 0; round < 4; round++) {
-            VarDctEncoder probe = new VarDctEncoder(cw, ch, bits, grey, false, distance);
+            VarDctEncoder probe = new VarDctEncoder(cw, ch, depth, grey, false, distance);
             probe.setHfMul(mul);
             probe.loadWindow(crop, 0, ch, 0, (ch + 7) & ~7, 0);
             probe.measureWindow();
             probe.quantiseWindow(mean);
             byte[] jxl = probe.standalone(null, false);
-            double err = VarDctEncoder.measureError(crop, cw, ch, bits, grey, jxl);
+            double err = VarDctEncoder.measureError(crop, cw, ch, depth, grey, jxl);
 
             // A finer quantiser stops paying at some point: the error a band can
             // reach is floored by what the decoder's own smoothing does to it,
@@ -502,7 +505,7 @@ final class VarDctStreamer {
         w.write(0xff, 8);
         w.write(0x0a, 8);
         new SizeHeader(width, height).write(w);
-        ImageMetadata meta = JxlEncoder.buildMetadata(bits, grey, alpha, alphaAssociated);
+        ImageMetadata meta = JxlEncoder.buildMetadata(depth, grey, alpha, alphaAssociated);
         meta.xybEncoded = true;
         meta.write(w);
         VarDctEncoder.writeFrameHeader(w, alpha);

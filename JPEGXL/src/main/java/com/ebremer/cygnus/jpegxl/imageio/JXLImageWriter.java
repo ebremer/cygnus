@@ -16,8 +16,16 @@ import javax.imageio.stream.ImageOutputStream;
 
 /**
  * ImageIO writer producing JPEG XL codestreams. By default output is lossless
- * (modular mode); an explicit compression quality below 1.0 selects the basic
- * lossy (VarDCT) mode for 8-bit images without alpha.
+ * (modular mode); an explicit compression quality below 1.0 selects the lossy
+ * (VarDCT) mode.
+ *
+ * <p>Two things beyond the usual ImageIO surface. A raster of
+ * {@link java.awt.image.DataBuffer#TYPE_FLOAT} samples is written as a
+ * floating-point image, bit for bit — which is what the reader hands back for
+ * one, so the round trip closes. And
+ * {@link ImageWriteParam#setProgressiveMode ImageWriteParam.setProgressiveMode}
+ * selects the responsive layout, where a prefix of the bytes is already the
+ * whole picture at low resolution rather than part of it at full resolution.
  */
 public final class JXLImageWriter extends ImageWriter {
 
@@ -38,6 +46,7 @@ public final class JXLImageWriter extends ImageWriter {
             compressionTypes = new String[] {"lossless", "lossy"};
             compressionType = "lossless";
             compressionQuality = 1.0f;
+            canWriteProgressive = true;
         }
     }
 
@@ -80,6 +89,19 @@ public final class JXLImageWriter extends ImageWriter {
         int numColour = grey ? 1 : 3;
         int bands = numColour + (alpha ? 1 : 0);
 
+        boolean lossy = param != null
+                && (param.getCompressionMode() == ImageWriteParam.MODE_EXPLICIT
+                        && ("lossy".equals(param.getCompressionType())
+                            || param.getCompressionQuality() < 1.0f));
+        boolean progressive = param != null
+                && param.getProgressiveMode() == ImageWriteParam.MODE_DEFAULT;
+
+        if (buffered.getRaster().getDataBuffer().getDataType()
+                == java.awt.image.DataBuffer.TYPE_FLOAT) {
+            writeFloat(out, buffered, grey, alpha, numColour, bands, lossy, progressive, param);
+            return;
+        }
+
         int maxSampleBits = 0;
         for (int i = 0; i < numColour && i < cm.getNumComponents(); i++) {
             maxSampleBits = Math.max(maxSampleBits, cm.getComponentSize(i));
@@ -120,22 +142,59 @@ public final class JXLImageWriter extends ImageWriter {
             }
         }
 
-        boolean lossy = param != null
-                && (param.getCompressionMode() == ImageWriteParam.MODE_EXPLICIT
-                        && ("lossy".equals(param.getCompressionType())
-                            || param.getCompressionQuality() < 1.0f));
         byte[] encoded;
         if (lossy && bits <= 16) {
-            // map quality [0,1] to a Butteraugli-like distance in [0.5, 15]
-            float quality = param.getCompressionQuality();
-            float distance = 0.5f + (1.0f - quality) * 14.5f;
             encoded = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encodeToTarget(
-                    planes, w, h, bits, grey, alpha, false, distance);
+                    planes, w, h, bits, grey, alpha, false, distanceOf(param));
+        } else if (progressive) {
+            encoded = JxlEncoder.encodeProgressive(planes, w, h, bits, grey, alpha, false);
         } else {
             encoded = JxlEncoder.encode(planes, w, h, bits, grey, alpha, false);
         }
         out.write(encoded);
         out.flush();
+    }
+
+    /**
+     * Writes a float raster as a floating-point image. The samples are colour
+     * values already, so nothing is scaled: they go to the coder as they are, and
+     * the decoder hands them back bit for bit (or, coded lossily, as close as the
+     * distance allows without ever quantising them onto an integer grid first).
+     */
+    private void writeFloat(ImageOutputStream out, BufferedImage buffered, boolean grey,
+            boolean alpha, int numColour, int bands, boolean lossy, boolean progressive,
+            ImageWriteParam param) throws IOException {
+        if (progressive) {
+            throw new UnsupportedOperationException("progressive needs integer samples: squeeze"
+                    + " averages neighbouring samples, and the average of two float bit patterns"
+                    + " is not a float between them");
+        }
+        int w = buffered.getWidth();
+        int h = buffered.getHeight();
+        Raster raster = buffered.getRaster();
+        int rasterBands = raster.getNumBands();
+        float[][] planes = new float[bands][w * h];
+        float[] row = new float[w];
+        for (int b = 0; b < bands; b++) {
+            boolean isAlphaBand = alpha && b == numColour;
+            int srcBand = isAlphaBand ? rasterBands - 1 : Math.min(b, rasterBands - 1);
+            for (int y = 0; y < h; y++) {
+                raster.getSamples(0, y, w, 1, srcBand, row);
+                System.arraycopy(row, 0, planes[b], y * w, w);
+            }
+        }
+        byte[] encoded = lossy
+                ? com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encodeFloat(
+                        planes, w, h, grey, alpha, false, distanceOf(param))
+                : JxlEncoder.encodeFloat(planes, w, h, grey, alpha, false);
+        out.write(encoded);
+        out.flush();
+    }
+
+    /** ImageIO quality [0,1] as a Butteraugli-like distance in [0.5, 15]. */
+    private static float distanceOf(ImageWriteParam param) {
+        float quality = param.getCompressionQuality();
+        return 0.5f + (1.0f - quality) * 14.5f;
     }
 
     private static BufferedImage toBufferedImage(RenderedImage img) {
