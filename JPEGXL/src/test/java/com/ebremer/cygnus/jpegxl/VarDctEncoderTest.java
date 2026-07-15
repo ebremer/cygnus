@@ -324,4 +324,64 @@ class VarDctEncoderTest {
             previous = err;
         }
     }
+
+    /** A smooth low-frequency image, where the encoder reaches for the 32x32 transform. */
+    private static int[][] sky(int w, int h) {
+        int[][] p = new int[3][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                p[0][i] = Math.max(0, Math.min(255, 128 + (int) (50 * Math.sin(x * 0.01))));
+                p[1][i] = Math.max(0, Math.min(255, 120 + (int) (40 * Math.cos(y * 0.008))));
+                p[2][i] = Math.max(0, Math.min(255, 100 + (x + y) / 12));
+            }
+        }
+        return p;
+    }
+
+    /**
+     * Large smooth regions get the 32x32 transform, which has to reconstruct
+     * exactly as the decoder reads it — a 4x4 low-frequency corner drawn from the
+     * DC image and the rest as high frequency, over sixteen cells. If any of that
+     * were off, a smooth gradient would come back as garbage rather than a close
+     * match; that it stays close is what says the whole DCT32 path is right.
+     */
+    @Test
+    void largeSmoothImageWithDct32RoundTrips() throws Exception {
+        int w = 256;
+        int h = 256;
+        int[][] src = sky(w, h);
+        for (float d : new float[] {1f, 2f, 3f}) {
+            double err = selfError(src, w, h, d);
+            assertTrue(err < d, "smooth image at distance " + d + " decoded far off: " + err);
+        }
+    }
+
+    /** The 32x32 transform never crosses a group edge, so streaming reaches it too. */
+    @Test
+    void streamedSmoothImageWithDct32() throws Exception {
+        int w = 600;
+        int h = 500;
+        int[][] src = sky(w, h);
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        try (com.ebremer.cygnus.jpegxl.encoder.JxlStreamingEncoder enc =
+                new com.ebremer.cygnus.jpegxl.encoder.JxlStreamingEncoder(
+                        out, w, h, 8, false, false, false, 1.5f)) {
+            for (int y = 0; y < h; y++) {
+                int[][] row = new int[3][w];
+                for (int c = 0; c < 3; c++) {
+                    System.arraycopy(src[c], y * w, row[c], 0, w);
+                }
+                enc.writeRows(row, 1);
+            }
+        }
+        int[][] back = JxlDecoder.decode(out.toByteArray()).frames.get(0).channels;
+        long sum = 0;
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < w * h; i++) {
+                sum += Math.abs(back[c][i] - src[c][i]);
+            }
+        }
+        assertTrue(sum / (3.0 * w * h) < 2.0, "streamed smooth image decoded far off");
+    }
 }

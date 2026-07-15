@@ -81,6 +81,20 @@ public final class VarDctEncoder {
 
     private static final TransformType DCT8 = TransformType.byType(0);
     private static final TransformType DCT16 = TransformType.byType(4);
+    private static final TransformType DCT32 = TransformType.byType(5);
+    /** The largest transform this encoder chooses, and its LLF (side/8) squared. */
+    private static final int MAX_DIM = 32;
+    private static final int MAX_LLF = (MAX_DIM / 8) * (MAX_DIM / 8);
+    private static final boolean NO_DCT32 = Boolean.getBoolean("jxl.enc.nodct32");
+    /**
+     * How much cheaper the 32x32 transform must estimate before it replaces the
+     * sixteen-cell subdivision. Below 1 by a margin because the rate estimate is
+     * a coarse token count that does not see the DC image, which a big block
+     * shifts around: requiring a clear win keeps it to the smooth regions where
+     * it plainly helps (a large photo's sky and road come out about 5% smaller)
+     * and away from the ones where the estimate would misjudge it.
+     */
+    private static final double DCT32_GAIN = 0.85;
 
     // adaptive quantisation limits (relative to the base multiplier)
     private static final float AQ_MIN = 0.75f;
@@ -570,30 +584,30 @@ public final class VarDctEncoder {
         // covers the row below, so a pair of rows is the smallest unit that
         // never reaches outside itself — and pairs can therefore run in any
         // order, or at once.
-        sweep(ceilDiv(h8, 2), strip -> {
-            float[] block = new float[256];
-            float[][] c8 = new float[4][64];
-            float[] c16 = new float[256];
-            float[] s0 = new float[256];
-            float[] s1 = new float[256];
-            float[] llf = new float[4];
-            float[] dcT = new float[4];
-            int byN = Math.min(strip * 2 + 2, h8);
-            for (int by = strip * 2; by < byN; by++) {
+        // Four cell rows at a time: a 32x32 block starts only on a 4-aligned row
+        // and covers the three below, so four rows are the smallest unit that
+        // never reaches outside itself — pairs and singles nest inside. The
+        // block choice is a hierarchy: try the 32x32, and where it does not pay,
+        // fall to the 16x16-or-four-8x8 decision this always had, and so on down.
+        sweep(ceilDiv(h8, 4), strip -> {
+            Scratch s = new Scratch();
+            int byN = Math.min(strip * 4 + 4, h8);
+            for (int by = strip * 4; by < byN; by++) {
                 for (int bx = 0; bx < w8; bx++) {
                     if (blockType[by * w8 + bx] != -1) {
-                        continue; // already decided (or covered by a 16x16)
+                        continue; // already decided (or covered by a larger block)
                     }
-                    boolean try16 = !no16
-                            && (by & 1) == 0 && (bx & 1) == 0
-                            && by + 1 < h8 && bx + 1 < w8
-                            && blockType[by * w8 + bx + 1] == -1
-                            && blockType[(by + 1) * w8 + bx] == -1
-                            && blockType[(by + 1) * w8 + bx + 1] == -1;
-                    if (try16 && chooseDct16(by, bx, factor, block, c8, c16, s0, s1, llf, dcT)) {
+                    if (!NO_DCT32 && (by & 3) == 0 && (bx & 3) == 0
+                            && by + 4 <= h8 && bx + 4 <= w8 && allClear(by, bx, 4)) {
+                        chooseSuperblock(by, bx, factor, s);
                         continue;
                     }
-                    quantiseDct8(by, bx, factor, block, c8[0], s0, s1);
+                    if (!no16 && (by & 1) == 0 && (bx & 1) == 0
+                            && by + 2 <= h8 && bx + 2 <= w8 && allClear(by, bx, 2)) {
+                        chooseDct16(by, bx, factor, s);
+                        continue;
+                    }
+                    quantiseDct8(by, bx, factor, s);
                 }
             }
         });
@@ -611,20 +625,49 @@ public final class VarDctEncoder {
         return (c == 0 ? xFromY[t] : bFromY[t]) / 84f;
     }
 
-    /** Quantises one 8x8 block in every channel, luma first for CfL. */
-    private void quantiseDct8(int by, int bx, float[] factor,
-            float[] block, float[] coeffs, float[] s0, float[] s1) {
+    /** Per-thread working buffers for the block-choice sweep. */
+    private static final class Scratch {
+        final float[] block = new float[MAX_DIM * MAX_DIM];
+        final float[][] c8 = new float[4][64];
+        final float[] c16 = new float[256];
+        final float[] c32 = new float[MAX_DIM * MAX_DIM];
+        final float[] s0 = new float[MAX_DIM * MAX_DIM];
+        final float[] s1 = new float[MAX_DIM * MAX_DIM];
+        final float[] llf = new float[MAX_LLF];
+        final float[] dcT = new float[MAX_LLF];
+        final float[] dqY = new float[MAX_DIM * MAX_DIM];
+        final int[][] q32 = new int[3][MAX_DIM * MAX_DIM];
+        final int[][] dc32 = new int[3][MAX_LLF];
+    }
+
+    /** True when every cell of the {@code cells}x{@code cells} square is still undecided. */
+    private boolean allClear(int by, int bx, int cells) {
+        for (int iy = 0; iy < cells; iy++) {
+            for (int ix = 0; ix < cells; ix++) {
+                if (blockType[(by + iy) * w8 + bx + ix] != -1) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /** Quantises one 8x8 block in every channel, luma first for CfL. Returns its rate estimate. */
+    private double quantiseDct8(int by, int bx, float[] factor, Scratch s) {
         int k = by * w8 + bx;
         int mul = clampMul(Math.round(hfMul * factor[k]));
         blockType[k] = 0;
         blockMul[k] = mul;
-        float[] dqY = new float[64];
+        float[] block = s.block;
+        float[] coeffs = s.c8[0];
+        float[] dqY = s.dqY;
+        double cost = 1;
         for (int ci = 0; ci < 3; ci++) {
             int c = Y_FIRST[ci];
             for (int y = 0; y < 8; y++) {
                 System.arraycopy(xyb[c], (y0 + by * 8 + y) * paddedWidth + bx * 8, block, y * 8, 8);
             }
-            Dct.forward2D(block, 0, 8, coeffs, 0, 8, 8, 8, s0, s1);
+            Dct.forward2D(block, 0, 8, coeffs, 0, 8, 8, 8, s.s0, s.s1);
             dcQuant[c][k] = Math.round(coeffs[0] / scaledDequant[c]);
             float sfc = baseSfc[c] / mul;
             float cfl = cflFactor(c, by, bx);
@@ -638,22 +681,28 @@ public final class VarDctEncoder {
                 if (c == 1) {
                     dqY[j] = q[j] * step;
                 }
+                cost += tokenCost(q[j]);
             }
             hfQuant[c][k] = q;
         }
+        return cost;
     }
 
     /**
-     * Quantises the aligned 16x16 area both ways and keeps the DCT16 version
-     * when its estimated rate is clearly lower. Returns true when chosen.
+     * Decides the aligned 16x16 area: the 16x16 transform if its rate is clearly
+     * lower than four 8x8s, otherwise the four 8x8s. Always commits, and returns
+     * the rate estimate of whatever it chose.
      */
-    private boolean chooseDct16(int by, int bx, float[] factor,
-            float[] block, float[][] c8, float[] c16, float[] s0, float[] s1,
-            float[] llf, float[] dcT) {
+    private double chooseDct16(int by, int bx, float[] factor, Scratch s) {
         int[] cells = {by * w8 + bx, by * w8 + bx + 1, (by + 1) * w8 + bx, (by + 1) * w8 + bx + 1};
         float f4 = (factor[cells[0]] + factor[cells[1]] + factor[cells[2]] + factor[cells[3]]) / 4;
         if (f4 < 0.95f) {
-            return false; // busy area: 8x8 blocks localise the error better
+            // busy area: 8x8 blocks localise the error better; do not even try 16x16
+            double cost = 0;
+            for (int i = 0; i < 4; i++) {
+                cost += quantiseDct8(by + (i >> 1), bx + (i & 1), factor, s);
+            }
+            return cost;
         }
         int mul16 = clampMul(Math.round(hfMul * f4));
         int[] mul8 = new int[4];
@@ -661,6 +710,9 @@ public final class VarDctEncoder {
             mul8[i] = clampMul(Math.round(hfMul * factor[cells[i]]));
         }
 
+        float[] block = s.block;
+        float[][] c8 = s.c8;
+        float[] c16 = s.c16;
         double cost16 = 8;
         double cost8 = 32;
         int[][] q16 = new int[3][];
@@ -676,7 +728,7 @@ public final class VarDctEncoder {
             for (int y = 0; y < 16; y++) {
                 System.arraycopy(xyb[c], (y0 + by * 8 + y) * paddedWidth + bx * 8, block, y * 16, 16);
             }
-            Dct.forward2D(block, 0, 16, c16, 0, 16, 16, 16, s0, s1);
+            Dct.forward2D(block, 0, 16, c16, 0, 16, 16, 16, s.s0, s.s1);
             float sfc16 = baseSfc[c] / mul16;
             float[] w16 = weightsOf[DCT16.parameterIndex][c];
             int[] q = new int[256];
@@ -697,11 +749,11 @@ public final class VarDctEncoder {
             q16[c] = q;
             // derive the DC entries that reproduce the true LLF coefficients
             for (int i = 0; i < 4; i++) {
-                llf[i] = c16[(i >> 1) * 16 + (i & 1)] / DCT16.llfScale[i];
+                s.llf[i] = c16[(i >> 1) * 16 + (i & 1)] / DCT16.llfScale[i];
             }
-            Dct.inverse2D(llf, 0, 2, dcT, 0, 2, 2, 2, s0, s1, false);
+            Dct.inverse2D(s.llf, 0, 2, s.dcT, 0, 2, 2, 2, s.s0, s.s1, false);
             for (int i = 0; i < 4; i++) {
-                dc16[c][i] = Math.round(dcT[i] / scaledDequant[c]);
+                dc16[c][i] = Math.round(s.dcT[i] / scaledDequant[c]);
             }
 
             // the four 8x8 alternatives
@@ -713,7 +765,7 @@ public final class VarDctEncoder {
                     System.arraycopy(xyb[c], (y0 + cy * 8 + y) * paddedWidth + cx * 8,
                             block, y * 8, 8);
                 }
-                Dct.forward2D(block, 0, 8, c8[i], 0, 8, 8, 8, s0, s1);
+                Dct.forward2D(block, 0, 8, c8[i], 0, 8, 8, 8, s.s0, s.s1);
                 dc8[c][i] = Math.round(c8[i][0] / scaledDequant[c]);
                 float sfc = baseSfc[c] / mul8[i];
                 int[] qq = new int[64];
@@ -741,7 +793,7 @@ public final class VarDctEncoder {
                     hfQuant[c][k] = q8[c][i];
                 }
             }
-            return true; // handled either way
+            return cost8;
         }
         for (int i = 0; i < 4; i++) {
             int k = cells[i];
@@ -755,7 +807,102 @@ public final class VarDctEncoder {
         for (int c = 0; c < 3; c++) {
             hfQuant[c][cells[0]] = q16[c];
         }
-        return true;
+        return cost16;
+    }
+
+    /**
+     * Decides the aligned 32x32 area. The subdivision — four 16x16-or-8x8
+     * decisions — is quantised and committed first, and the 32x32 transform
+     * replaces it only when its rate is clearly lower. A 32x32 covers a smooth
+     * region in one block where sixteen 8x8s would each carry their own DC and
+     * high-frequency tail, so it pays on skies and flat backgrounds and nowhere
+     * busy — which the smoothness gate keeps it away from.
+     */
+    private void chooseSuperblock(int by, int bx, float[] factor, Scratch s) {
+        double costSub = 0;
+        for (int qy = 0; qy < 4; qy += 2) {
+            for (int qx = 0; qx < 4; qx += 2) {
+                costSub += chooseDct16(by + qy, bx + qx, factor, s);
+            }
+        }
+        float f16 = 0;
+        for (int iy = 0; iy < 4; iy++) {
+            for (int ix = 0; ix < 4; ix++) {
+                f16 += factor[(by + iy) * w8 + bx + ix];
+            }
+        }
+        f16 /= 16;
+        if (f16 < 0.95f) {
+            return; // busy: keep the subdivision
+        }
+        int mul32 = clampMul(Math.round(hfMul * f16));
+        double cost32 = quantise32(by, bx, mul32, s);
+        if (cost32 < DCT32_GAIN * costSub) {
+            commit32(by, bx, mul32, s);
+        }
+    }
+
+    /**
+     * Quantises the 32x32 block in every channel into {@code s.q32}/{@code s.dc32}
+     * (not yet committed) and returns its rate estimate. Mirrors {@link #chooseDct16}'s
+     * 16x16 arm at the next scale: a 4x4 low-frequency corner drawn from the DC
+     * image, the rest coded as high frequency.
+     */
+    private double quantise32(int by, int bx, int mul32, Scratch s) {
+        double cost = 16;
+        float[] c32 = s.c32;
+        float[] dqY = s.dqY;
+        for (int ci = 0; ci < 3; ci++) {
+            int c = Y_FIRST[ci];
+            float cfl = cflFactor(c, by, bx);
+            for (int y = 0; y < 32; y++) {
+                System.arraycopy(xyb[c], (y0 + by * 8 + y) * paddedWidth + bx * 8,
+                        s.block, y * 32, 32);
+            }
+            Dct.forward2D(s.block, 0, 32, c32, 0, 32, 32, 32, s.s0, s.s1);
+            float sfc = baseSfc[c] / mul32;
+            float[] w32 = weightsOf[DCT32.parameterIndex][c];
+            int[] q = s.q32[c];
+            for (int y = 0; y < 32; y++) {
+                for (int x = 0; x < 32; x++) {
+                    if (y < 4 && x < 4) {
+                        continue; // LLF comes from the DC image
+                    }
+                    int j = y * 32 + x;
+                    float step = sfc * w32[x * 32 + y];
+                    q[j] = Math.round((c32[j] - cfl * dqY[j]) / step);
+                    if (c == 1) {
+                        dqY[j] = q[j] * step;
+                    }
+                    cost += tokenCost(q[j]);
+                }
+            }
+            // the DC entries that reproduce the true 4x4 LLF
+            for (int i = 0; i < 16; i++) {
+                s.llf[i] = c32[(i >> 2) * 32 + (i & 3)] / DCT32.llfScale[i];
+            }
+            Dct.inverse2D(s.llf, 0, 4, s.dcT, 0, 4, 4, 4, s.s0, s.s1, false);
+            for (int i = 0; i < 16; i++) {
+                s.dc32[c][i] = Math.round(s.dcT[i] / scaledDequant[c]);
+            }
+        }
+        return cost;
+    }
+
+    /** Writes a decided 32x32 block over the sixteen cells it covers. */
+    private void commit32(int by, int bx, int mul32, Scratch s) {
+        int origin = by * w8 + bx;
+        for (int i = 0; i < 16; i++) {
+            int k = (by + (i >> 2)) * w8 + bx + (i & 3);
+            blockType[k] = (byte) (i == 0 ? DCT32.type : -2);
+            blockMul[k] = mul32;
+            for (int c = 0; c < 3; c++) {
+                dcQuant[c][k] = s.dc32[c][i];
+            }
+        }
+        for (int c = 0; c < 3; c++) {
+            hfQuant[c][origin] = s.q32[c].clone();
+        }
     }
 
     /** Crude token-rate estimate for one quantised coefficient. */
@@ -881,21 +1028,22 @@ public final class VarDctEncoder {
     private float[][] reconstructWindow() {
         int rows = h8 << 3;
         float[][] out = new float[3][paddedWidth * rows];
+        int maxN = MAX_DIM * MAX_DIM;
         sweep(h8, by -> {
-            float[] deq = new float[256];
-            float[] dqY = new float[256];
-            float[] dcT = new float[4];
-            float[] llf = new float[4];
-            float[] s0 = new float[256];
-            float[] s1 = new float[256];
+            float[] deq = new float[maxN];
+            float[] dqY = new float[maxN];
+            float[] dcT = new float[MAX_LLF];
+            float[] llf = new float[MAX_LLF];
+            float[] s0 = new float[maxN];
+            float[] s1 = new float[maxN];
             for (int bx = 0; bx < w8; bx++) {
                 int k = by * w8 + bx;
                 byte type = blockType[k];
                 if (type < 0) {
-                    continue; // covered by the 16x16 block that owns the cell
+                    continue; // covered by the larger block that owns the cell
                 }
-                TransformType tt = type == DCT16.type ? DCT16 : DCT8;
-                int dim = type == DCT16.type ? 16 : 8;
+                TransformType tt = TransformType.byType(type);
+                int dim = tt.pixelWidth;      // square DCTs only, here
                 int llfDim = dim >> 3;
                 for (int ci = 0; ci < 3; ci++) {
                     int c = Y_FIRST[ci];
@@ -921,13 +1069,13 @@ public final class VarDctEncoder {
                     if (llfDim == 1) {
                         deq[0] = dcQuant[c][k] * scaledDequant[c];
                     } else {
-                        for (int i = 0; i < 4; i++) {
-                            int cell = (by + (i >> 1)) * w8 + bx + (i & 1);
+                        for (int i = 0; i < llfDim * llfDim; i++) {
+                            int cell = (by + i / llfDim) * w8 + bx + i % llfDim;
                             dcT[i] = dcQuant[c][cell] * scaledDequant[c];
                         }
-                        Dct.forward2D(dcT, 0, 2, llf, 0, 2, 2, 2, s0, s1);
-                        for (int i = 0; i < 4; i++) {
-                            deq[(i >> 1) * dim + (i & 1)] = llf[i] * tt.llfScale[i];
+                        Dct.forward2D(dcT, 0, llfDim, llf, 0, llfDim, llfDim, llfDim, s0, s1);
+                        for (int i = 0; i < llfDim * llfDim; i++) {
+                            deq[(i / llfDim) * dim + i % llfDim] = llf[i] * tt.llfScale[i];
                         }
                     }
                     Dct.inverse2D(deq, 0, dim, out[c], by * 8 * paddedWidth + bx * 8,
@@ -1378,7 +1526,7 @@ public final class VarDctEncoder {
                 if (blockType[k] < 0) {
                     continue; // covered cell
                 }
-                TransformType tt = blockType[k] == 0 ? DCT8 : DCT16;
+                TransformType tt = TransformType.byType(blockType[k]);
                 int numBlocks = tt.blockHeight * tt.blockWidth;
                 int[] order = HfPass.naturalOrder(tt.orderId);
                 int orderSize = order.length;

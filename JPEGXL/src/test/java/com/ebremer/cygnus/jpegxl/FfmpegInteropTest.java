@@ -3,6 +3,7 @@ package com.ebremer.cygnus.jpegxl;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import com.ebremer.cygnus.jpegxl.decoder.JxlDecoder;
@@ -114,6 +115,42 @@ class FfmpegInteropTest {
         for (int p = 0; p < 3; p++) {
             assertArrayEquals(original[p], decoded[p], "plane " + p);
         }
+    }
+
+    /**
+     * A large smooth image encoded lossily uses the 32x32 transform; libjxl must
+     * reconstruct it the same way we do, to within a rounding step.
+     */
+    @Test
+    void ffmpegAgreesOnOurDct32Output() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 384;
+        int h = 320;
+        int[][] src = new int[3][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                src[0][i] = Math.max(0, Math.min(255, 128 + (int) (55 * Math.sin(x * 0.009))));
+                src[1][i] = Math.max(0, Math.min(255, 120 + (int) (45 * Math.cos(y * 0.007))));
+                src[2][i] = Math.max(0, Math.min(255, 100 + (x + y) / 10));
+            }
+        }
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encode(
+                deepCopy(src), w, h, 8, false, false, false, 1.5f);
+        Path jxlFile = tempDir.resolve("ours-dct32.jxl");
+        Path rawFile = tempDir.resolve("ffdec-dct32.raw");
+        Files.write(jxlFile, jxl);
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+        int[][] ours = JxlDecoder.decode(jxl).frames.get(0).channels;
+        int worst = 0;
+        for (int p = 0; p < 3; p++) {
+            for (int i = 0; i < w * h; i++) {
+                worst = Math.max(worst, Math.abs(ours[p][i] - theirs[p][i]));
+            }
+        }
+        assertTrue(worst <= 1, "our decode and libjxl's differ by " + worst + " on a DCT32 image");
     }
 
     /** Smooth gradients favour the weighted predictor. */
