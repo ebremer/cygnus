@@ -2,6 +2,7 @@ package com.ebremer.cygnus.jpegxl.imageio;
 
 import com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo;
 import com.ebremer.cygnus.jpegxl.codestream.ImageMetadata;
+import com.ebremer.cygnus.jpegxl.color.IccColorTransform;
 import com.ebremer.cygnus.jpegxl.decoder.JxlDecoder;
 import com.ebremer.cygnus.jpegxl.decoder.JxlFrame;
 import com.ebremer.cygnus.jpegxl.decoder.JxlImage;
@@ -273,6 +274,22 @@ public final class JXLImageReader extends ImageReader {
         if (blackIdx >= 0 && !Boolean.getBoolean("jxl.skipCmyk")) {
             frame = renderCmyk(frame, numColour, blackIdx, meta);
         }
+
+        // Colour management: a matrix/TRC RGB ICC profile is applied here, mapping
+        // the device samples to sRGB for display — the rendering a colour-managed
+        // viewer performs, reproducing lcms2. Only for a non-XYB integer image,
+        // whose colour planes are the profile's device values (an XYB frame is
+        // already in sRGB primaries; the float path is left to the caller).
+        // Profiles a pure-Java transform cannot render exactly (LUT/CMYK) return
+        // null from forProfile, and the samples are left as sRGB. This is a viewer
+        // step, so it lives here and not in the normative JxlDecoder.
+        if (!grey && blackIdx < 0 && !meta.xybEncoded && !meta.bitDepth.floatingPoint
+                && !Boolean.getBoolean("jxl.skipIcc")) {
+            IccColorTransform icc = IccColorTransform.forProfile(meta.iccProfile);
+            if (icc != null) {
+                frame = renderIcc(frame, icc, (1 << bpp) - 1);
+            }
+        }
         int[][] ch = frame.channels;
 
         if (meta.bitDepth.floatingPoint) {
@@ -355,6 +372,20 @@ public final class JXLImageReader extends ImageReader {
      * decoded image the caller holds is unchanged. {@code -Djxl.skipCmyk} turns
      * this off, for a caller that wants the four channels as they were coded.
      */
+    /**
+     * Returns a frame whose three colour planes are the ICC device samples mapped
+     * to sRGB; the originals (shared with the caller's decoded image) are left
+     * untouched. Extra channels ride along unchanged.
+     */
+    private static JxlFrame renderIcc(JxlFrame frame, IccColorTransform icc, int max) {
+        int[][] out = frame.channels.clone();
+        out[0] = frame.channels[0].clone();
+        out[1] = frame.channels[1].clone();
+        out[2] = frame.channels[2].clone();
+        icc.toSrgb(out[0], out[1], out[2], max);
+        return new JxlFrame(frame.width, frame.height, out, frame.floatChannels, frame.duration);
+    }
+
     private static JxlFrame renderCmyk(JxlFrame frame, int colourCount, int blackIdx,
             ImageMetadata meta) {
         int n = frame.width * frame.height;

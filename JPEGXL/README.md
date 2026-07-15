@@ -104,19 +104,23 @@ cropped result; reference, LF and preview frames always decode whole.
   upsampling and extra-channel shifts are bit-identical to a full decode;
   non-local features fall back to decoding every group automatically.
 - **Colour management**: embedded ICC profiles are reconstructed from the
-  encoded ICC stream byte-exactly. An XYB image with an embedded profile is
-  coded in linear light — the profile, not an enumerated transfer, defines its
-  output — so the eight-bit decode applies the sRGB transfer to gamma-encode it;
-  otherwise the picture comes out far too dark. The float decode
-  (`decodeToFloats`) stays linear, matching the profile-plus-linear conformance
-  references. Wide-gamut profiles are *not* remapped to the viewer's gamut:
-  `java.awt.color`'s CMM does not reproduce libjxl's lcms2 maths (attempting it
-  makes agreement with libjxl worse, not better), and matching an ICC-device
-  output byte-for-byte needs a real CMM. A CMYK image (a black extra channel) is
-  composited to RGB for display through ImageIO — the black multiplied back into
-  the colour planes, so a scanned document's text shows rather than dropping out
-  to white paper; the raw four channels remain available (`JxlDecoder.decode`,
-  or `-Djxl.skipCmyk`).
+  encoded ICC stream byte-exactly, and *applied* for display through the ImageIO
+  reader. A modular image whose profile is a matrix/TRC RGB profile — the kind a
+  photograph carries (sRGB, Display P3, Adobe RGB, a scanner's) — has its device
+  samples mapped to sRGB through the profile (tone curves, colorant matrix, D50
+  connection space); `IccColorTransform` does it in pure Java and reproduces
+  lcms2, the engine libjxl uses, to within a single eight-bit step. Profiles a
+  matrix/TRC transform cannot render exactly (LUT-based, CMYK, greyscale) fall
+  back to an sRGB reading of the samples; `-Djxl.skipIcc` turns the transform off.
+  An XYB image with an embedded profile is coded in linear light, so its eight-bit
+  decode applies the sRGB transfer to gamma-encode it; otherwise the picture comes
+  out far too dark. The float decode (`decodeToFloats`) stays linear, matching the
+  profile-plus-linear conformance references — colour management is a viewer step,
+  not the normative decode. A CMYK image (a black extra channel) is composited to
+  RGB for display through ImageIO — the black multiplied back into the colour
+  planes, so a scanned document's text shows rather than dropping out to white
+  paper; the raw four channels remain available (`JxlDecoder.decode`, or
+  `-Djxl.skipCmyk`).
 - **YCbCr frames**: recompressed-JPEG streams (`cjxl in.jpg`) decode to
   pixels, including 4:2:0/4:2:2 chroma subsampling with the JPEG-style
   triangle upsampling.
