@@ -265,6 +265,14 @@ public final class JXLImageReader extends ImageReader {
         int numColour = grey ? 1 : 3;
         int alphaIdx = meta.alphaChannelIndex();
         int bpp = meta.bitDepth.bitsPerSample;
+
+        // A CMYK image is rendered to RGB for display; the black channel is
+        // multiplied into the colour planes (see renderCmyk). This is a viewer
+        // step, not the normative decode, so it lives here and not in JxlDecoder.
+        int blackIdx = grey ? -1 : cmykBlackIndex(meta);
+        if (blackIdx >= 0 && !Boolean.getBoolean("jxl.skipCmyk")) {
+            frame = renderCmyk(frame, numColour, blackIdx, meta);
+        }
         int[][] ch = frame.channels;
 
         if (meta.bitDepth.floatingPoint) {
@@ -319,6 +327,67 @@ public final class JXLImageReader extends ImageReader {
             return v;
         }
         return (v * 255 + max / 2) / max;
+    }
+
+    /** The extra-channel index of the CMYK black plane, or -1 if there is none. */
+    private static int cmykBlackIndex(ImageMetadata meta) {
+        for (int i = 0; i < meta.numExtraChannels(); i++) {
+            if (meta.extraChannels.get(i).type
+                    == com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo.TYPE_BLACK) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Renders a CMYK frame to RGB by multiplying its black channel into the three
+     * colour planes — the naive device conversion. A JPEG XL CMYK image carries
+     * C, M and Y as their additive complements in the colour channels (no ink is
+     * the maximum value, white) and K as a separate black extra channel, likewise
+     * complemented, so RGB is {@code colour * (black / blackMax)} per component.
+     *
+     * <p>It matters because where the black is full — the text of a scanned
+     * document, say — the colour channels are still white, and a decoder that
+     * shows only the colour planes (which is what dumping a CMYK file to RGB
+     * usually does) loses the ink entirely. The plane arrays not touched are
+     * shared with the returned frame; the three colour planes are copies, so the
+     * decoded image the caller holds is unchanged. {@code -Djxl.skipCmyk} turns
+     * this off, for a caller that wants the four channels as they were coded.
+     */
+    private static JxlFrame renderCmyk(JxlFrame frame, int colourCount, int blackIdx,
+            ImageMetadata meta) {
+        int n = frame.width * frame.height;
+        int bi = colourCount + blackIdx;
+        float[] blackNorm = new float[n];
+        if (frame.floatChannels != null && frame.floatChannels[bi] != null) {
+            blackNorm = frame.floatChannels[bi]; // already in [0, 1]
+        } else {
+            int bmax = (1 << meta.extraChannels.get(blackIdx).bitDepth.bitsPerSample) - 1;
+            int[] b = frame.channels[bi];
+            for (int i = 0; i < n; i++) {
+                blackNorm[i] = (float) b[i] / bmax;
+            }
+        }
+        boolean floatColour = frame.floatChannels != null && frame.floatChannels[0] != null;
+        if (floatColour) {
+            float[][] out = frame.floatChannels.clone();
+            for (int c = 0; c < 3; c++) {
+                out[c] = frame.floatChannels[c].clone();
+                for (int i = 0; i < n; i++) {
+                    out[c][i] *= blackNorm[i];
+                }
+            }
+            return new JxlFrame(frame.width, frame.height, frame.channels, out, frame.duration);
+        }
+        int[][] out = frame.channels.clone();
+        for (int c = 0; c < 3; c++) {
+            out[c] = frame.channels[c].clone();
+            for (int i = 0; i < n; i++) {
+                out[c][i] = Math.round(frame.channels[c][i] * blackNorm[i]);
+            }
+        }
+        return new JxlFrame(frame.width, frame.height, out, frame.floatChannels, frame.duration);
     }
 
     /** Floating-point output via a TYPE_FLOAT component raster. */

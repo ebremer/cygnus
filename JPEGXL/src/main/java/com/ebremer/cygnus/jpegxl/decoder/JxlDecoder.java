@@ -483,7 +483,10 @@ public final class JxlDecoder {
             SizeHeader size, ImageMetadata meta, long duration, java.awt.Rectangle csRegion,
             boolean floatOut) {
         // spot colours are rendered at output only; the canvas and the
-        // reference snapshots stay spot-free
+        // reference snapshots stay spot-free. CMYK is not composited here: unlike
+        // spot colours it is not part of the normative decode (the conformance
+        // references are the coded CMYK channels), so it is a viewer step, done
+        // in the ImageIO reader instead.
         float[][] emit = canvas;
         int[][] emitExact = canvasExact;
         if (canvasColour >= 3 && hasSpotColours(meta)) {

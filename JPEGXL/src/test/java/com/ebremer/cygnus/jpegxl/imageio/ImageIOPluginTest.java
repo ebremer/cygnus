@@ -447,4 +447,70 @@ class ImageIOPluginTest {
             }
         }
     }
+
+    /** A CMYK image (a black extra channel) is composited to RGB for display. */
+    @Test
+    void cmykImageIsCompositedToRgb() throws Exception {
+        int w = 64;
+        int h = 48;
+        int[][] p = new int[4][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                p[0][i] = x * 255 / (w - 1);
+                p[1][i] = 255 - x * 255 / (w - 1);
+                p[2][i] = y * 255 / (h - 1);
+                p[3][i] = (x + y) * 255 / (w + h - 2);   // black channel
+            }
+        }
+        var extras = java.util.List.of(com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo.of(
+                com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo.TYPE_BLACK,
+                com.ebremer.cygnus.jpegxl.codestream.BitDepth.of(8), "K"));
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.JxlEncoder.encode(p, w, h, 8, false, extras);
+
+        BufferedImage img = ImageIO.read(new ByteArrayInputStream(jxl));
+        assertNotNull(img);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                int rgb = img.getRGB(x, y);
+                // naive device conversion: RGB = colour * (black / 255)
+                assertEquals(Math.round(p[0][i] * p[3][i] / 255f), (rgb >> 16) & 0xff, "R at " + x);
+                assertEquals(Math.round(p[1][i] * p[3][i] / 255f), (rgb >> 8) & 0xff, "G at " + x);
+                assertEquals(Math.round(p[2][i] * p[3][i] / 255f), rgb & 0xff, "B at " + x);
+            }
+        }
+    }
+
+    /** Where the ink is full — the black channel at zero — the pixel shows black. */
+    @Test
+    void cmykFullBlackInkShowsAsBlack() throws Exception {
+        var extras = java.util.List.of(com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo.of(
+                com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo.TYPE_BLACK,
+                com.ebremer.cygnus.jpegxl.codestream.BitDepth.of(8), "K"));
+        int[][] p = {{255}, {255}, {255}, {0}};   // white colour, black channel 0 (full ink)
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.JxlEncoder.encode(p, 1, 1, 8, false, extras);
+        BufferedImage img = ImageIO.read(new ByteArrayInputStream(jxl));
+        assertEquals(0, img.getRGB(0, 0) & 0xffffff, "full black ink should render black");
+    }
+
+    /** {@code -Djxl.skipCmyk} leaves the coded planes for a caller that wants them raw. */
+    @Test
+    void skipCmykLeavesColourPlanesUncomposited() throws Exception {
+        var extras = java.util.List.of(com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo.of(
+                com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo.TYPE_BLACK,
+                com.ebremer.cygnus.jpegxl.codestream.BitDepth.of(8), "K"));
+        int[][] p = {{200}, {150}, {100}, {0}};   // black 0 would zero the colour if composited
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.JxlEncoder.encode(p, 1, 1, 8, false, extras);
+        System.setProperty("jxl.skipCmyk", "true");
+        try {
+            BufferedImage img = ImageIO.read(new ByteArrayInputStream(jxl));
+            int rgb = img.getRGB(0, 0);
+            assertEquals(200, (rgb >> 16) & 0xff, "colour plane should be untouched");
+            assertEquals(150, (rgb >> 8) & 0xff);
+            assertEquals(100, rgb & 0xff);
+        } finally {
+            System.clearProperty("jxl.skipCmyk");
+        }
+    }
 }

@@ -103,7 +103,11 @@ cropped result; reference, LF and preview frames always decode whole.
   upsampling and extra-channel shifts are bit-identical to a full decode;
   non-local features fall back to decoding every group automatically.
 - **Colour management**: embedded ICC profiles are reconstructed from the
-  encoded ICC stream and applied through `java.awt.color` when possible.
+  encoded ICC stream and applied through `java.awt.color` when possible. A CMYK
+  image (a black extra channel) is composited to RGB for display through
+  ImageIO — the black multiplied back into the colour planes, so a scanned
+  document's text shows rather than dropping out to white paper; the raw four
+  channels remain available (`JxlDecoder.decode`, or `-Djxl.skipCmyk`).
 - **YCbCr frames**: recompressed-JPEG streams (`cjxl in.jpg`) decode to
   pixels, including 4:2:0/4:2:2 chroma subsampling with the JPEG-style
   triangle upsampling.
