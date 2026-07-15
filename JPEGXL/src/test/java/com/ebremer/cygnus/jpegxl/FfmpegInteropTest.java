@@ -154,6 +154,58 @@ class FfmpegInteropTest {
     }
 
     /**
+     * The opt-in 128 and 256 scales, when enabled, still emit a valid codestream
+     * libjxl reconstructs the same way we do. Skipped unless {@code jxl.enc.dct256}
+     * is set at JVM launch, because the scales are off by default (their rate
+     * estimate misjudges them); this validates the machinery is correct for anyone
+     * who turns them on.
+     */
+    @Test
+    void ffmpegAgreesOnOur128And256Output() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        assumeTrue(Boolean.getBoolean("jxl.enc.dct128") && Boolean.getBoolean("jxl.enc.dct256"),
+                "128/256 scales not opted in");
+        int w = 640;
+        int h = 640;
+        int[][] src = new int[3][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                int v = 30 + (x + y) * 180 / (w + h - 2);
+                src[0][i] = v;
+                src[1][i] = Math.min(255, v + 8);
+                src[2][i] = Math.max(0, v - 8);
+            }
+        }
+        long before = 0;
+        for (int t = 21; t <= 26; t++) {
+            before += com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(t);
+        }
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encode(
+                deepCopy(src), w, h, 8, false, false, false, 2.0f);
+        long fired = 0;
+        for (int t = 21; t <= 26; t++) {
+            fired += com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(t);
+        }
+        fired -= before;
+        assertTrue(fired > 0, "opted-in run should draw some 128/256 block");
+        Path jxlFile = tempDir.resolve("ours-dct256.jxl");
+        Path rawFile = tempDir.resolve("ffdec-dct256.raw");
+        Files.write(jxlFile, jxl);
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+        int[][] ours = JxlDecoder.decode(jxl).frames.get(0).channels;
+        int worst = 0;
+        for (int p = 0; p < 3; p++) {
+            for (int i = 0; i < w * h; i++) {
+                worst = Math.max(worst, Math.abs(ours[p][i] - theirs[p][i]));
+            }
+        }
+        assertTrue(worst <= 2, "our 128/256 decode disagrees with libjxl: worst " + worst);
+    }
+
+    /**
      * A large smooth gradient at a coarse distance draws the 64-scale blocks (the
      * 64x32/32x64 rectangular pair); libjxl must reconstruct those big blocks the
      * same way we do. This is the first content on which the encoder emits

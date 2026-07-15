@@ -100,8 +100,25 @@ public final class VarDctEncoder {
     private static final TransformType DCT64 = TransformType.byType(18);
     private static final TransformType DCT64_32 = TransformType.byType(19); // 64 tall, 32 wide
     private static final TransformType DCT32_64 = TransformType.byType(20); // 32 tall, 64 wide
-    /** The largest transform this encoder chooses, and its LLF (side/8) squared. */
-    private static final int MAX_DIM = 64;
+    private static final TransformType DCT128 = TransformType.byType(21);
+    private static final TransformType DCT128_64 = TransformType.byType(22); // 128 tall, 64 wide
+    private static final TransformType DCT64_128 = TransformType.byType(23); // 64 tall, 128 wide
+    private static final TransformType DCT256 = TransformType.byType(24);
+    private static final TransformType DCT256_128 = TransformType.byType(25); // 256 tall, 128 wide
+    private static final TransformType DCT128_256 = TransformType.byType(26); // 128 tall, 256 wide
+    // The 128 and 256 scales are OPT-IN (off by default): measured, the token-count
+    // rate estimate cannot price a block that large — when it picks one it bloats
+    // (6x on a smooth ramp at distance 2), and where a big block might help it is
+    // not picked. The machinery is generalised to produce them for whoever wires a
+    // better estimate, but the default encoder does not offer them.
+    private static final boolean DCT128_ON = Boolean.getBoolean("jxl.enc.dct128");
+    private static final boolean DCT256_ON = Boolean.getBoolean("jxl.enc.dct256");
+    /**
+     * The largest transform this encoder chooses, and its LLF (side/8) squared.
+     * Sized to the enabled scales so the sweep scratch stays small in the common
+     * case: 64 by default, up to 256 only when the big scales are opted in.
+     */
+    private static final int MAX_DIM = DCT256_ON ? 256 : DCT128_ON ? 128 : 64;
     private static final int MAX_LLF = (MAX_DIM / 8) * (MAX_DIM / 8);
     private static final boolean NO_DCT32 = Boolean.getBoolean("jxl.enc.nodct32");
     private static final boolean NO_DCT64 = Boolean.getBoolean("jxl.enc.nodct64");
@@ -132,34 +149,28 @@ public final class VarDctEncoder {
     public static final java.util.concurrent.atomic.AtomicLongArray TYPE_HIST =
             new java.util.concurrent.atomic.AtomicLongArray(27);
     /**
-     * How much cheaper the 32x32 transform must estimate before it replaces the
-     * sixteen-cell subdivision. Below 1 by a margin because the rate estimate is
-     * a coarse token count that does not see the DC image, which a big block
-     * shifts around: requiring a clear win keeps it to the smooth regions where
-     * it plainly helps (a large photo's sky and road come out about 5% smaller)
-     * and away from the ones where the estimate would misjudge it.
+     * How much cheaper a square transform (32x32 up to 256x256) must estimate
+     * before it replaces the four-quadrant subdivision under it. Below 1 by a
+     * margin because the rate estimate is a coarse token count that does not see
+     * the DC image, which a big block shifts around: requiring a clear win keeps it
+     * to the smooth regions where it plainly helps (a large photo's sky and road
+     * come out ~5% smaller at 32, more at the larger scales) and away from the ones
+     * where the estimate would misjudge it. The same margin serves every scale.
      */
-    private static final double DCT32_GAIN = 0.85;
+    private static final double SQUARE_GAIN = 0.85;
     /**
-     * How much cheaper the 64x64 transform must estimate before it replaces the
-     * four 32x32 superblocks under it. The same margin as {@link #DCT32_GAIN} and
-     * for the same reason, one scale up: a 64-block only pays on a very large
-     * smooth expanse (a clear sky, a plain wall), and the rate estimate cannot see
-     * the DC image the block rearranges, so it is taken only on a clear win.
+     * The distance below which the big scales (64x64 and up) are not offered at
+     * all. Their rate estimate — a token count blind to the entropy coder and the
+     * DC image — badly misjudges a big block near lossless, where a gentle
+     * gradient's DCT decays too slowly to throw away and the block keeps a wide
+     * skirt of small coefficients the estimate underprices; measured, it can bloat
+     * a smooth image by more than half at distance 1. A big block only earns its
+     * place once the quantiser is coarse enough to clear that skirt, which is
+     * distance 2 and up (5-12% smaller on a large smooth image); below it the 32x32
+     * hierarchy is left to decide. This mirrors how libjxl reserves its largest
+     * transforms for lower qualities.
      */
-    private static final double DCT64_GAIN = 0.85;
-    /**
-     * The distance below which the 64x64 scale is not offered at all. Its rate
-     * estimate — a token count blind to the entropy coder and the DC image — badly
-     * misjudges a big block near lossless, where a gentle gradient's DCT decays too
-     * slowly to throw away and the block keeps a wide skirt of small coefficients
-     * the estimate underprices; measured, it can bloat a smooth image by more than
-     * half at distance 1. The 64-block only earns its place once the quantiser is
-     * coarse enough to clear that skirt, which is distance 2 and up (5-12% smaller
-     * on a large smooth image); below it the 32x32 hierarchy is left to decide.
-     * This mirrors how libjxl reserves its largest transforms for lower qualities.
-     */
-    private static final float DCT64_MIN_DISTANCE = 2.0f;
+    private static final float BIG_MIN_DISTANCE = 2.0f;
 
     // adaptive quantisation limits (relative to the base multiplier)
     private static final float AQ_MIN = 0.75f;
@@ -648,29 +659,44 @@ public final class VarDctEncoder {
         float[] factor = maskingFactors(mean);
         boolean no16 = Boolean.getBoolean("jxl.enc.nodct16");
 
-        // Eight cell rows at a time: a 64x64 block starts only on an 8-aligned row
-        // and covers the seven below, so eight rows are the smallest unit that
-        // never reaches outside itself — the 32x32 (four rows), 16x16 (two) and
-        // 8x8 (one) nest inside, and eight-row strips can still run at once. The
-        // block choice is a hierarchy from the top: try the 64x64, then the 32x32
-        // where that does not pay, then the 16x16-or-four-8x8 decision, and down.
-        sweep(ceilDiv(h8, 8), strip -> {
+        // A strip is as tall as the largest block that can be attempted, so the
+        // block never reaches outside its strip and the strips run at once. Without
+        // the big scales that is the 64x64 (eight cell rows) once past
+        // BIG_MIN_DISTANCE, the 32x32 (four) below it, and every smaller block nests
+        // inside. The 128/256 scales, when opted in, widen it to sixteen or
+        // thirty-two rows. The block choice is a hierarchy from the top: the largest
+        // block that pays, else down to the 16x16-or-four-8x8 decision, and down.
+        boolean big = distance >= BIG_MIN_DISTANCE;
+        boolean use256 = big && DCT256_ON;
+        boolean use128 = big && DCT128_ON;
+        int stripCells = use256 ? 32 : use128 ? 16 : big && !NO_DCT64 ? 8 : 4;
+        sweep(ceilDiv(h8, stripCells), strip -> {
             Scratch s = new Scratch();
-            int byN = Math.min(strip * 8 + 8, h8);
-            for (int by = strip * 8; by < byN; by++) {
+            int byTop = strip * stripCells;
+            int byN = Math.min(byTop + stripCells, h8);
+            for (int by = byTop; by < byN; by++) {
                 for (int bx = 0; bx < w8; bx++) {
                     if (blockType[by * w8 + bx] != -1) {
                         continue; // already decided (or covered by a larger block)
                     }
-                    if (!NO_DCT64 && distance >= DCT64_MIN_DISTANCE
-                            && (by & 7) == 0 && (bx & 7) == 0
+                    if (use256 && (by & 31) == 0 && (bx & 31) == 0
+                            && by + 32 <= h8 && bx + 32 <= w8 && allClear(by, bx, 32)) {
+                        chooseBlock(by, bx, 32, factor, s);
+                        continue;
+                    }
+                    if (use128 && (by & 15) == 0 && (bx & 15) == 0
+                            && by + 16 <= h8 && bx + 16 <= w8 && allClear(by, bx, 16)) {
+                        chooseBlock(by, bx, 16, factor, s);
+                        continue;
+                    }
+                    if (big && !NO_DCT64 && (by & 7) == 0 && (bx & 7) == 0
                             && by + 8 <= h8 && bx + 8 <= w8 && allClear(by, bx, 8)) {
-                        chooseHyperblock(by, bx, factor, s);
+                        chooseBlock(by, bx, 8, factor, s);
                         continue;
                     }
                     if (!NO_DCT32 && (by & 3) == 0 && (bx & 3) == 0
                             && by + 4 <= h8 && bx + 4 <= w8 && allClear(by, bx, 4)) {
-                        chooseSuperblock(by, bx, factor, s);
+                        chooseBlock(by, bx, 4, factor, s);
                         continue;
                     }
                     if (!no16 && (by & 1) == 0 && (bx & 1) == 0
@@ -1168,232 +1194,150 @@ public final class VarDctEncoder {
     }
 
     /**
-     * Decides the aligned 32x32 area. The subdivision — four 16x16-or-8x8
-     * decisions — is quantised and committed first, and the 32x32 transform
-     * replaces it only when its rate is clearly lower. A 32x32 covers a smooth
-     * region in one block where sixteen 8x8s would each carry their own DC and
+     * Decides an aligned square region of {@code cells}x{@code cells} 8x8 cells —
+     * 32x32 (four cells a side) up through 256x256 (thirty-two). The subdivision
+     * into four quadrants of the next scale down is quantised and committed first,
+     * and the one big square (or a rectangular pair of half-blocks) replaces it
+     * only when its rate is clearly lower. A big block covers a smooth region in
+     * one transform where the smaller ones would each carry their own DC and
      * high-frequency tail, so it pays on skies and flat backgrounds and nowhere
-     * busy — which the smoothness gate keeps it away from.
+     * busy — which the smoothness gate keeps it away from. Recursive: each quadrant
+     * is this same decision one scale down, until {@code cells == 2} hands off to
+     * {@link #chooseDct16}. Returns the rate estimate of whatever it committed.
      */
-    private double chooseSuperblock(int by, int bx, float[] factor, Scratch s) {
+    private double chooseBlock(int by, int bx, int cells, float[] factor, Scratch s) {
+        if (cells == 2) {
+            return chooseDct16(by, bx, factor, s);
+        }
+        int half = cells / 2;
         double costSub = 0;
-        for (int qy = 0; qy < 4; qy += 2) {
-            for (int qx = 0; qx < 4; qx += 2) {
-                costSub += chooseDct16(by + qy, bx + qx, factor, s);
+        for (int qy = 0; qy < cells; qy += half) {
+            for (int qx = 0; qx < cells; qx += half) {
+                costSub += chooseBlock(by + qy, bx + qx, half, factor, s);
             }
         }
-        float f16 = 0;
-        for (int iy = 0; iy < 4; iy++) {
-            for (int ix = 0; ix < 4; ix++) {
-                f16 += factor[(by + iy) * w8 + bx + ix];
+        float f = 0;
+        for (int iy = 0; iy < cells; iy++) {
+            for (int ix = 0; ix < cells; ix++) {
+                f += factor[(by + iy) * w8 + bx + ix];
             }
         }
-        f16 /= 16;
+        f /= cells * cells;
 
-        // candidates that replace the whole 32x32 subdivision, each needing a
-        // clear win over it. The square 32x32 is kept to smooth regions (its rate
-        // estimate misjudges busy ones); the rectangular tilings — two 32x16 or
-        // 16x32 — go wherever the content runs one way, which is often the busy
-        // areas the square block avoids. The four-block 32x8/8x32 tilings are not
-        // tried: measured across the photographs they never won a superblock, so
-        // they were only wasted forward transforms (the decoder still reads them).
+        // The square (kept to smooth regions — its rate estimate misjudges busy
+        // ones) and the two half-block rectangular tilings (for content that runs
+        // one way, often the busy areas the square avoids), each needing a clear
+        // win over the subdivision the recursion already committed.
         double bestCost = Double.MAX_VALUE;
-        int mul32 = 0;
+        int mul = 0;
         RectTiling bestRect = null;
-        if (f16 >= 0.95f) {
-            mul32 = clampMul(Math.round(hfMul * f16));
-            double cost32 = quantise32(by, bx, mul32, s);
-            if (cost32 < DCT32_GAIN * costSub) {
-                bestCost = cost32;
+        if (f >= 0.95f) {
+            mul = clampMul(Math.round(hfMul * f));
+            double costSq = quantiseSquareBig(by, bx, squareFor(cells), mul, s);
+            if (costSq < SQUARE_GAIN * costSub) {
+                bestCost = costSq;
             }
         }
         if (!NO_RECT) {
-            RectTiling half = bestRectTiling(by, bx, 4,
-                    new TransformType[] {DCT32_16, DCT16_32}, factor, s);
-            if (half.cost < RECT_GAIN * costSub && half.cost < bestCost) {
-                bestCost = half.cost;
-                bestRect = half;
+            RectTiling rect = bestRectTiling(by, bx, cells, rectFor(cells), factor, s);
+            if (rect.cost < RECT_GAIN * costSub && rect.cost < bestCost) {
+                bestCost = rect.cost;
+                bestRect = rect;
             }
         }
         if (bestRect != null) {
-            commitRectTiling(by, bx, 4, bestRect);
+            commitRectTiling(by, bx, cells, bestRect);
             return bestRect.cost;
         } else if (bestCost < Double.MAX_VALUE) {
-            commit32(by, bx, mul32, s);
+            commitSquareBig(by, bx, squareFor(cells), mul, s);
             return bestCost;
         }
-        // else keep the subdivision the four chooseDct16 calls already committed
+        // else keep the subdivision the recursion already committed
         return costSub;
     }
 
-    /**
-     * Chooses between one 64x64 block and the four 32x32 superblocks under it,
-     * the top of the same hierarchy {@link #chooseSuperblock} runs at 32. The
-     * four superblocks are decided first (each committing whatever it prefers, and
-     * returning its rate); a 64x64 replaces the lot only on a clear win, which
-     * comes only over a very large smooth expanse. The rectangular 64x32/32x64
-     * pair is offered too, through the same general tiling helper the smaller
-     * scales use, for content that runs smooth along one axis over the whole 64.
-     */
-    private void chooseHyperblock(int by, int bx, float[] factor, Scratch s) {
-        double costSub = 0;
-        for (int qy = 0; qy < 8; qy += 4) {
-            for (int qx = 0; qx < 8; qx += 4) {
-                costSub += chooseSuperblock(by + qy, bx + qx, factor, s);
-            }
-        }
-        float f64 = 0;
-        for (int iy = 0; iy < 8; iy++) {
-            for (int ix = 0; ix < 8; ix++) {
-                f64 += factor[(by + iy) * w8 + bx + ix];
-            }
-        }
-        f64 /= 64;
+    /** The square DCT covering a {@code cells}x{@code cells} region: 4→32, 8→64, 16→128, 32→256. */
+    private static TransformType squareFor(int cells) {
+        return switch (cells) {
+            case 4 -> DCT32;
+            case 8 -> DCT64;
+            case 16 -> DCT128;
+            default -> DCT256;
+        };
+    }
 
-        double bestCost = Double.MAX_VALUE;
-        int mul64 = 0;
-        RectTiling bestRect = null;
-        if (f64 >= 0.95f) {
-            mul64 = clampMul(Math.round(hfMul * f64));
-            double cost64 = quantise64(by, bx, mul64, s);
-            if (cost64 < DCT64_GAIN * costSub) {
-                bestCost = cost64;
-            }
-        }
-        if (!NO_RECT) {
-            RectTiling half = bestRectTiling(by, bx, 8,
-                    new TransformType[] {DCT64_32, DCT32_64}, factor, s);
-            if (half.cost < RECT_GAIN * costSub && half.cost < bestCost) {
-                bestCost = half.cost;
-                bestRect = half;
-            }
-        }
-        if (bestRect != null) {
-            commitRectTiling(by, bx, 8, bestRect);
-        } else if (bestCost < Double.MAX_VALUE) {
-            commit64(by, bx, mul64, s);
-        }
-        // else keep the four superblocks the loop above already committed
+    /** The two half-block rectangular tilings of a {@code cells}x{@code cells} region. */
+    private static TransformType[] rectFor(int cells) {
+        return switch (cells) {
+            case 4 -> new TransformType[] {DCT32_16, DCT16_32};
+            case 8 -> new TransformType[] {DCT64_32, DCT32_64};
+            case 16 -> new TransformType[] {DCT128_64, DCT64_128};
+            default -> new TransformType[] {DCT256_128, DCT128_256};
+        };
     }
 
     /**
-     * Quantises the 64x64 block in every channel into {@code s.q32}/{@code s.dc32}
-     * (reused at this scale — both are sized for the largest transform) and
-     * returns its rate estimate. Mirrors {@link #quantise32} one scale up: an 8x8
-     * low-frequency corner drawn from the DC image, the rest coded as high
-     * frequency.
+     * Quantises one square transform ({@code tt}, side 32–256 px) in every channel
+     * into {@code s.q32}/{@code s.dc32} — both sized for the largest transform —
+     * and returns its rate estimate. A (side/8)² low-frequency corner is drawn from
+     * the DC image, the rest coded as high frequency. General over the scale: the
+     * 32x32 arm is the 256x256 arm, four cells a side rather than thirty-two.
      */
-    private double quantise64(int by, int bx, int mul64, Scratch s) {
-        double cost = 64;   // its 8x8 LLF, matching quantise32's 4x4 = 16
-        float[] c64 = s.c32;   // MAX_DIM x MAX_DIM scratch, now 64x64
+    private double quantiseSquareBig(int by, int bx, TransformType tt, int mul, Scratch s) {
+        int px = tt.pixelWidth;         // square, so == pixelHeight
+        int side = tt.blockWidth;       // px/8: the LLF side and cells covered per side
+        int shift = Integer.numberOfTrailingZeros(side);
+        int mask = side - 1;
+        double cost = side * side;      // the LLF cell count
+        float[] coef = s.c32;
         float[] dqY = s.dqY;
         for (int ci = 0; ci < 3; ci++) {
             int c = Y_FIRST[ci];
             float cfl = cflFactor(c, by, bx);
-            for (int y = 0; y < 64; y++) {
+            for (int y = 0; y < px; y++) {
                 System.arraycopy(xyb[c], (y0 + by * 8 + y) * paddedWidth + bx * 8,
-                        s.block, y * 64, 64);
+                        s.block, y * px, px);
             }
-            Dct.forward2D(s.block, 0, 64, c64, 0, 64, 64, 64, s.s0, s.s1);
-            float sfc = baseSfc[c] / mul64;
-            float[] w64 = weightsOf[DCT64.parameterIndex][c];
+            Dct.forward2D(s.block, 0, px, coef, 0, px, px, px, s.s0, s.s1);
+            float sfc = baseSfc[c] / mul;
+            float[] wc = weightsOf[tt.parameterIndex][c];
             int[] q = s.q32[c];
-            for (int y = 0; y < 64; y++) {
-                for (int x = 0; x < 64; x++) {
-                    if (y < 8 && x < 8) {
+            for (int y = 0; y < px; y++) {
+                for (int x = 0; x < px; x++) {
+                    if (y < side && x < side) {
                         continue; // LLF comes from the DC image
                     }
-                    int j = y * 64 + x;
-                    float step = sfc * w64[x * 64 + y];
-                    q[j] = Math.round((c64[j] - cfl * dqY[j]) / step);
+                    int j = y * px + x;
+                    float step = sfc * wc[x * px + y];
+                    q[j] = Math.round((coef[j] - cfl * dqY[j]) / step);
                     if (c == 1) {
                         dqY[j] = q[j] * step;
                     }
                     cost += tokenCost(q[j]);
                 }
             }
-            // the DC entries that reproduce the true 8x8 LLF
-            for (int i = 0; i < 64; i++) {
-                s.llf[i] = c64[(i >> 3) * 64 + (i & 7)] / DCT64.llfScale[i];
+            // the DC entries that reproduce the true LLF corner
+            for (int i = 0; i < side * side; i++) {
+                s.llf[i] = coef[(i >> shift) * px + (i & mask)] / tt.llfScale[i];
             }
-            Dct.inverse2D(s.llf, 0, 8, s.dcT, 0, 8, 8, 8, s.s0, s.s1, false);
-            for (int i = 0; i < 64; i++) {
+            Dct.inverse2D(s.llf, 0, side, s.dcT, 0, side, side, side, s.s0, s.s1, false);
+            for (int i = 0; i < side * side; i++) {
                 s.dc32[c][i] = Math.round(s.dcT[i] / scaledDequant[c]);
             }
         }
         return cost;
     }
 
-    /** Writes a decided 64x64 block over the sixty-four cells it covers. */
-    private void commit64(int by, int bx, int mul64, Scratch s) {
+    /** Writes a decided square block over the {@code (side)²} cells it covers. */
+    private void commitSquareBig(int by, int bx, TransformType tt, int mul, Scratch s) {
+        int side = tt.blockWidth;
+        int shift = Integer.numberOfTrailingZeros(side);
+        int mask = side - 1;
         int origin = by * w8 + bx;
-        for (int i = 0; i < 64; i++) {
-            int k = (by + (i >> 3)) * w8 + bx + (i & 7);
-            blockType[k] = (byte) (i == 0 ? DCT64.type : -2);
-            blockMul[k] = mul64;
-            for (int c = 0; c < 3; c++) {
-                dcQuant[c][k] = s.dc32[c][i];
-            }
-        }
-        for (int c = 0; c < 3; c++) {
-            hfQuant[c][origin] = s.q32[c].clone();
-        }
-    }
-
-    /**
-     * Quantises the 32x32 block in every channel into {@code s.q32}/{@code s.dc32}
-     * (not yet committed) and returns its rate estimate. Mirrors {@link #chooseDct16}'s
-     * 16x16 arm at the next scale: a 4x4 low-frequency corner drawn from the DC
-     * image, the rest coded as high frequency.
-     */
-    private double quantise32(int by, int bx, int mul32, Scratch s) {
-        double cost = 16;
-        float[] c32 = s.c32;
-        float[] dqY = s.dqY;
-        for (int ci = 0; ci < 3; ci++) {
-            int c = Y_FIRST[ci];
-            float cfl = cflFactor(c, by, bx);
-            for (int y = 0; y < 32; y++) {
-                System.arraycopy(xyb[c], (y0 + by * 8 + y) * paddedWidth + bx * 8,
-                        s.block, y * 32, 32);
-            }
-            Dct.forward2D(s.block, 0, 32, c32, 0, 32, 32, 32, s.s0, s.s1);
-            float sfc = baseSfc[c] / mul32;
-            float[] w32 = weightsOf[DCT32.parameterIndex][c];
-            int[] q = s.q32[c];
-            for (int y = 0; y < 32; y++) {
-                for (int x = 0; x < 32; x++) {
-                    if (y < 4 && x < 4) {
-                        continue; // LLF comes from the DC image
-                    }
-                    int j = y * 32 + x;
-                    float step = sfc * w32[x * 32 + y];
-                    q[j] = Math.round((c32[j] - cfl * dqY[j]) / step);
-                    if (c == 1) {
-                        dqY[j] = q[j] * step;
-                    }
-                    cost += tokenCost(q[j]);
-                }
-            }
-            // the DC entries that reproduce the true 4x4 LLF
-            for (int i = 0; i < 16; i++) {
-                s.llf[i] = c32[(i >> 2) * 32 + (i & 3)] / DCT32.llfScale[i];
-            }
-            Dct.inverse2D(s.llf, 0, 4, s.dcT, 0, 4, 4, 4, s.s0, s.s1, false);
-            for (int i = 0; i < 16; i++) {
-                s.dc32[c][i] = Math.round(s.dcT[i] / scaledDequant[c]);
-            }
-        }
-        return cost;
-    }
-
-    /** Writes a decided 32x32 block over the sixteen cells it covers. */
-    private void commit32(int by, int bx, int mul32, Scratch s) {
-        int origin = by * w8 + bx;
-        for (int i = 0; i < 16; i++) {
-            int k = (by + (i >> 2)) * w8 + bx + (i & 3);
-            blockType[k] = (byte) (i == 0 ? DCT32.type : -2);
-            blockMul[k] = mul32;
+        for (int i = 0; i < side * side; i++) {
+            int k = (by + (i >> shift)) * w8 + bx + (i & mask);
+            blockType[k] = (byte) (i == 0 ? tt.type : -2);
+            blockMul[k] = mul;
             for (int c = 0; c < 3; c++) {
                 dcQuant[c][k] = s.dc32[c][i];
             }
@@ -1526,7 +1470,18 @@ public final class VarDctEncoder {
     private float[][] reconstructWindow() {
         int rows = h8 << 3;
         float[][] out = new float[3][paddedWidth * rows];
-        int maxN = MAX_DIM * MAX_DIM;
+        // Size the per-row scratch to the largest block actually present, not to
+        // MAX_DIM: with the 64–256 scales in the type table MAX_DIM is 256, and a
+        // per-row 256x256 buffer allocated for every row of an image that holds no
+        // block bigger than 32 would be pure churn.
+        int maxDim = 8;
+        for (byte t : blockType) {
+            if (t >= 0) {
+                TransformType tt = TransformType.byType(t);
+                maxDim = Math.max(maxDim, Math.max(tt.pixelHeight, tt.pixelWidth));
+            }
+        }
+        int maxN = maxDim * maxDim;
         sweep(h8, by -> {
             float[] deq = new float[maxN];
             float[] dqY = new float[maxN];

@@ -179,7 +179,10 @@ cropped result; reference, LF and preview frames always decode whole.
   8×16/16×8/32×16/16×32, the 64-scale 64×32/32×64 (and the 64×64 square, kept but
   usually out-competed), the small DCT2/DCT4/DCT4×8/DCT8×4, and the four AFV blocks
   chosen by a rate estimate — the 32×32 taking a smooth region (a sky, a road) in
-  one block, the 64-scale a very large smooth expanse at coarser distances, the
+  one block, the 64-scale a very large smooth expanse at coarser distances (the
+  128/256 scales are implemented one recursion deeper but off by default — the
+  token-count estimate cannot price a block that big, so they only bloat; enable
+  with `-Djxl.enc.dct128`/`dct256`), the
   rectangular blocks content that runs one way (a horizon, a wall's
   edge), the small transforms the piecewise-flat blocks a plain DCT8 rings on (a
   hard edge, a text stroke), AFV the diagonal corners, about
