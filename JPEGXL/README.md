@@ -1,7 +1,7 @@
 # JPEG XL for Java — pure-Java reader and writer
 
-A from-scratch, dependency-free JPEG XL (ISO/IEC 18181) decoder and encoder
-for JDK 25, exposed through the standard Java ImageIO API.
+A from-scratch, dependency-free JPEG XL ([ISO/IEC 18181](https://jpeg.org/jpegxl/))
+decoder and encoder for JDK 25, exposed through the standard Java ImageIO API.
 
 - **Pure Java** — no native code, no third-party dependencies (JUnit is
   test-scope only).
@@ -24,10 +24,13 @@ for JDK 25, exposed through the standard Java ImageIO API.
   never holds the image, lossless or lossy, integer or float: gigapixel encodes
   run in a heap sized by the image's width, not its area.
 - **Validated against libjxl** — the test suite cross-checks against the
-  reference implementation (cjxl/djxl and ffmpeg's libjxl) plus the official
-  conformance test corpus: lossless paths bit-exactly (including 32-bit
+  reference implementation (cjxl/djxl and ffmpeg's libjxl) plus the
+  [official conformance corpus](https://github.com/libjxl/conformance)
+  (**40/40 cases, no deviations**): lossless paths bit-exactly (including 32-bit
   floats), lossy paths within a small tolerance (this decoder uses exact math
-  where libjxl uses fast approximations).
+  where libjxl uses fast approximations). See **[COMPLIANCE.md](COMPLIANCE.md)**
+  for the full feature-by-feature mapping to the standard and the evidence
+  behind each claim.
 
 ## Usage
 
@@ -80,7 +83,8 @@ cropped result; reference, LF and preview frames always decode whole.
 
 ## What is implemented
 
-**Decoder** — both coding modes of ISO/IEC 18181-1:
+**Decoder** — both coding modes of
+[ISO/IEC 18181-1](https://www.iso.org/standard/85066.html):
 
 - **VarDCT (lossy)**: all 27 transform types (DCT2 through DCT256, AFV,
   Hornuss and the rectangular DCTs), dequantisation with all weight
@@ -359,6 +363,31 @@ byte[] jpeg = JpegReconstructor.reconstruct(jxl);  // the original, byte-exact
 - 256×256 groups with a proper TOC, so large images decode in bounded memory
   and are parallelisable by conforming decoders.
 - Greyscale/RGB, 1–31 bits, any number of extra channels (lossless).
+
+## Specification & compliance
+
+JPEG XL is the multi-part **ISO/IEC 18181** standard:
+
+- Part 1 — [Core coding system](https://www.iso.org/standard/85066.html) — the
+  codestream and decoding process implemented here.
+- Part 2 — [File format](https://www.iso.org/standard/80617.html) — container,
+  metadata boxes, JPEG bitstream reconstruction.
+- Part 3 — [Conformance testing](https://www.iso.org/standard/87633.html) — the
+  corpus the decoder is validated against.
+- Part 4 — [Reference software](https://www.iso.org/standard/80619.html) —
+  libjxl, used for cross-validation.
+
+See also the [JPEG XL homepage](https://jpeg.org/jpegxl/), the
+[workplan & specifications](https://jpeg.org/jpegxl/workplan.html), the
+[JPEG XL White Paper](https://ds.jpeg.org/whitepapers/jpeg-xl-whitepaper.pdf),
+the [reference implementation](https://github.com/libjxl/libjxl), and the
+[conformance corpus](https://github.com/libjxl/conformance).
+
+The decoder passes the complete official conformance corpus (**40/40 cases, no
+deviations**), and every encoder path round-trips through libjxl. A full
+feature-by-feature mapping to the standard — with the test evidence behind each
+claim, and an honest list of scope boundaries — is in
+**[COMPLIANCE.md](COMPLIANCE.md)**.
 
 ## Building
 
