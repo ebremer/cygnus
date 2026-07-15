@@ -98,6 +98,12 @@ public final class JXLImageReader extends ImageReader {
         boolean alpha = meta.alphaChannelIndex() >= 0;
         boolean deep = meta.bitDepth.bitsPerSample > 8;
         List<ImageTypeSpecifier> types = new ArrayList<>();
+        // a demosaiced CFA mosaic comes out as eight-bit RGB, not the grey it is coded as
+        if (grey && cfaChannelIndex(meta) >= 0 && !meta.bitDepth.floatingPoint
+                && !Boolean.getBoolean("jxl.skipCfa")) {
+            types.add(ImageTypeSpecifier.createFromBufferedImageType(BufferedImage.TYPE_INT_RGB));
+            return types.iterator();
+        }
         if (grey && !alpha) {
             types.add(ImageTypeSpecifier.createFromBufferedImageType(
                     deep ? BufferedImage.TYPE_USHORT_GRAY : BufferedImage.TYPE_BYTE_GRAY));
@@ -270,6 +276,16 @@ public final class JXLImageReader extends ImageReader {
         // A CMYK image is rendered to RGB for display; the black channel is
         // multiplied into the colour planes (see renderCmyk). This is a viewer
         // step, not the normative decode, so it lives here and not in JxlDecoder.
+        // A single-channel image tagged with a colour-filter-array channel is a
+        // Bayer mosaic: its grey plane is demosaiced to RGB for display, the
+        // interpolation a raw-sensor viewer performs. The format tags the image
+        // but records no Bayer pattern, so RGGB (the common one) is assumed; this
+        // is a viewer step, and -Djxl.skipCfa turns it off, leaving the raw mosaic.
+        if (grey && cfaChannelIndex(meta) >= 0 && !meta.bitDepth.floatingPoint
+                && !Boolean.getBoolean("jxl.skipCfa")) {
+            return demosaicToImage(frame.channels[0], w, h, meta.bitDepth.bitsPerSample);
+        }
+
         int blackIdx = grey ? -1 : cmykBlackIndex(meta);
         if (blackIdx >= 0 && !Boolean.getBoolean("jxl.skipCmyk")) {
             frame = renderCmyk(frame, numColour, blackIdx, meta);
@@ -355,6 +371,39 @@ public final class JXLImageReader extends ImageReader {
             }
         }
         return -1;
+    }
+
+    /** The extra-channel index of the first colour-filter-array plane, or -1. */
+    private static int cfaChannelIndex(ImageMetadata meta) {
+        for (int i = 0; i < meta.numExtraChannels(); i++) {
+            if (meta.extraChannels.get(i).type
+                    == com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo.TYPE_CFA) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Demosaics a Bayer mosaic plane to an eight-bit RGB image. The pattern is
+     * taken to be RGGB — the format records none — and the samples are scaled from
+     * their own depth. See {@link com.ebremer.cygnus.jpegxl.color.CfaDemosaic}.
+     */
+    private static BufferedImage demosaicToImage(int[] mosaic, int w, int h, int bits) {
+        int[][] rgb = com.ebremer.cygnus.jpegxl.color.CfaDemosaic.demosaic(
+                mosaic, w, h, com.ebremer.cygnus.jpegxl.color.CfaDemosaic.Pattern.RGGB);
+        int max = (1 << bits) - 1;
+        int identity = bits == 8 ? 1 : 0;
+        BufferedImage img = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        int[] argb = new int[w * h];
+        for (int i = 0; i < w * h; i++) {
+            int r = scaleTo8(rgb[0][i], bits, max, identity);
+            int g = scaleTo8(rgb[1][i], bits, max, identity);
+            int b = scaleTo8(rgb[2][i], bits, max, identity);
+            argb[i] = 0xff000000 | (r << 16) | (g << 8) | b;
+        }
+        img.setRGB(0, 0, w, h, argb, 0, w);
+        return img;
     }
 
     /**

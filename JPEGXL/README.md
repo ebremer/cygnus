@@ -120,7 +120,10 @@ cropped result; reference, LF and preview frames always decode whole.
   RGB for display through ImageIO — the black multiplied back into the colour
   planes, so a scanned document's text shows rather than dropping out to white
   paper; the raw four channels remain available (`JxlDecoder.decode`, or
-  `-Djxl.skipCmyk`).
+  `-Djxl.skipCmyk`). A single-channel image tagged with a colour-filter-array
+  channel is a Bayer mosaic, and the reader demosaics it to RGB (`CfaDemosaic`,
+  bilinear, RGGB assumed — the format records no pattern; `-Djxl.skipCfa` leaves
+  the raw mosaic).
 - **YCbCr frames**: recompressed-JPEG streams (`cjxl in.jpg`) decode to
   pixels, including 4:2:0/4:2:2 chroma subsampling with the JPEG-style
   triangle upsampling.
