@@ -280,8 +280,9 @@ class FfmpegInteropTest {
         }
         // libjxl reads the same spline dictionary and draws the same curve; the few
         // levels of residual are the spline renderer's own float precision (the
-        // draw math, shared decoder code, not the encode), confined to the curve —
-        // the bulk of the frame matches to a rounding step.
+        // draw math and the non-linear XYB->RGB of the added colour, shared decoder
+        // code, not the encode), confined to the curve — the bulk of the frame
+        // matches to a rounding step.
         assertTrue(worst <= 8, "our spline decode disagrees with libjxl: worst " + worst);
         assertTrue(off < (long) w * h * 3 / 20, "residual should be confined to the curve: " + off);
     }
