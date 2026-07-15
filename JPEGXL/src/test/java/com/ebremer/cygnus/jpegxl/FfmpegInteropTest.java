@@ -404,6 +404,59 @@ class FfmpegInteropTest {
         assertTrue(worst <= 2, "our DCT2/DCT4 decode disagrees with libjxl: worst " + worst);
     }
 
+    /**
+     * A patch-coded image — a reference frame of glyphs stamped over the canvas —
+     * is a valid two-frame codestream libjxl reads back exactly, reference-only
+     * frame, {@code REPLACE} stamps and all.
+     */
+    @Test
+    void ffmpegDecodesOurPatches() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 256;
+        int h = 256;
+        int[][] rgb = new int[3][w * h];
+        for (int i = 0; i < w * h; i++) {
+            rgb[0][i] = 240;
+            rgb[1][i] = 240;
+            rgb[2][i] = 245;
+        }
+        int[][] glyphs = new int[4][16 * 16 * 3];
+        java.util.Random r = new java.util.Random(1);
+        for (int g = 0; g < 4; g++) {
+            for (int k = 0; k < glyphs[g].length; k++) {
+                glyphs[g][k] = r.nextInt(256);
+            }
+        }
+        for (int ty = 0; ty < h / 16; ty++) {
+            for (int tx = 0; tx < w / 16; tx++) {
+                if (((tx + ty) % 4) != 0) {
+                    continue;
+                }
+                int g = (tx * 3 + ty * 5) % 4;
+                for (int c = 0; c < 3; c++) {
+                    for (int y = 0; y < 16; y++) {
+                        for (int x = 0; x < 16; x++) {
+                            rgb[c][(ty * 16 + y) * w + tx * 16 + x] = glyphs[g][(c * 16 + y) * 16 + x];
+                        }
+                    }
+                }
+            }
+        }
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.JxlEncoder.encodeWithPatches(rgb, w, h, 8, false);
+        // confirm patches were actually used (a two-frame file), not the plain fallback
+        assertTrue(JxlDecoder.decode(jxl).frames.get(0).channels[0][0] == rgb[0][0]);
+
+        Path jxlFile = tempDir.resolve("patch.jxl");
+        Files.write(jxlFile, jxl);
+        Path rawFile = tempDir.resolve("patch.raw");
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+        for (int c = 0; c < 3; c++) {
+            assertArrayEquals(rgb[c], theirs[c], "libjxl must decode our patches exactly, channel " + c);
+        }
+    }
+
     /** Smooth gradients favour the weighted predictor. */
     @Test
     void ffmpegDecodesOurWeightedPredictorOutput() throws Exception {

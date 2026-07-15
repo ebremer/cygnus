@@ -123,6 +123,7 @@ public final class JxlEncoder {
     private boolean squeezed;    // the channel list has been squeezed
     private boolean prepared;
     private FrameParams frameParams; // set when this encoder writes one frame of many
+    private List<PatchDictWriter.Patch> patchDict; // set to stamp reference patches over this frame
     private final boolean xyb;   // lossy XYB-modular: colour coded as quantised XYB
     private final float[] lfDequant; // {X,Y,B} DC dequant steps when xyb, else null
 
@@ -636,6 +637,147 @@ public final class JxlEncoder {
             enc.writeFrame(out);
         }
         return out.toByteArray();
+    }
+
+    // --------------------------------------------------------------- patches
+
+    private static final int PATCH_TILE = 16;   // repeated-tile granularity
+    private static final int PATCH_MIN_REPEATS = 3;
+
+    /**
+     * Encodes losslessly, coding repeated tiles once. Screenshots and pages of
+     * text stamp the same glyph — a letter, a button, an icon — over and over; a
+     * tile that recurs is coded once into a reference frame and
+     * {@link com.ebremer.cygnus.jpegxl.features.PatchesDictionary REPLACE-stamped}
+     * at each site, the main frame carrying only the flattened background. It is
+     * lossless (the stamp copies the exact pixels) and it never loses: the plain
+     * encode is produced too and the smaller of the two returned, so photographs
+     * and other unrepetitive images fall straight through.
+     */
+    public static byte[] encodeWithPatches(int[][] planes, int width, int height, int bits,
+            boolean grey) throws IOException {
+        byte[] plain = encode(planes, width, height, bits, grey, false, false);
+        try {
+            byte[] patched = tryPatches(planes, width, height, bits, grey);
+            if (patched != null && patched.length < plain.length) {
+                return patched;
+            }
+        } catch (RuntimeException e) {
+            // detection or assembly hit an edge case: the plain encode still stands
+        }
+        return plain;
+    }
+
+    private static byte[] tryPatches(int[][] planes, int width, int height, int bits,
+            boolean grey) throws IOException {
+        int numColour = grey ? 1 : 3;
+        int t = PATCH_TILE;
+        int cols = width / t;
+        int rows = height / t;
+        if (cols == 0 || rows == 0) {
+            return null;
+        }
+        // group whole tiles by their exact contents
+        java.util.Map<String, List<int[]>> groups = new java.util.HashMap<>();
+        for (int tr = 0; tr < rows; tr++) {
+            for (int tc = 0; tc < cols; tc++) {
+                String key = tileKey(planes, numColour, width, tc * t, tr * t, t);
+                groups.computeIfAbsent(key, k -> new ArrayList<>()).add(new int[] {tc, tr});
+            }
+        }
+        // glyphs are the tiles that recur enough to pay; place them in a reference
+        // atlas that fills the top of a full-canvas frame, the rest left blank
+        int atlasCap = cols * rows;   // how many glyph slots fit in the canvas grid
+        int[][] atlas = new int[numColour][width * height];
+        int[][] blanked = new int[numColour][];
+        for (int c = 0; c < numColour; c++) {
+            blanked[c] = planes[c].clone();
+        }
+        List<PatchDictWriter.Patch> patchList = new ArrayList<>();
+        int glyph = 0;
+        // per-channel image mean to flatten the blanked tiles into
+        int[] mean = new int[numColour];
+        for (int c = 0; c < numColour; c++) {
+            long sum = 0;
+            for (int v : planes[c]) {
+                sum += v;
+            }
+            mean[c] = (int) (sum / planes[c].length);
+        }
+        for (List<int[]> group : groups.values()) {
+            if (group.size() < PATCH_MIN_REPEATS || glyph >= atlasCap) {
+                continue;
+            }
+            int ax = (glyph % cols) * t;
+            int ay = (glyph / cols) * t;
+            int[] first = group.get(0);
+            // copy the glyph into the atlas
+            for (int c = 0; c < numColour; c++) {
+                for (int y = 0; y < t; y++) {
+                    System.arraycopy(planes[c], (first[1] * t + y) * width + first[0] * t,
+                            atlas[c], (ay + y) * width + ax, t);
+                }
+            }
+            int[][] positions = new int[group.size()][2];
+            for (int i = 0; i < group.size(); i++) {
+                int[] tile = group.get(i);
+                positions[i][0] = tile[0] * t;
+                positions[i][1] = tile[1] * t;
+                for (int c = 0; c < numColour; c++) {
+                    for (int y = 0; y < t; y++) {
+                        java.util.Arrays.fill(blanked[c], (tile[1] * t + y) * width + tile[0] * t,
+                                (tile[1] * t + y) * width + tile[0] * t + t, mean[c]);
+                    }
+                }
+            }
+            patchList.add(new PatchDictWriter.Patch(0, ax, ay, t, t, positions));
+            glyph++;
+        }
+        if (patchList.isEmpty()) {
+            return null;
+        }
+
+        BitDepth depth = BitDepth.of(bits);
+        ImageMetadata meta = buildMetadata(depth, grey, List.of());
+        BitWriter out = new BitWriter();
+        out.write(0xff, 8);
+        out.write(0x0a, 8);
+        new SizeHeader(width, height).write(out);
+        meta.write(out);
+
+        // reference frame: the glyph atlas, kept in slot 1 as a pure patch source
+        // (reference-only, so it is not composited into the displayed image)
+        JxlEncoder ref = new JxlEncoder(atlas, width, height, depth, grey, List.of(), false);
+        FrameParams rp = FrameParams.single(0, 1, width, height);
+        rp.frameType = 2;        // reference-only, saved to slot 0 (duration 0)
+        rp.saveAsReference = 0;
+        rp.saveBeforeCT = true;  // patches copy from the pre-colour-transform snapshot
+        rp.isLast = false;
+        ref.frameParams = rp;
+        ref.writeFrame(out);
+
+        // main frame: the flattened background, patches stamping the glyphs back
+        JxlEncoder main = new JxlEncoder(blanked, width, height, depth, grey, List.of(), false);
+        FrameParams mp = FrameParams.single(0, 1, width, height);
+        mp.isLast = true;
+        main.frameParams = mp;
+        main.patchDict = patchList;
+        main.writeFrame(out);
+        return out.toByteArray();
+    }
+
+    private static String tileKey(int[][] planes, int numColour, int width,
+            int x0, int y0, int t) {
+        StringBuilder sb = new StringBuilder(numColour * t * t);
+        for (int c = 0; c < numColour; c++) {
+            for (int y = 0; y < t; y++) {
+                int row = (y0 + y) * width + x0;
+                for (int x = 0; x < t; x++) {
+                    sb.append((char) planes[c][row + x]);
+                }
+            }
+        }
+        return sb.toString();
     }
 
     /** Whether a frame needs the running canvas beneath it (it is a patch or a blend). */
@@ -1276,6 +1418,11 @@ public final class JxlEncoder {
         boolean defaultDequant = lfDequant == null
                 || (lfDequant[0] == 1f / 4096f && lfDequant[1] == 1f / 512f
                         && lfDequant[2] == 1f / 256f);
+        if (patchDict != null) {
+            // patches head LfGlobal (before splines, noise and the dequant), and
+            // the frame flag is set to match — see writeFrameHeader
+            PatchDictWriter.write(lfGlobal, patchDict, extras.size());
+        }
         lfGlobal.writeBool(defaultDequant); // LfChannelDequantization.all_default
         if (!defaultDequant) {
             for (int i = 0; i < 3; i++) {
@@ -1330,6 +1477,7 @@ public final class JxlEncoder {
         fp.numExtra = extras.size();
         fp.numPasses = numPasses;
         fp.xyb = xyb;
+        fp.patches = patchDict != null;
         writeFrameHeader(out, fp);
 
         out.writeBool(false); // TOC not permuted
@@ -1569,6 +1717,9 @@ public final class JxlEncoder {
         int saveAsReference; // slot to keep this frame in (0 = keep none)
         boolean isLast = true;
         boolean xyb;         // XYB frame: the do_YCbCr bit is absent
+        boolean patches;     // frame stamps reference patches (FLAG_PATCHES)
+        int frameType;       // 0 regular, 2 reference-only (a pure patch source)
+        boolean saveBeforeCT; // save this frame before the colour transform
 
         static FrameParams single(int numExtra, int numPasses, int w, int h) {
             FrameParams p = new FrameParams();
@@ -1605,9 +1756,9 @@ public final class JxlEncoder {
     static void writeFrameHeader(BitWriter out, FrameParams p) {
         out.zeroPadToByte();
         out.writeBool(false);        // !all_default
-        out.write(0, 2);             // frame_type: regular
+        out.write(p.frameType, 2);   // frame_type: 0 regular, 2 reference-only
         out.writeBool(true);         // encoding: modular
-        out.writeU64(0);             // flags
+        out.writeU64(p.patches ? com.ebremer.cygnus.jpegxl.codestream.FrameHeader.FLAG_PATCHES : 0);
         if (!p.xyb) {
             out.writeBool(false);    // do_YCbCr (absent when xyb_encoded)
         }
@@ -1618,7 +1769,9 @@ public final class JxlEncoder {
             out.write(0, 2);         // extra channel upsampling
         }
         out.write(GROUP_SIZE_SHIFT_BITS, 2); // group_size_shift = 8
-        if (p.numPasses == 1) {
+        if (p.frameType == 2) {
+            // a reference-only frame codes no passes info
+        } else if (p.numPasses == 1) {
             out.write(0, 2);         // num_passes = 1 (U32 selector 0)
         } else if (p.numPasses == PROGRESSIVE_PASSES) {
             out.write(2, 2);         // num_passes = 3
@@ -1646,31 +1799,36 @@ public final class JxlEncoder {
             out.writeBool(false);    // have_crop
             fullFrame = true;
         }
-        // per-channel blend info: colour (index -1), then each extra channel
-        for (int i = -1; i < p.numExtra; i++) {
-            out.writeU32Auto(p.blendMode, 0, 0, 1, 0, 2, 0, 3, 2);
-            if (p.numExtra > 0 && p.blendMode == BLEND_BLEND) {
-                out.writeU32Auto(p.blendAlphaChannel, 0, 0, 1, 0, 2, 0, 3, 3);
-                out.write(0, 1);     // clamp = false
+        // blend info, animation and is_last belong only to regular (and
+        // skip-progressive) frames; a reference-only frame carries none of them
+        // and is implicitly not the last
+        if (p.frameType == 0 || p.frameType == 3) {
+            // per-channel blend info: colour (index -1), then each extra channel
+            for (int i = -1; i < p.numExtra; i++) {
+                out.writeU32Auto(p.blendMode, 0, 0, 1, 0, 2, 0, 3, 2);
+                if (p.numExtra > 0 && p.blendMode == BLEND_BLEND) {
+                    out.writeU32Auto(p.blendAlphaChannel, 0, 0, 1, 0, 2, 0, 3, 3);
+                    out.write(0, 1);     // clamp = false
+                }
+                if (!fullFrame || p.blendMode != BLEND_REPLACE) {
+                    out.write(p.blendSource, 2);
+                }
             }
-            if (!fullFrame || p.blendMode != BLEND_REPLACE) {
-                out.write(p.blendSource, 2);
+            if (p.haveAnimation) {
+                writeDuration(out, p.duration);
             }
+            out.writeBool(p.isLast);
         }
-        if (p.haveAnimation) {
-            writeDuration(out, p.duration);
-        }
-        out.writeBool(p.isLast);
         if (!p.isLast) {
             out.write(p.saveAsReference, 2);
         }
         // save_before_colour_transform is only coded for the frames that could
         // be kept; we never keep before-transform (there is no colour transform),
         // so a false here matches what the decoder derives for the rest
-        boolean codesSaveBefore = fullFrame && p.blendMode == BLEND_REPLACE
-                && (p.duration == 0 || p.saveAsReference != 0) && !p.isLast;
+        boolean codesSaveBefore = p.frameType == 2 || (fullFrame && p.blendMode == BLEND_REPLACE
+                && (p.duration == 0 || p.saveAsReference != 0) && !p.isLast);
         if (codesSaveBefore) {
-            out.writeBool(false);    // save after colour transform
+            out.writeBool(p.saveBeforeCT);
         }
         out.write(0, 2);             // name length (U32 selector 0)
         out.writeBool(false);        // RestorationFilter not all_default

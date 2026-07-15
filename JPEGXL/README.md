@@ -169,6 +169,12 @@ cropped result; reference, LF and preview frames always decode whole.
   codes (package-merge, RFC 7932 simple and complex descriptions), optional
   embedded previews. On the conformance photographs the output runs a few
   percent over `cjxl -e7` (`bike` +5.3%, `bicycles` +3.4%, `cafe` −1.5%).
+- **Patches** (`encodeWithPatches`): a screenshot's repeated tiles — the same
+  glyph, button or icon stamped over and over — are coded once into a
+  reference-only frame and REPLACE-stamped at each site, the main frame carrying
+  only the flattened background (~12% smaller on a synthetic screenshot, libjxl
+  reads it back exactly). Lossless, and it never grows an image: the plain encode
+  is produced alongside and the smaller returned.
 - **Lossy (VarDCT) mode**: XYB colour, square 8×8/16×16/32×32, rectangular
   8×16/16×8/32×16/16×32, and the small DCT2/DCT4 blocks chosen by a rate estimate
   — the 32×32 taking a smooth region (a sky, a road) in one block, the rectangular
