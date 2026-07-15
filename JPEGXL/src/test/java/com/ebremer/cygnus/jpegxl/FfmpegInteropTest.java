@@ -154,6 +154,51 @@ class FfmpegInteropTest {
     }
 
     /**
+     * A large smooth gradient at a coarse distance draws the 64-scale blocks (the
+     * 64x32/32x64 rectangular pair); libjxl must reconstruct those big blocks the
+     * same way we do. This is the first content on which the encoder emits
+     * transform types above 17, so it is the real check that they are signalled
+     * correctly.
+     */
+    @Test
+    void ffmpegAgreesOnOurDct64Output() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 512;
+        int h = 512;
+        int[][] src = new int[3][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                int v = 30 + (x + y) * 180 / (w + h - 2);
+                src[0][i] = v;
+                src[1][i] = Math.min(255, v + 8);
+                src[2][i] = Math.max(0, v - 8);
+            }
+        }
+        long before = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(19)
+                + com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(20);
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encode(
+                deepCopy(src), w, h, 8, false, false, false, 3.0f);
+        long fired = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(19)
+                + com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(20) - before;
+        assertTrue(fired > 0, "large smooth gradient at distance 3 should draw 64-scale blocks");
+        Path jxlFile = tempDir.resolve("ours-dct64.jxl");
+        Path rawFile = tempDir.resolve("ffdec-dct64.raw");
+        Files.write(jxlFile, jxl);
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+        int[][] ours = JxlDecoder.decode(jxl).frames.get(0).channels;
+        int worst = 0;
+        for (int p = 0; p < 3; p++) {
+            for (int i = 0; i < w * h; i++) {
+                worst = Math.max(worst, Math.abs(ours[p][i] - theirs[p][i]));
+            }
+        }
+        assertTrue(worst <= 2, "our 64-scale decode disagrees with libjxl: worst " + worst);
+    }
+
+    /**
      * The perceptual rate control ({@code encodeToTarget}) tunes the quantiser but
      * still emits an ordinary VarDCT codestream; libjxl reconstructs it exactly as
      * we do. A smooth gradient is used because that is where the loop works

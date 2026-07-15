@@ -176,9 +176,11 @@ cropped result; reference, LF and preview frames always decode whole.
   reads it back exactly). Lossless, and it never grows an image: the plain encode
   is produced alongside and the smaller returned.
 - **Lossy (VarDCT) mode**: XYB colour, square 8×8/16×16/32×32, rectangular
-  8×16/16×8/32×16/16×32, the small DCT2/DCT4/DCT4×8/DCT8×4, and the four AFV blocks
+  8×16/16×8/32×16/16×32, the 64-scale 64×32/32×64 (and the 64×64 square, kept but
+  usually out-competed), the small DCT2/DCT4/DCT4×8/DCT8×4, and the four AFV blocks
   chosen by a rate estimate — the 32×32 taking a smooth region (a sky, a road) in
-  one block, the rectangular blocks content that runs one way (a horizon, a wall's
+  one block, the 64-scale a very large smooth expanse at coarser distances, the
+  rectangular blocks content that runs one way (a horizon, a wall's
   edge), the small transforms the piecewise-flat blocks a plain DCT8 rings on (a
   hard edge, a text stroke), AFV the diagonal corners, about
   10% smaller on a directional photograph (`bike`) — activity-masked adaptive
