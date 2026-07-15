@@ -163,10 +163,10 @@ cropped result; reference, LF and preview frames always decode whole.
   embedded previews. On the conformance photographs the output runs a few
   percent over `cjxl -e7` (`bike` +5.3%, `bicycles` +3.4%, `cafe` −1.5%).
 - **Lossy (VarDCT) mode**: XYB colour, square 8×8/16×16/32×32 and rectangular
-  8×16/16×8 DCT blocks chosen by a rate estimate — the 32×32 taking a smooth
-  region (a sky, a road) in one block, the rectangular pair taking content that
-  runs one way (a horizon, a wall's edge), about 7–8% smaller on a directional
-  photograph (`bike`) — activity-masked adaptive quantisation, default
+  8×16/16×8/32×16/16×32 DCT blocks chosen by a rate estimate — the 32×32 taking a
+  smooth region (a sky, a road) in one block, the rectangular blocks taking
+  content that runs one way (a horizon, a wall's edge), about 10% smaller on a
+  directional photograph (`bike`) — activity-masked adaptive quantisation, default
   quantisation tables with a distance-controlled quantiser
   (`VarDctEncoder.encode(rgb, w, h, distance)`), and an iterative
   rate-control mode (`encodeToTarget`) that refines the quantiser against

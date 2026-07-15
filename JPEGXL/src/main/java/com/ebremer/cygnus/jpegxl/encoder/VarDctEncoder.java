@@ -84,6 +84,8 @@ public final class VarDctEncoder {
     private static final TransformType DCT32 = TransformType.byType(5);
     private static final TransformType DCT8_16 = TransformType.byType(7);  // 8 tall, 16 wide
     private static final TransformType DCT16_8 = TransformType.byType(6);  // 16 tall, 8 wide
+    private static final TransformType DCT32_16 = TransformType.byType(10); // 32 tall, 16 wide
+    private static final TransformType DCT16_32 = TransformType.byType(11); // 16 tall, 32 wide
     /** The largest transform this encoder chooses, and its LLF (side/8) squared. */
     private static final int MAX_DIM = 32;
     private static final int MAX_LLF = (MAX_DIM / 8) * (MAX_DIM / 8);
@@ -100,6 +102,9 @@ public final class VarDctEncoder {
     /** Count of rectangular blocks committed, for tests to confirm the path fires. */
     public static final java.util.concurrent.atomic.AtomicLong RECT_BLOCKS =
             new java.util.concurrent.atomic.AtomicLong();
+    /** Per-transform-type origin counts across encodes, for tests to confirm which fire. */
+    public static final java.util.concurrent.atomic.AtomicLongArray TYPE_HIST =
+            new java.util.concurrent.atomic.AtomicLongArray(27);
     /**
      * How much cheaper the 32x32 transform must estimate before it replaces the
      * sixteen-cell subdivision. Below 1 by a margin because the rate estimate is
@@ -627,12 +632,16 @@ public final class VarDctEncoder {
             }
         });
         chooseSharpness();
-        // count the rectangular blocks that survived into the final layout (a
-        // committed one can still be overwritten by a 32x32); tests read this.
+        // count the rectangular blocks (any of the six types, 6..11) that survived
+        // into the final layout — a committed one can still be overwritten by a
+        // larger block; tests read this.
         long rect = 0;
         for (byte t : blockType) {
-            if (t == DCT8_16.type || t == DCT16_8.type) {
-                rect++;
+            if (t >= 0) {
+                TYPE_HIST.incrementAndGet(t);
+                if (t >= DCT16_8.type && t <= DCT16_32.type) {
+                    rect++;
+                }
             }
         }
         RECT_BLOCKS.addAndGet(rect);
@@ -772,36 +781,92 @@ public final class VarDctEncoder {
         return cost;
     }
 
+    /** A rectangular tiling of a square cell region: one transform, its blocks' data and rate. */
+    private static final class RectTiling {
+        final TransformType tt;
+        final int[] mul;         // per block
+        final int[][][] q;       // [block][channel] coefficients
+        final int[][][] dc;      // [block][channel][covered cell]
+        final double cost;
+
+        RectTiling(TransformType tt, int[] mul, int[][][] q, int[][][] dc, double cost) {
+            this.tt = tt;
+            this.mul = mul;
+            this.q = q;
+            this.dc = dc;
+            this.cost = cost;
+        }
+    }
+
     /**
-     * Quantises the two rectangular blocks that tile the 16x16 area — vertical
-     * (two 16x8 side by side) or horizontal (two 8x16 stacked) — and commits
-     * them over the four cells, origin cells carrying the type and the other two
-     * marked covered.
+     * The cheapest rectangular tiling of an {@code s}x{@code s} cell region among
+     * {@code options}. Each option tiles the region with blocks {@code blockHeight
+     * x blockWidth} cells in size, laid out {@code s/blockHeight} by
+     * {@code s/blockWidth}; nothing is committed. Returns {@code null} only for an
+     * empty option list.
      */
-    private void commitRect(int by, int bx, TransformType tt, int[] mul,
-            int[][][] q, int[][][] dc) {
-        boolean vertical = tt.isVertical();  // 16x8: two columns; else 8x16: two rows
-        for (int b = 0; b < 2; b++) {
-            int oBy = vertical ? by : by + b;
-            int oBx = vertical ? bx + b : bx;
-            int origin = oBy * w8 + oBx;
-            blockType[origin] = (byte) tt.type;
-            blockMul[origin] = mul[b];
-            for (int c = 0; c < 3; c++) {
-                hfQuant[c][origin] = q[b][c];
+    private RectTiling bestRectTiling(int regionBy, int regionBx, int s,
+            TransformType[] options, float[] factor, Scratch sc) {
+        RectTiling best = null;
+        for (TransformType tt : options) {
+            int bH = tt.blockHeight;
+            int bW = tt.blockWidth;
+            int rows = s / bH;
+            int cols = s / bW;
+            int n = rows * cols;
+            int[] mul = new int[n];
+            int[][][] q = new int[n][3][];
+            int[][][] dc = new int[n][3][bH * bW];
+            double cost = 8.0 * n;   // a per-block base, matching the square arms
+            int b = 0;
+            for (int br = 0; br < rows; br++) {
+                for (int bc = 0; bc < cols; bc++) {
+                    int cBy = regionBy + br * bH;
+                    int cBx = regionBx + bc * bW;
+                    float f = 0;
+                    for (int iy = 0; iy < bH; iy++) {
+                        for (int ix = 0; ix < bW; ix++) {
+                            f += factor[(cBy + iy) * w8 + cBx + ix];
+                        }
+                    }
+                    mul[b] = clampMul(Math.round(hfMul * f / (bH * bW)));
+                    cost += quantiseRect(cBy, cBx, tt, mul[b], sc, q[b], dc[b]);
+                    b++;
+                }
             }
-            // the block's two covered cells and their DC entries
-            for (int i = 0; i < 2; i++) {
-                int cBy = vertical ? oBy + i : oBy;
-                int cBx = vertical ? oBx : oBx + i;
-                int cell = cBy * w8 + cBx;
-                if (cell != origin) {
-                    blockType[cell] = -2;
-                    blockMul[cell] = mul[b];
-                }
+            if (best == null || cost < best.cost) {
+                best = new RectTiling(tt, mul, q, dc, cost);
+            }
+        }
+        return best;
+    }
+
+    /** Commits a rectangular tiling over its region: origin cells carry the type, the rest are covered. */
+    private void commitRectTiling(int regionBy, int regionBx, int s, RectTiling t) {
+        int bH = t.tt.blockHeight;
+        int bW = t.tt.blockWidth;
+        int rows = s / bH;
+        int cols = s / bW;
+        int b = 0;
+        for (int br = 0; br < rows; br++) {
+            for (int bc = 0; bc < cols; bc++) {
+                int oBy = regionBy + br * bH;
+                int oBx = regionBx + bc * bW;
+                int origin = oBy * w8 + oBx;
                 for (int c = 0; c < 3; c++) {
-                    dcQuant[c][cell] = dc[b][c][i];
+                    hfQuant[c][origin] = t.q[b][c];
                 }
+                for (int iy = 0; iy < bH; iy++) {
+                    for (int ix = 0; ix < bW; ix++) {
+                        int cell = (oBy + iy) * w8 + oBx + ix;
+                        blockType[cell] = (iy == 0 && ix == 0) ? (byte) t.tt.type : -2;
+                        blockMul[cell] = t.mul[b];
+                        for (int c = 0; c < 3; c++) {
+                            dcQuant[c][cell] = t.dc[b][c][iy * bW + ix];
+                        }
+                    }
+                }
+                b++;
             }
         }
     }
@@ -918,39 +983,13 @@ public final class VarDctEncoder {
             }
         }
 
-        // ---- rectangular pair where it clearly beats the four 8x8s
+        // ---- rectangular pair (two 16x8 or two 8x16) where it clearly beats the 8x8s
         if (!NO_RECT) {
-            double bestRect = Double.MAX_VALUE;
-            TransformType bestTt = null;
-            int[] bestMul = null;
-            int[][][] bestQ = null;
-            int[][][] bestDc = null;
-            for (TransformType tt : new TransformType[] {DCT16_8, DCT8_16}) {
-                boolean vert = tt.isVertical();
-                int[] mul = new int[2];
-                int[][][] q = new int[2][3][];
-                int[][][] dc = new int[2][3][2];
-                double pairCost = 16;
-                for (int b = 0; b < 2; b++) {
-                    int cBy = vert ? by : by + b;
-                    int cBx = vert ? bx + b : bx;
-                    int cellA = cBy * w8 + cBx;
-                    int cellB = vert ? (cBy + 1) * w8 + cBx : cBy * w8 + cBx + 1;
-                    float f2 = (factor[cellA] + factor[cellB]) / 2;
-                    mul[b] = clampMul(Math.round(hfMul * f2));
-                    pairCost += quantiseRect(cBy, cBx, tt, mul[b], s, q[b], dc[b]);
-                }
-                if (pairCost < bestRect) {
-                    bestRect = pairCost;
-                    bestTt = tt;
-                    bestMul = mul;
-                    bestQ = q;
-                    bestDc = dc;
-                }
-            }
-            if (bestRect < RECT_GAIN * cost8) {
-                commitRect(by, bx, bestTt, bestMul, bestQ, bestDc);
-                return bestRect;
+            RectTiling rect = bestRectTiling(by, bx, 2,
+                    new TransformType[] {DCT16_8, DCT8_16}, factor, s);
+            if (rect.cost < RECT_GAIN * cost8) {
+                commitRectTiling(by, bx, 2, rect);
+                return rect.cost;
             }
         }
 
@@ -989,14 +1028,38 @@ public final class VarDctEncoder {
             }
         }
         f16 /= 16;
-        if (f16 < 0.95f) {
-            return; // busy: keep the subdivision
+
+        // candidates that replace the whole 32x32 subdivision, each needing a
+        // clear win over it. The square 32x32 is kept to smooth regions (its rate
+        // estimate misjudges busy ones); the rectangular tilings — two 32x16 or
+        // 16x32 — go wherever the content runs one way, which is often the busy
+        // areas the square block avoids. The four-block 32x8/8x32 tilings are not
+        // tried: measured across the photographs they never won a superblock, so
+        // they were only wasted forward transforms (the decoder still reads them).
+        double bestCost = Double.MAX_VALUE;
+        int mul32 = 0;
+        RectTiling bestRect = null;
+        if (f16 >= 0.95f) {
+            mul32 = clampMul(Math.round(hfMul * f16));
+            double cost32 = quantise32(by, bx, mul32, s);
+            if (cost32 < DCT32_GAIN * costSub) {
+                bestCost = cost32;
+            }
         }
-        int mul32 = clampMul(Math.round(hfMul * f16));
-        double cost32 = quantise32(by, bx, mul32, s);
-        if (cost32 < DCT32_GAIN * costSub) {
+        if (!NO_RECT) {
+            RectTiling half = bestRectTiling(by, bx, 4,
+                    new TransformType[] {DCT32_16, DCT16_32}, factor, s);
+            if (half.cost < RECT_GAIN * costSub && half.cost < bestCost) {
+                bestCost = half.cost;
+                bestRect = half;
+            }
+        }
+        if (bestRect != null) {
+            commitRectTiling(by, bx, 4, bestRect);
+        } else if (bestCost < Double.MAX_VALUE) {
             commit32(by, bx, mul32, s);
         }
+        // else keep the subdivision the four chooseDct16 calls already committed
     }
 
     /**

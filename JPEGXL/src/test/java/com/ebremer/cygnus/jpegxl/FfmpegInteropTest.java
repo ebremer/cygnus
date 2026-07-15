@@ -305,6 +305,55 @@ class FfmpegInteropTest {
         assertTrue(worst <= 2, "our rectangular-block decode disagrees with libjxl: worst " + worst);
     }
 
+    /**
+     * The larger 32x16 / 16x32 rectangular blocks — the 32x32-scale directional
+     * transforms — also reconstruct identically in libjxl, their 4x2 / 2x4
+     * low-frequency corners and flipped layouts included.
+     */
+    @Test
+    void ffmpegAgreesOnOurLargerRectangularBlocks() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 384;
+        int h = 320;
+        int[][] rgb = new int[3][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                // wide bands (~64px) so a 32-long block covers a smooth run
+                int v = x < w / 2
+                        ? (int) (128 + 110 * Math.sin(y * 0.09))
+                        : (int) (128 + 110 * Math.sin(x * 0.09));
+                v = Math.max(0, Math.min(255, v));
+                rgb[0][i] = v;
+                rgb[1][i] = Math.min(255, v + 15);
+                rgb[2][i] = 255 - v;
+            }
+        }
+        long tall = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(10);
+        long wide = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(11);
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encode(rgb, w, h, 1.5f);
+        long fired = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(10) - tall
+                + com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(11) - wide;
+        assertTrue(fired > 0, "the wide image should use 32-scale rectangular blocks");
+
+        JxlImage ours = JxlDecoder.decode(jxl);
+        int[][] od = ours.frames.get(0).channels;
+        Path jxlFile = tempDir.resolve("bigrect.jxl");
+        Files.write(jxlFile, jxl);
+        Path rawFile = tempDir.resolve("bigrect.raw");
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+
+        int worst = 0;
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < w * h; i++) {
+                worst = Math.max(worst, Math.abs(od[c][i] - theirs[c][i]));
+            }
+        }
+        assertTrue(worst <= 2, "our 32-scale rectangular decode disagrees with libjxl: worst " + worst);
+    }
+
     /** Smooth gradients favour the weighted predictor. */
     @Test
     void ffmpegDecodesOurWeightedPredictorOutput() throws Exception {

@@ -49,6 +49,41 @@ class RectangularDctTest {
         return sum / (3.0 * w * h);
     }
 
+    /** Wide bands (~64px) so a 32-long block covers a smooth run a 16 would split. */
+    private static int[][] wideDirectional(int w, int h) {
+        int[][] p = new int[3][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                int v = x < w / 2
+                        ? clamp((int) (128 + 110 * Math.sin(y * 0.09)))
+                        : clamp((int) (128 + 110 * Math.sin(x * 0.09)));
+                p[0][i] = v;
+                p[1][i] = clamp(v + 15);
+                p[2][i] = clamp(255 - v);
+            }
+        }
+        return p;
+    }
+
+    @Test
+    void largerRectanglesFireOnWideDirectionalContent() throws Exception {
+        int w = 384;
+        int h = 320;
+        int[][] src = wideDirectional(w, h);
+        long tall = VarDctEncoder.TYPE_HIST.get(10);   // 32x16
+        long wide = VarDctEncoder.TYPE_HIST.get(11);   // 16x32
+        byte[] jxl = VarDctEncoder.encode(src, w, h, 1.5f);
+        long firedTall = VarDctEncoder.TYPE_HIST.get(10) - tall;
+        long firedWide = VarDctEncoder.TYPE_HIST.get(11) - wide;
+
+        assertTrue(firedTall + firedWide > 0,
+                "wide directional content should draw 32-scale rectangular blocks");
+        JxlImage img = JxlDecoder.decode(jxl);
+        double mean = meanError(src, img.frames.get(0).channels, w, h);
+        assertTrue(mean < 3.5, "round-trip mean error too high: " + mean);
+    }
+
     @Test
     void rectangularBlocksFireOnDirectionalContent() throws Exception {
         int w = 256;
