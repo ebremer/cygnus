@@ -193,7 +193,8 @@ public final class VarDctEncoder {
     private int hfMul;
     private final float[] scaledDequant = new float[3];
     private final float[] baseSfc = new float[3];   // before the block multiplier
-    private final float[][][] weightsOf;            // [parameterIndex][channel]
+    private float[][][] weightsOf;                  // [parameterIndex][channel]
+    private float[][] customDct8Params;             // MODE_DCT bands for the DCT8 set, or null = default
     private final ImageMetadata opsin;              // defaults: opsin matrix, quant biases
     private final RestorationFilter filter = RestorationFilter.defaults();
     final int w8;                                   // cell columns, whole image
@@ -1645,6 +1646,26 @@ public final class VarDctEncoder {
     }
 
     /**
+     * Lossy colour quantised with a custom DCT8 matrix ({@code dct8Params} the
+     * per-channel MODE_DCT distance bands, {@link #setCustomDct8}). The header
+     * carries the matrix, so any decoder — ours or libjxl — rebuilds the image
+     * with it. Used to exercise the custom-matrix path; the automatic encoders
+     * keep the default matrix unless a tuned one is proven to pay.
+     */
+    public static byte[] encodeWithMatrix(int[][] planes, int width, int height, int bits,
+            boolean grey, float distance, float[][] dct8Params) throws IOException {
+        BitDepth depth = BitDepth.of(bits);
+        java.util.List<ExtraChannelInfo> extras = JxlEncoder.alphaOnly(depth, false, false);
+        checkInput(planes, width, height, depth, grey, extras);
+        VarDctEncoder enc = new VarDctEncoder(width, height, depth, grey, extras, distance);
+        enc.setCustomDct8(dct8Params);
+        int colour = grey ? 1 : 3;
+        enc.loadWhole(java.util.Arrays.copyOf(planes, colour));
+        enc.quantiseWindow(Double.NaN);
+        return enc.standalone(java.util.Arrays.copyOfRange(planes, colour, planes.length));
+    }
+
+    /**
      * Encodes floating-point samples lossily.
      *
      * <p>The float goes straight into the XYB conversion, and that is the whole
@@ -2344,12 +2365,70 @@ public final class VarDctEncoder {
     }
 
     void writeHfGlobalBits(BitWriter w, EntropyEncoder hfEnc, int numGroups, int numHfPresets) {
-        w.writeBool(true); // dequant matrices all default
+        writeDequantHeader(w);
         int bits = numGroups > 1 ? 32 - Integer.numberOfLeadingZeros(numGroups - 1) : 0;
         w.write(numHfPresets - 1, bits);
         // HfPass 0: no coded orders, then the coefficient code spec
         w.write(2, 2);     // used_orders selector 2 -> 0
         hfEnc.writeSpec(w);
+    }
+
+    /**
+     * The DequantMatrices header: {@code all_default} in the common case, or —
+     * when a custom DCT8 matrix has been set — every set the library default
+     * except the DCT8 one, which is coded as MODE_DCT distance bands. The same
+     * bits {@link #setCustomDct8} reads back to derive the encoder's own weights,
+     * so what is signalled and what was quantised with are one and the same.
+     */
+    private void writeDequantHeader(BitWriter w) {
+        if (customDct8Params == null) {
+            w.writeBool(true); // all default
+        } else {
+            writeCustomDequant(w, customDct8Params);
+        }
+    }
+
+    /** {@code !all_default}, MODE_DCT bands for the DCT8 set, library default for the rest. */
+    private static void writeCustomDequant(BitWriter w, float[][] params) {
+        w.writeBool(false);
+        for (int i = 0; i < 17; i++) {
+            if (i != 0) {
+                w.write(0, 3); // MODE_LIBRARY
+                continue;
+            }
+            w.write(DequantMatrices.MODE_DCT, 3);
+            int n = params[0].length;
+            w.write(n - 1, 4);
+            for (int c = 0; c < 3; c++) {
+                // readDctParams multiplies value[0] by 64, so pre-divide it
+                w.writeF16(params[c][0] / 64f);
+                for (int k = 1; k < n; k++) {
+                    w.writeF16(params[c][k]);
+                }
+            }
+        }
+    }
+
+    /**
+     * Quantise with a custom DCT8 matrix — {@code params[channel]} the MODE_DCT
+     * distance bands (band 0 is the DC weight, the rest the log-ratios the format
+     * calls {@code params}). The weights the encoder quantises with are read back
+     * from the very bits that will be written, through the real
+     * {@link DequantMatrices}, so an f16 rounding in the header cannot desync the
+     * two sides. Only the DCT8 set changes; every other transform keeps its default.
+     */
+    void setCustomDct8(float[][] params) {
+        try {
+            BitWriter tmp = new BitWriter();
+            writeCustomDequant(tmp, params);
+            // numHfPresets: 0 bits for a single group, so nothing more to write
+            tmp.zeroPadToByte();
+            DequantMatrices dm = new DequantMatrices(new Bits(tmp.toByteArray()), 1, 1, null);
+            this.weightsOf = dm.weights;
+            this.customDct8Params = params;
+        } catch (IOException e) {
+            throw new IllegalArgumentException("invalid custom DCT8 matrix", e);
+        }
     }
 
     static void writeFrameHeader(BitWriter out, boolean alpha) {

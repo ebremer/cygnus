@@ -206,6 +206,53 @@ class FfmpegInteropTest {
     }
 
     /**
+     * A custom (non-default) DCT8 quant matrix, signalled as MODE_DCT distance
+     * bands in the codestream, must be read and applied by libjxl exactly as we
+     * apply it — otherwise our decode and libjxl's would diverge on every 8x8
+     * block. Uses a deliberately non-default matrix (a flatter high-frequency
+     * falloff) so the header genuinely carries something.
+     */
+    @Test
+    void ffmpegAgreesOnOurCustomMatrixOutput() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 160;
+        int h = 128;
+        int[][] src = new int[3][w * h];
+        java.util.Random rnd = new java.util.Random(11);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                int base = 120 + (int) (60 * Math.sin(x * 0.3) * Math.cos(y * 0.2));
+                src[0][i] = Math.max(0, Math.min(255, base + rnd.nextInt(40) - 20));
+                src[1][i] = Math.max(0, Math.min(255, base + rnd.nextInt(40) - 20));
+                src[2][i] = Math.max(0, Math.min(255, base + rnd.nextInt(40) - 20));
+            }
+        }
+        // A flatter falloff than the DCT8 default (exponents halved).
+        float[][] matrix = {
+            {3150.0f, 0.0f, -0.2f, -0.2f, -0.2f, -1.0f},
+            {560.0f, 0.0f, -0.15f, -0.15f, -0.15f, -0.15f},
+            {512.0f, -1.0f, -0.5f, 0.0f, -0.5f, -1.0f},
+        };
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encodeWithMatrix(
+                deepCopy(src), w, h, 8, false, 1.0f, matrix);
+        Path jxlFile = tempDir.resolve("ours-custommatrix.jxl");
+        Path rawFile = tempDir.resolve("ffdec-custommatrix.raw");
+        Files.write(jxlFile, jxl);
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+        int[][] ours = JxlDecoder.decode(jxl).frames.get(0).channels;
+        int worst = 0;
+        for (int p = 0; p < 3; p++) {
+            for (int i = 0; i < w * h; i++) {
+                worst = Math.max(worst, Math.abs(ours[p][i] - theirs[p][i]));
+            }
+        }
+        assertTrue(worst <= 2, "our custom-matrix decode disagrees with libjxl: worst " + worst);
+    }
+
+    /**
      * A large smooth gradient at a coarse distance draws the 64-scale blocks (the
      * 64x32/32x64 rectangular pair); libjxl must reconstruct those big blocks the
      * same way we do. This is the first content on which the encoder emits

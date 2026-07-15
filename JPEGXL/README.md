@@ -188,7 +188,10 @@ cropped result; reference, LF and preview frames always decode whole.
   hard edge, a text stroke), AFV the diagonal corners, about
   10% smaller on a directional photograph (`bike`) — activity-masked adaptive
   quantisation, default quantisation tables with a distance-controlled quantiser
-  (`VarDctEncoder.encode(rgb, w, h, distance)`), and an iterative
+  (`VarDctEncoder.encode(rgb, w, h, distance)`) or a custom 8×8 quant table carried
+  in the frame (`encodeWithMatrix`, signalled and applied so libjxl rebuilds with
+  it — though the default table is kept automatically, as per-image retuning of it
+  was measured to barely move the rate), and an iterative
   rate-control mode (`encodeToTarget`) that refines the quantiser against a
   perceptual, Butteraugli-inspired error measure — opsin-domain, split into
   frequency bands, masking-aware, and pooled with a p-norm so a concentrated
