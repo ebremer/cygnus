@@ -123,6 +123,8 @@ public final class JxlEncoder {
     private boolean squeezed;    // the channel list has been squeezed
     private boolean prepared;
     private FrameParams frameParams; // set when this encoder writes one frame of many
+    private final boolean xyb;   // lossy XYB-modular: colour coded as quantised XYB
+    private final float[] lfDequant; // {X,Y,B} DC dequant steps when xyb, else null
 
     /**
      * Passes a progressive frame is cut into. Squeeze leaves channels at shifts
@@ -133,6 +135,11 @@ public final class JxlEncoder {
 
     private JxlEncoder(int[][] planes, int width, int height, BitDepth depth, boolean grey,
             List<ExtraChannelInfo> extras, boolean progressive) {
+        this(planes, width, height, depth, grey, extras, progressive, false, null);
+    }
+
+    private JxlEncoder(int[][] planes, int width, int height, BitDepth depth, boolean grey,
+            List<ExtraChannelInfo> extras, boolean progressive, boolean xyb, float[] lfDequant) {
         this.depth = depth;
         this.progressive = progressive;
         this.width = width;
@@ -142,6 +149,8 @@ public final class JxlEncoder {
         this.extras = List.copyOf(extras);
         this.colourCount = grey ? 1 : 3;
         this.numInput = colourCount + this.extras.size();
+        this.xyb = xyb;
+        this.lfDequant = lfDequant;
         checkPlanes(planes, width, height, grey, this.extras);
         this.input = new int[numInput][];
         for (int i = 0; i < numInput; i++) {
@@ -230,6 +239,63 @@ public final class JxlEncoder {
             throw new IllegalArgumentException("bits per sample must be in 1..31");
         }
         return new JxlEncoder(planes, width, height, BitDepth.of(bits), grey, extras, false).run();
+    }
+
+    /**
+     * Encodes an RGB image as a <em>lossy</em> modular codestream in XYB colour —
+     * the second lossy path beside {@link VarDctEncoder}, using the modular coder
+     * rather than the DCT.
+     *
+     * <p>The colour is turned to XYB, the perceptual space the format quantises
+     * in, and each channel is divided by a step before coding: a coarser step
+     * throws away more and codes smaller. There is no DCT and no block choice, so
+     * a photograph compresses less than through VarDCT at the same fidelity, but
+     * the coder is the plain modular one and the loss is a single, legible
+     * per-channel quantisation — which is exactly what suits flat, synthetic or
+     * near-lossless material. The channels are laid down as libjxl lays them —
+     * Y, X, and B carried as {@code B - Y} — and dequantised on the way back by
+     * the DC steps written in {@code LfChannelDequantization}.
+     *
+     * @param distance a fidelity dial: 1.0 is the format's default quantisation,
+     *                 larger is coarser (smaller file, more loss), smaller is
+     *                 finer. Clamped to a sane range.
+     */
+    public static byte[] encodeXyb(int[][] planes, int width, int height, int bits,
+            float distance) throws IOException {
+        return encodeXyb(planes, width, height, bits, distance, List.of());
+    }
+
+    /** {@link #encodeXyb} with an optional alpha plane, coded losslessly. */
+    public static byte[] encodeXyb(int[][] planes, int width, int height, int bits,
+            float distance, boolean alpha, boolean alphaAssociated) throws IOException {
+        return encodeXyb(planes, width, height, bits, distance,
+                alphaOnly(BitDepth.of(bits), alpha, alphaAssociated));
+    }
+
+    /** {@link #encodeXyb} carrying extra channels (alpha and the rest), coded losslessly. */
+    public static byte[] encodeXyb(int[][] planes, int width, int height, int bits,
+            float distance, List<ExtraChannelInfo> extras) throws IOException {
+        if (width <= 0 || height <= 0) {
+            throw new IllegalArgumentException("bad dimensions " + width + "x" + height);
+        }
+        if (bits < 1 || bits > 31) {
+            throw new IllegalArgumentException("bits per sample must be in 1..31");
+        }
+        float[] dq = xybDequant(distance);
+        return new JxlEncoder(planes, width, height, BitDepth.of(bits), false, extras,
+                false, true, dq).run();
+    }
+
+    /**
+     * The default XYB DC dequant steps, {@code {X, Y, B}}, scaled by
+     * {@code distance}. The defaults match the decoder's
+     * {@link com.ebremer.cygnus.jpegxl.decoder.JxlDecoder}
+     * {@code LfChannelDequantization} defaults, so distance 1.0 reproduces them
+     * and can be signalled with the all-default bit.
+     */
+    static float[] xybDequant(float distance) {
+        float d = Math.max(0.05f, Math.min(distance, 64f));
+        return new float[] {d / 4096f, d / 512f, d / 256f};
     }
 
     /**
@@ -429,7 +495,7 @@ public final class JxlEncoder {
         out.write(0xff, 8);
         out.write(0x0a, 8);
         new SizeHeader(width, height).write(out);
-        buildMetadata(depth, grey, extras).write(out);
+        buildMetadata(depth, grey, extras, xyb).write(out);
         writeFrame(out);
         return out.toByteArray();
     }
@@ -586,6 +652,19 @@ public final class JxlEncoder {
             return;
         }
         prepared = true;
+        if (xyb) {
+            // Colour is already decorrelated by the XYB transform and quantised in
+            // place, so there is no palette, no RCT and no squeeze — just the three
+            // XYB channels (plus any extra channels) coded as they stand.
+            prepareXyb();
+            for (int i = 0; i < numInput; i++) {
+                chans.add(chanOf(i));
+            }
+            for (int i = nbMeta; i < chans.size(); i++) {
+                choosePredictor(chans.get(i));
+            }
+            return;
+        }
         // A palette turns pixels into indices into a lookup, and an index has no
         // magnitude: the average of index 3 and index 9 is not a colour between
         // them. Squeeze is built on averaging, so the two do not go together.
@@ -626,6 +705,88 @@ public final class JxlEncoder {
         for (int i = nbMeta; i < chans.size(); i++) {
             choosePredictor(chans.get(i));
         }
+    }
+
+    /**
+     * Turns the RGB colour planes into the three quantised XYB channels the
+     * decoder expects — {@code input[0..2]} become Y, X and {@code B - Y} as
+     * integers. The forward opsin is the inverse of the decoder's (matrix scaled
+     * by {@code 255 / intensityTarget}, then the cube-root non-linearity); each
+     * XYB value is divided by its DC step and rounded, and B carries its Y
+     * subtracted off exactly as libjxl decorrelates it. The reconstruction is
+     * {@code X = step_x * Xi}, {@code Y = step_y * Yi}, {@code B = step_b * (Yi +
+     * (Bi - Yi))} — the inverse this rounds against.
+     */
+    private void prepareXyb() {
+        ImageMetadata opsin = new ImageMetadata(); // default opsin matrix and biases
+        float itScale = 255f / opsin.intensityTarget;
+        double[] inv = new double[9];
+        for (int i = 0; i < 9; i++) {
+            inv[i] = opsin.opsinInverse[i] * itScale;
+        }
+        double[] fwd = invert3x3(inv);
+        double[] bias = {opsin.opsinBias[0], opsin.opsinBias[1], opsin.opsinBias[2]};
+        double[] cbrtBias = {Math.cbrt(bias[0]), Math.cbrt(bias[1]), Math.cbrt(bias[2])};
+        double maxVal = (1L << bits) - 1;
+        int n = width * height;
+        int[] cY = new int[n];
+        int[] cX = new int[n];
+        int[] cB = new int[n];
+        int[] r0 = input[0];
+        int[] g0 = input[1];
+        int[] b0 = input[2];
+        for (int i = 0; i < n; i++) {
+            double r = srgbToLinear(sampleColour(r0[i], maxVal));
+            double g = srgbToLinear(sampleColour(g0[i], maxVal));
+            double b = srgbToLinear(sampleColour(b0[i], maxVal));
+            double mixL = fwd[0] * r + fwd[1] * g + fwd[2] * b;
+            double mixM = fwd[3] * r + fwd[4] * g + fwd[5] * b;
+            double mixS = fwd[6] * r + fwd[7] * g + fwd[8] * b;
+            double gl = Math.cbrt(mixL - bias[0]) + cbrtBias[0];
+            double gm = Math.cbrt(mixM - bias[1]) + cbrtBias[1];
+            double gs = Math.cbrt(mixS - bias[2]) + cbrtBias[2];
+            double x = (gl - gm) / 2;
+            double y = (gl + gm) / 2;
+            int yi = (int) Math.rint(y / lfDequant[1]);
+            int xi = (int) Math.rint(x / lfDequant[0]);
+            int bi = (int) Math.rint(gs / lfDequant[2]);
+            cY[i] = yi;
+            cX[i] = xi;
+            cB[i] = bi - yi;
+        }
+        input[0] = cY;
+        input[1] = cX;
+        input[2] = cB;
+    }
+
+    private double sampleColour(int sample, double maxVal) {
+        return depth.floatingPoint ? depth.sampleToFloat(sample) : sample / maxVal;
+    }
+
+    /** The inverse of the decoder's sign-mirrored sRGB transfer. */
+    private static double srgbToLinear(double v) {
+        if (v < 0) {
+            return -srgbToLinear(-v);
+        }
+        return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    }
+
+    private static double[] invert3x3(double[] m) {
+        double a = m[0];
+        double b = m[1];
+        double c = m[2];
+        double d = m[3];
+        double e = m[4];
+        double f = m[5];
+        double g = m[6];
+        double h = m[7];
+        double i = m[8];
+        double det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+        return new double[] {
+            (e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det,
+            (f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det,
+            (d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det,
+        };
     }
 
     /**
@@ -1110,7 +1271,17 @@ public final class JxlEncoder {
 
         // ---- LfGlobal section
         BitWriter lfGlobal = new BitWriter();
-        lfGlobal.writeBool(true); // LfChannelDequantization.all_default
+        // XYB DC dequant steps: the default set matches the decoder's, so distance
+        // 1.0 is signalled with the all-default bit; a scaled set is written out.
+        boolean defaultDequant = lfDequant == null
+                || (lfDequant[0] == 1f / 4096f && lfDequant[1] == 1f / 512f
+                        && lfDequant[2] == 1f / 256f);
+        lfGlobal.writeBool(defaultDequant); // LfChannelDequantization.all_default
+        if (!defaultDequant) {
+            for (int i = 0; i < 3; i++) {
+                lfGlobal.writeF16(lfDequant[i] * 128f);
+            }
+        }
         lfGlobal.writeBool(true); // global tree present
         treeEnc.writeSpec(lfGlobal);
         emitTree(tree, lfGlobal, treeEnc);
@@ -1158,6 +1329,7 @@ public final class JxlEncoder {
                 : FrameParams.single(extras.size(), numPasses, width, height);
         fp.numExtra = extras.size();
         fp.numPasses = numPasses;
+        fp.xyb = xyb;
         writeFrameHeader(out, fp);
 
         out.writeBool(false); // TOC not permuted
@@ -1343,6 +1515,11 @@ public final class JxlEncoder {
 
     static ImageMetadata buildMetadata(BitDepth depth, boolean grey,
             List<ExtraChannelInfo> extras) {
+        return buildMetadata(depth, grey, extras, false);
+    }
+
+    static ImageMetadata buildMetadata(BitDepth depth, boolean grey,
+            List<ExtraChannelInfo> extras, boolean xyb) {
         ImageMetadata meta = new ImageMetadata();
         meta.bitDepth = depth;
         // The buffer-width hint has to cover every channel, not just colour: an
@@ -1352,7 +1529,7 @@ public final class JxlEncoder {
             narrow &= !ec.bitDepth.floatingPoint && ec.bitDepth.bitsPerSample <= 12;
         }
         meta.modular16BitBuffers = narrow;
-        meta.xybEncoded = false;
+        meta.xybEncoded = xyb;
         meta.extraChannels.addAll(extras);
         ColourEncoding colour = new ColourEncoding();
         if (grey) {
@@ -1391,6 +1568,7 @@ public final class JxlEncoder {
         int blendAlphaChannel;
         int saveAsReference; // slot to keep this frame in (0 = keep none)
         boolean isLast = true;
+        boolean xyb;         // XYB frame: the do_YCbCr bit is absent
 
         static FrameParams single(int numExtra, int numPasses, int w, int h) {
             FrameParams p = new FrameParams();
@@ -1430,7 +1608,9 @@ public final class JxlEncoder {
         out.write(0, 2);             // frame_type: regular
         out.writeBool(true);         // encoding: modular
         out.writeU64(0);             // flags
-        out.writeBool(false);        // do_YCbCr (xyb_encoded is false)
+        if (!p.xyb) {
+            out.writeBool(false);    // do_YCbCr (absent when xyb_encoded)
+        }
         out.write(0, 2);             // log upsampling
         for (int i = 0; i < p.numExtra; i++) {
             // 0 here, so the channel's own dim_shift is the whole of its

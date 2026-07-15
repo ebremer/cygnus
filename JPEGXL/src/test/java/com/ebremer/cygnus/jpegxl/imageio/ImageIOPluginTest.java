@@ -168,6 +168,61 @@ class ImageIOPluginTest {
     }
 
     /**
+     * The {@code modular-lossy} compression type reaches the XYB-modular encoder:
+     * a valid file that reads back close to the source, coded in XYB rather than
+     * through the DCT.
+     */
+    @Test
+    void modularLossyTypeIsOfferedAndRoundTrips() throws IOException {
+        int w = 128;
+        int h = 96;
+        BufferedImage img = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int r = x * 255 / (w - 1);
+                int g = y * 255 / (h - 1);
+                int b = (x + y) * 255 / (w + h - 2);
+                img.setRGB(x, y, (r << 16) | (g << 8) | b);
+            }
+        }
+        javax.imageio.ImageWriter writer = ImageIO.getImageWritersByFormatName("jxl").next();
+        javax.imageio.ImageWriteParam param = writer.getDefaultWriteParam();
+        assertTrue(java.util.Arrays.asList(param.getCompressionTypes()).contains("modular-lossy"),
+                "modular-lossy should be an offered compression type");
+        param.setCompressionMode(javax.imageio.ImageWriteParam.MODE_EXPLICIT);
+        param.setCompressionType("modular-lossy");
+        param.setCompressionQuality(0.95f);
+
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        try (javax.imageio.stream.ImageOutputStream ios = ImageIO.createImageOutputStream(bos)) {
+            writer.setOutput(ios);
+            writer.write(null, new javax.imageio.IIOImage(img, null, null), param);
+        }
+        writer.dispose();
+        byte[] bytes = bos.toByteArray();
+
+        // the file is genuinely XYB-coded, not the lossless fallback
+        assertTrue(com.ebremer.cygnus.jpegxl.decoder.JxlDecoder.decode(bytes).metadata.xybEncoded,
+                "modular-lossy output should declare XYB encoding");
+
+        BufferedImage back = ImageIO.read(new ByteArrayInputStream(bytes));
+        assertEquals(w, back.getWidth());
+        assertEquals(h, back.getHeight());
+        double error = 0;
+        int n = 0;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                for (int b = 0; b < 3; b++) {
+                    error += Math.abs(img.getRaster().getSample(x, y, b)
+                            - back.getRaster().getSample(x, y, b));
+                    n++;
+                }
+            }
+        }
+        assertTrue(error / n < 2.0, "mean error too high for a smooth image: " + (error / n));
+    }
+
+    /**
      * The progressive knob is the standard one. A prefix of the bytes it produces
      * is the whole picture at low resolution, where a prefix of an ordinary file
      * is part of the picture and a lot of black.

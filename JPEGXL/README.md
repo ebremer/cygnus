@@ -15,8 +15,9 @@ for JDK 25, exposed through the standard Java ImageIO API.
   back) as a floating-point image.
 - **Direct APIs** — `JxlDecoder` returns per-channel sample planes (integer
   or float) with full metadata; `JxlEncoder` writes lossless codestreams
-  (integer or floating-point samples, optionally progressive) and
-  `VarDctEncoder` lossy ones, for non-ImageIO use.
+  (integer or floating-point samples, optionally progressive) and lossy
+  XYB-modular ones (`encodeXyb`), and `VarDctEncoder` writes lossy VarDCT, for
+  non-ImageIO use.
 - **Streaming input** — decoding from an `ImageInputStream` reads section
   ranges on demand instead of buffering the whole file.
 - **Streaming output** — `JxlStreamingEncoder` takes rows top to bottom and
@@ -169,6 +170,15 @@ cropped result; reference, LF and preview frames always decode whole.
   (`VarDctEncoder.encode(rgb, w, h, distance)`), and an iterative
   rate-control mode (`encodeToTarget`) that refines the quantiser against
   the achieved error; the ImageIO quality knob uses the latter.
+- **Lossy XYB-modular mode**: the second lossy path, coding the same XYB colour
+  through the modular coder instead of the DCT — `JxlEncoder.encodeXyb(rgb, w, h,
+  bits, distance)`, or the `modular-lossy` ImageIO compression type. Each XYB
+  channel is divided by a DC step and coded as it stands (Y, X, and B carried as
+  `B − Y`, the steps written in `LfChannelDequantization`); the frame is an
+  ordinary modular one with `xyb_encoded` set. libjxl decodes our output and
+  agrees with our inverse XYB to within rounding (worst 1). With no DCT it codes
+  a photograph far less tightly than VarDCT — it is the tool for flat, synthetic
+  or near-lossless material, and VarDCT stays the default lossy path.
 - **Extra channels**: as many as the image needs, of every type the format
   defines — alpha, depth, selection mask, CMYK black, CFA, thermal, spot
   colour, and the catch-all — each with its own name, its own bit depth

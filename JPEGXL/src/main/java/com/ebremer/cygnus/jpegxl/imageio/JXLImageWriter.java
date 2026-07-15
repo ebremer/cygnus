@@ -179,12 +179,17 @@ public final class JXLImageWriter extends ImageWriter {
         return new JXLWriteParam(getLocale());
     }
 
-    /** Write param exposing lossless (default) and lossy compression types. */
+    /**
+     * Write param exposing the compression types: {@code lossless} (default),
+     * {@code lossy} (VarDCT — the efficient lossy path), and
+     * {@code modular-lossy} (quantised XYB coded modular, the alternative lossy
+     * path for flat or near-lossless material).
+     */
     private static final class JXLWriteParam extends ImageWriteParam {
         JXLWriteParam(java.util.Locale locale) {
             super(locale);
             canWriteCompressed = true;
-            compressionTypes = new String[] {"lossless", "lossy"};
+            compressionTypes = new String[] {"lossless", "lossy", "modular-lossy"};
             compressionType = "lossless";
             compressionQuality = 1.0f;
             canWriteProgressive = true;
@@ -230,10 +235,12 @@ public final class JXLImageWriter extends ImageWriter {
         int numColour = grey ? 1 : 3;
         int bands = numColour + (alpha ? 1 : 0);
 
-        boolean lossy = param != null
-                && (param.getCompressionMode() == ImageWriteParam.MODE_EXPLICIT
-                        && ("lossy".equals(param.getCompressionType())
-                            || param.getCompressionQuality() < 1.0f));
+        boolean explicit = param != null
+                && param.getCompressionMode() == ImageWriteParam.MODE_EXPLICIT;
+        boolean modularLossy = explicit && "modular-lossy".equals(param.getCompressionType());
+        boolean lossy = !modularLossy && explicit
+                && ("lossy".equals(param.getCompressionType())
+                        || param.getCompressionQuality() < 1.0f);
         boolean progressive = param != null
                 && param.getProgressiveMode() == ImageWriteParam.MODE_DEFAULT;
 
@@ -245,7 +252,12 @@ public final class JXLImageWriter extends ImageWriter {
 
         IntFrame f = toIntFrame(buffered, grey, alpha, numColour, bands);
         byte[] encoded;
-        if (lossy && f.bits <= 16) {
+        if (modularLossy && !grey && f.bits <= 16) {
+            // quantised XYB coded modular — the alternative lossy path; a grey
+            // image has no XYB to code, so it falls through to lossless below
+            encoded = JxlEncoder.encodeXyb(f.planes, f.w, f.h, f.bits,
+                    distanceOf(param), alpha, false);
+        } else if (lossy && f.bits <= 16) {
             encoded = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encodeToTarget(
                     f.planes, f.w, f.h, f.bits, grey, alpha, false, distanceOf(param));
         } else if (progressive) {

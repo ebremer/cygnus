@@ -224,6 +224,39 @@ class FfmpegInteropTest {
         assertTrue(mean < 3, "our ICC display is far from libjxl's: mean " + mean);
     }
 
+    /**
+     * Our lossy XYB-modular output is a valid codestream libjxl reads, and our
+     * inverse XYB agrees with its own to within rounding — the whole quantise,
+     * decorrelate ({@code B - Y}) and dequantise round-trip lands on the same
+     * pixels the reference does.
+     */
+    @Test
+    void ffmpegDecodesOurXybModular() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 160;
+        int h = 120;
+        int[][] rgb = TestImages.mixed(w, h, 3, 8, 20260715L);
+        byte[] jxl = JxlEncoder.encodeXyb(rgb, w, h, 8, 1.0f);
+        JxlImage ours = JxlDecoder.decode(jxl);
+        assertTrue(ours.metadata.xybEncoded, "our file should declare XYB");
+
+        Path jxlFile = tempDir.resolve("xybmod.jxl");
+        Files.write(jxlFile, jxl);
+        Path rawFile = tempDir.resolve("xybmod.raw");
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+        int[][] od = ours.frames.get(0).channels;
+
+        int worst = 0;
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < w * h; i++) {
+                worst = Math.max(worst, Math.abs(od[c][i] - theirs[c][i]));
+            }
+        }
+        assertTrue(worst <= 2, "our XYB-modular decode disagrees with libjxl: worst " + worst);
+    }
+
     /** Smooth gradients favour the weighted predictor. */
     @Test
     void ffmpegDecodesOurWeightedPredictorOutput() throws Exception {
