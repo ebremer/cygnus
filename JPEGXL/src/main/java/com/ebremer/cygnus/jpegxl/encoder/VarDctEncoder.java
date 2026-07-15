@@ -188,6 +188,9 @@ public final class VarDctEncoder {
     private final boolean grey;
     private final java.util.List<ExtraChannelInfo> extras;
     private float[] noiseLut;      // 8-point photon-noise strengths, or null for no noise
+    private boolean animated;      // this frame is one of an animation (carries a duration)
+    private long animDuration;     // ticks this frame shows for
+    private boolean animLast = true; // whether this is the animation's final frame
     private final int globalScale;
     private final float distance;   // the requested distance, gates the largest blocks
     private int hfMul;
@@ -1696,6 +1699,61 @@ public final class VarDctEncoder {
     }
 
     /**
+     * A lossy (VarDCT) animation: a sequence of full-canvas frames, each coded
+     * through the quantiser and shown for its own duration, at {@code
+     * tpsNumerator/tpsDenominator} ticks per second, looping {@code numLoops} times
+     * (0 = forever). Where {@link JxlEncoder#encodeAnimation} keeps every frame
+     * lossless, this trades exactness for size — the natural choice for video-like
+     * content. Only full-frame {@code REPLACE} frames (each an independent picture);
+     * the crop and blend compositing the lossless path offers, and extra channels,
+     * are not carried here.
+     */
+    public static byte[] encodeVarDctAnimation(java.util.List<JxlEncoder.AnimationFrame> frames,
+            int width, int height, int bits, boolean grey, float distance,
+            int tpsNumerator, int tpsDenominator, long numLoops) throws IOException {
+        if (frames.isEmpty()) {
+            throw new IllegalArgumentException("an animation needs at least one frame");
+        }
+        if (tpsNumerator <= 0 || tpsDenominator <= 0) {
+            throw new IllegalArgumentException("ticks per second must be positive");
+        }
+        BitDepth depth = BitDepth.of(bits);
+        java.util.List<ExtraChannelInfo> extras = JxlEncoder.alphaOnly(depth, false, false);
+        ImageMetadata meta = JxlEncoder.buildMetadata(depth, grey, extras);
+        meta.xybEncoded = true;
+        meta.haveAnimation = true;
+        meta.animTpsNumerator = tpsNumerator;
+        meta.animTpsDenominator = tpsDenominator;
+        meta.animNumLoops = numLoops;
+
+        BitWriter out = new BitWriter();
+        out.write(0xff, 8);
+        out.write(0x0a, 8);
+        new SizeHeader(width, height).write(out);
+        meta.write(out);
+
+        int colour = grey ? 1 : 3;
+        int n = frames.size();
+        for (int i = 0; i < n; i++) {
+            JxlEncoder.AnimationFrame f = frames.get(i);
+            if (f.width != width || f.height != height || f.x0 != 0 || f.y0 != 0
+                    || f.blendMode != JxlEncoder.BLEND_REPLACE) {
+                throw new IllegalArgumentException(
+                        "lossy animation supports only full-frame REPLACE frames");
+            }
+            checkInput(f.planes, width, height, depth, grey, extras);
+            VarDctEncoder enc = new VarDctEncoder(width, height, depth, grey, extras, distance);
+            enc.animated = true;
+            enc.animDuration = f.durationTicks;
+            enc.animLast = i == n - 1;
+            enc.loadWhole(java.util.Arrays.copyOf(f.planes, colour));
+            enc.quantiseWindow(Double.NaN);
+            enc.writeFrame(out, new int[0][]);
+        }
+        return out.toByteArray();
+    }
+
+    /**
      * Encodes floating-point samples lossily.
      *
      * <p>The float goes straight into the XYB conversion, and that is the whole
@@ -2037,7 +2095,8 @@ public final class VarDctEncoder {
             }
             one.zeroPadToByte();
             byte[] payload = one.toByteArray();
-            writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0));
+            writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0), null,
+                    animated, animDuration, animLast);
             out.writeBool(false); // TOC not permuted
             out.zeroPadToByte();
             writeTocEntry(out, payload.length);
@@ -2079,7 +2138,8 @@ public final class VarDctEncoder {
         }
 
         // ---- header + TOC + payload
-        writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0));
+        writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0), null,
+                animated, animDuration, animLast);
         out.writeBool(false); // TOC not permuted
         out.zeroPadToByte();
         writeTocEntry(out, lfGlobalBytes.length);
@@ -2610,6 +2670,17 @@ public final class VarDctEncoder {
      * passes (the last shift zero, not written) with no downsampling.
      */
     static void writeFrameHeader(BitWriter out, int numExtra, long flags, int[] shifts) {
+        writeFrameHeader(out, numExtra, flags, shifts, false, 0, true);
+    }
+
+    /**
+     * The full-frame REPLACE header, still or animated. Animated frames carry a
+     * {@code duration} and a real {@code isLast}; a still frame is the {@code
+     * animated=false, isLast=true} case, which writes exactly the bits the still
+     * path always did.
+     */
+    static void writeFrameHeader(BitWriter out, int numExtra, long flags, int[] shifts,
+            boolean animated, long duration, boolean isLast) {
         out.zeroPadToByte();
         out.writeBool(false);        // !all_default
         out.write(0, 2);             // frame_type: regular
@@ -2623,12 +2694,25 @@ public final class VarDctEncoder {
         out.write(2, 3);             // x_qm_scale = 2
         out.write(2, 3);             // b_qm_scale = 2
         writePasses(out, shifts);
-        out.writeBool(false);        // have_crop
+        out.writeBool(false);        // have_crop (full frame)
         int blendEntries = 1 + numExtra;
         for (int i = 0; i < blendEntries; i++) {
             out.write(0, 2);         // blend mode: replace (full frame -> no source)
         }
-        out.writeBool(true);         // is_last
+        if (animated) {
+            writeDuration(out, duration);
+        }
+        out.writeBool(isLast);
+        // full-frame REPLACE frames are independent — none is kept as a reference,
+        // so save_as_reference is 0 (written for every non-last frame). The
+        // before-colour-transform copy is coded only for a frame that could be kept,
+        // which a positive-duration REPLACE frame with save_as_reference 0 is not.
+        if (!isLast) {
+            out.write(0, 2);         // save_as_reference = 0
+        }
+        if (!isLast && duration == 0) {
+            out.writeBool(false);    // save_before_colour_transform
+        }
         out.write(0, 2);             // name length
         if (NO_FILTERS) {
             out.writeBool(false);    // RestorationFilter not all_default
@@ -2639,6 +2723,21 @@ public final class VarDctEncoder {
             out.writeBool(true);     // RestorationFilter all_default: gaborish + EPF
         }
         out.writeU64(0);             // frame header extensions
+    }
+
+    /** duration: sel 0 -> 0, sel 1 -> 1, sel 2 -> u(8), sel 3 -> u(32). */
+    private static void writeDuration(BitWriter out, long duration) {
+        if (duration == 0) {
+            out.write(0, 2);
+        } else if (duration == 1) {
+            out.write(1, 2);
+        } else if (duration < 256) {
+            out.write(2, 2);
+            out.write((int) duration, 8);
+        } else {
+            out.write(3, 2);
+            out.write((int) duration, 32);
+        }
     }
 
     /** The Passes bundle: {@code num_passes}, {@code num_ds}=0, then each pass's shift. */

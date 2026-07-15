@@ -259,6 +259,9 @@ cropped result; reference, LF and preview frames always decode whole.
   alpha (`AnimationFrame.blended`). Patches and blends use the reference-frame
   machinery, which the encoder manages itself. Lossless, any extra channels, and
   writable through the standard ImageIO sequence API (`writeToSequence`) as well.
+  For video-like content there is a lossy path too —
+  `VarDctEncoder.encodeVarDctAnimation` codes each frame through the quantiser at a
+  chosen distance instead of losslessly (full-canvas replace frames only).
 - **Streaming (chunked) encoding, lossless or lossy**: `JxlStreamingEncoder`
   consumes rows top to bottom and compresses each 256-row band of groups as it
   completes, so peak memory is one band plus the compressed sections — the image
