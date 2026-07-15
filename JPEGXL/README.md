@@ -127,6 +127,12 @@ cropped result; reference, LF and preview frames always decode whole.
 - Bare codestreams and ISOBMFF containers, animations (each visible frame is
   an ImageIO image index, with durations in the native metadata), preview
   frames (ImageIO thumbnails), alpha and other extra channels.
+- **Codestream level enforcement**: a container's declared level (the `jxll`
+  box; 5 baseline, 10 extended) is checked against the decoded content, so a
+  file that claims the baseline but carries level-10 features — 32-bit samples,
+  a CMYK black channel, more than four extra channels, outsized dimensions — is
+  rejected rather than quietly returned. `JxlImage.codestreamLevel` reports the
+  declaration; a bare codestream declares nothing and is decoded as-is.
 - **Parallel decoding**: group sections, reconstruction, restoration filters
   and colour conversion fan out across cores.
 

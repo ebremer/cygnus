@@ -21,6 +21,14 @@ public final class JxlImage {
     /** Gain-map bundle from the container's {@code jhgm} box, when present. */
     public com.ebremer.cygnus.jpegxl.container.GainMap gainMap;
     /**
+     * The codestream level the file declared: 5 for a baseline file (and for a
+     * bare codestream, which declares nothing), 10 for one whose container
+     * carries a {@code jxll} box raising it. The content has been checked against
+     * this — a container that declared less than its content needs would have
+     * been rejected rather than returned.
+     */
+    public int codestreamLevel = com.ebremer.cygnus.jpegxl.codestream.CodestreamLevel.DEFAULT;
+    /**
      * Origin of the decoded frames in oriented image coordinates: (0, 0) for a
      * full decode; the requested rectangle's origin for a region decode, whose
      * frames then cover only that rectangle.

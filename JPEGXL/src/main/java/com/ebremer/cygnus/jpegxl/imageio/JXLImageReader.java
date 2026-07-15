@@ -46,7 +46,8 @@ public final class JXLImageReader extends ImageReader {
                 throw new IllegalStateException("no input set");
             }
             source = new com.ebremer.cygnus.jpegxl.io.CodestreamSource.StreamSource(
-                    stream, com.ebremer.cygnus.jpegxl.container.Container.scanSegments(stream));
+                    stream, com.ebremer.cygnus.jpegxl.container.Container.scanSegments(stream),
+                    com.ebremer.cygnus.jpegxl.container.Container.declaredLevel(stream));
         }
         return source;
     }

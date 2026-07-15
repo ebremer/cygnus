@@ -37,6 +37,117 @@ public final class Container {
         return true;
     }
 
+    /**
+     * The level a container declares: its {@code jxll} box value, or
+     * {@link com.ebremer.cygnus.jpegxl.codestream.CodestreamLevel#DEFAULT} (5)
+     * when it omits the box, since a level-5 file is written without one. A bare
+     * codestream is in no container and declares nothing, so it returns 0 — the
+     * sentinel that leaves it unconstrained: it is decoded whatever it holds
+     * rather than held to a baseline it never claimed.
+     */
+    public static int declaredLevel(byte[] data) throws IOException {
+        if (!isContainer(data)) {
+            return 0;
+        }
+        long off = SIGNATURE_BOX.length;
+        while (off + 8 <= data.length) {
+            long boxSize = u32be(data, (int) off);   // whole box, header included
+            int type = (int) u32be(data, (int) off + 4);
+            long payload = off + 8;
+            if (boxSize == 1) {
+                if (payload + 8 > data.length) {
+                    throw new IOException("truncated box header");
+                }
+                boxSize = ((long) u32be(data, (int) payload) << 32) | u32be(data, (int) payload + 4);
+                payload += 8;
+            } else if (boxSize == 0) {
+                boxSize = data.length - off;
+            }
+            if (type == 0x6a786c6c /* jxll */) {
+                if (payload >= data.length) {
+                    throw new IOException("empty jxll box");
+                }
+                return data[(int) payload] & 0xff;
+            }
+            if (type == 0x6a786c63 /* jxlc */ || type == 0x6a786c70 /* jxlp */) {
+                break; // the level box precedes the codestream; stop once past it
+            }
+            off += boxSize;
+        }
+        return com.ebremer.cygnus.jpegxl.codestream.CodestreamLevel.DEFAULT;
+    }
+
+    /**
+     * {@link #declaredLevel(byte[])} over an {@link javax.imageio.stream.ImageInputStream},
+     * for the streaming decode path. Leaves the stream position where it found
+     * it, so the caller's own scan is undisturbed.
+     */
+    public static int declaredLevel(javax.imageio.stream.ImageInputStream in) throws IOException {
+        int noBox = com.ebremer.cygnus.jpegxl.codestream.CodestreamLevel.DEFAULT;
+        long mark = in.getStreamPosition();
+        try {
+            in.seek(0);
+            byte[] sig = new byte[SIGNATURE_BOX.length];
+            int got = in.read(sig);
+            if (got < sig.length || !java.util.Arrays.equals(sig, SIGNATURE_BOX)) {
+                return 0; // bare codestream: declares nothing, unconstrained
+            }
+            long off = SIGNATURE_BOX.length;
+            long length = in.length();
+            while (length < 0 || off + 8 <= length) {
+                in.seek(off);
+                long boxSize;
+                int type;
+                try {
+                    boxSize = in.readUnsignedInt();
+                    type = in.readInt();
+                } catch (java.io.EOFException e) {
+                    break;
+                }
+                long payload = off + 8;
+                if (boxSize == 1) {
+                    boxSize = in.readLong();
+                    payload += 8;
+                } else if (boxSize == 0) {
+                    break; // extends to end; no level box follows a codestream box
+                }
+                if (type == 0x6a786c6c /* jxll */) {
+                    in.seek(payload);
+                    return in.readUnsignedByte();
+                }
+                if (type == 0x6a786c63 /* jxlc */ || type == 0x6a786c70 /* jxlp */) {
+                    break;
+                }
+                off += boxSize;
+            }
+            return noBox; // a container with no jxll box is level 5 by default
+        } finally {
+            in.seek(mark);
+        }
+    }
+
+    /**
+     * The level a codestream needs, read from its headers alone — the size and
+     * image-metadata clauses, no ICC reconstruction and no frames. What
+     * {@link #wrap} uses to decide whether to write a {@code jxll} box. Because
+     * it skips the ICC, an ICC profile past the level-5 size limit (4 MiB, which
+     * essentially never happens) is not seen here; the decoder's own check, run
+     * on fully reconstructed metadata, catches that case.
+     */
+    public static int requiredLevel(byte[] codestream) throws IOException {
+        com.ebremer.cygnus.jpegxl.io.Bits in =
+                new com.ebremer.cygnus.jpegxl.io.Bits(codestream);
+        if (in.u(16) != 0x0aff) {
+            throw new IOException("not a JPEG XL codestream");
+        }
+        com.ebremer.cygnus.jpegxl.codestream.SizeHeader size =
+                com.ebremer.cygnus.jpegxl.codestream.SizeHeader.read(in);
+        com.ebremer.cygnus.jpegxl.codestream.ImageMetadata meta =
+                com.ebremer.cygnus.jpegxl.codestream.ImageMetadata.read(in);
+        return com.ebremer.cygnus.jpegxl.codestream.CodestreamLevel.required(
+                meta, size.width, size.height);
+    }
+
     /** Extracts the raw codestream, concatenating jxlp fragments if needed. */
     public static byte[] extractCodestream(byte[] data) throws IOException {
         if (isBareCodestream(data)) {
@@ -271,6 +382,7 @@ public final class Container {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         out.writeBytes(SIGNATURE_BOX);
         out.writeBytes(FTYP_BOX);
+        writeLevelBox(out, codestream);
         if (exif != null) {
             byte[] payload = new byte[exif.length + 4]; // tiff header offset 0
             System.arraycopy(exif, 0, payload, 4, exif.length);
@@ -304,6 +416,27 @@ public final class Container {
         inner[3] = (byte) type.charAt(3);
         System.arraycopy(compressed, 0, inner, 4, compressed.length);
         writeBox(out, "brob", inner);
+    }
+
+    /**
+     * Writes the {@code jxll} box, right after {@code ftyp} and before any
+     * codestream, when the codestream needs level 10. Level 5 is the default and
+     * carries no box — so a plain image produces exactly the bytes it did before
+     * this existed, and only content that reaches past the baseline gains the
+     * one-byte declaration that says so.
+     */
+    private static void writeLevelBox(ByteArrayOutputStream out, byte[] codestream) {
+        int level;
+        try {
+            level = requiredLevel(codestream);
+        } catch (IOException e) {
+            return; // not a parseable codestream; leave the level unstated
+        }
+        if (level == com.ebremer.cygnus.jpegxl.codestream.CodestreamLevel.DEFAULT
+                || level == com.ebremer.cygnus.jpegxl.codestream.CodestreamLevel.INVALID) {
+            return;
+        }
+        writeBox(out, "jxll", new byte[] {(byte) level});
     }
 
     private static void writeBox(ByteArrayOutputStream out, String type, byte[] payload) {
@@ -341,6 +474,7 @@ public final class Container {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         out.writeBytes(SIGNATURE_BOX);
         out.writeBytes(FTYP_BOX);
+        writeLevelBox(out, codestream);
         long size = codestream.length + 8L;
         out.write((int) (size >>> 24));
         out.write((int) (size >>> 16));

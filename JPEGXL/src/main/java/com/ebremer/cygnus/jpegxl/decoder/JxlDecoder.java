@@ -80,7 +80,8 @@ public final class JxlDecoder {
     }
 
     public static JxlImage decode(byte[] file) throws IOException {
-        JxlImage image = decode(new CodestreamSource.ArraySource(Container.extractCodestream(file)));
+        JxlImage image = decode(new CodestreamSource.ArraySource(
+                Container.extractCodestream(file), Container.declaredLevel(file)));
         attachContainerMetadata(image, file);
         return image;
     }
@@ -100,7 +101,8 @@ public final class JxlDecoder {
      * anyone wants.
      */
     public static JxlImage decodePartial(byte[] file) throws IOException {
-        return decodeImpl(new CodestreamSource.ArraySource(Container.extractCodestream(file)),
+        return decodeImpl(new CodestreamSource.ArraySource(
+                Container.extractCodestream(file), Container.declaredLevel(file)),
                 null, false, false, true);
     }
 
@@ -117,18 +119,21 @@ public final class JxlDecoder {
 
     /** Decodes from an {@link javax.imageio.stream.ImageInputStream} without buffering the file. */
     public static JxlImage decode(javax.imageio.stream.ImageInputStream stream) throws IOException {
-        return decode(new CodestreamSource.StreamSource(stream, Container.scanSegments(stream)));
+        return decode(new CodestreamSource.StreamSource(
+                stream, Container.scanSegments(stream), Container.declaredLevel(stream)));
     }
 
     /** Decodes only {@code region}; see {@link #decode(CodestreamSource, java.awt.Rectangle)}. */
     public static JxlImage decode(byte[] file, java.awt.Rectangle region) throws IOException {
-        return decode(new CodestreamSource.ArraySource(Container.extractCodestream(file)), region);
+        return decode(new CodestreamSource.ArraySource(
+                Container.extractCodestream(file), Container.declaredLevel(file)), region);
     }
 
     /** Decodes only {@code region}; see {@link #decode(CodestreamSource, java.awt.Rectangle)}. */
     public static JxlImage decode(javax.imageio.stream.ImageInputStream stream,
             java.awt.Rectangle region) throws IOException {
-        return decode(new CodestreamSource.StreamSource(stream, Container.scanSegments(stream)),
+        return decode(new CodestreamSource.StreamSource(
+                stream, Container.scanSegments(stream), Container.declaredLevel(stream)),
                 region);
     }
 
@@ -170,8 +175,8 @@ public final class JxlDecoder {
      * exact deep integers.
      */
     public static JxlImage decodeToFloats(byte[] file) throws IOException {
-        JxlImage image = decodeToFloats(
-                new CodestreamSource.ArraySource(Container.extractCodestream(file)));
+        JxlImage image = decodeToFloats(new CodestreamSource.ArraySource(
+                Container.extractCodestream(file), Container.declaredLevel(file)));
         attachContainerMetadata(image, file);
         return image;
     }
@@ -458,6 +463,18 @@ public final class JxlDecoder {
         JxlImage image = new JxlImage(meta, orientedWidth, orientedHeight, frames,
                 oriented != null ? oriented.x : 0, oriented != null ? oriented.y : 0);
         image.preview = preview;
+        // Hold the file to the level it promised: a container that declared a
+        // level but carries content beyond it is malformed, and rejected here
+        // rather than returned. Done in the core so every entry point — bytes,
+        // stream, region — is covered. The dimension checks are symmetric in the
+        // two axes, so the oriented size serves. A bare codestream declares
+        // nothing (sentinel 0) and is decoded whatever it holds.
+        int declared = src.declaredLevel();
+        if (declared != 0) {
+            image.codestreamLevel = declared;
+            com.ebremer.cygnus.jpegxl.codestream.CodestreamLevel.enforce(
+                    declared, meta, orientedWidth, orientedHeight);
+        }
         return image;
     }
 

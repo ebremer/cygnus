@@ -29,12 +29,36 @@ public interface CodestreamSource {
         return out;
     }
 
+    /**
+     * The codestream level a container declared in its {@code jxll} box (5 or
+     * 10), or <b>0</b> when nothing declared one — a bare codestream, which is
+     * decoded whatever it holds rather than measured against a baseline it never
+     * claimed. The level travels with the source so the single decode path can
+     * hold a file to its promise whatever entry point (bytes, stream, region)
+     * reached it. Left as a plain int to keep this interface off the codestream
+     * package.
+     */
+    default int declaredLevel() {
+        return 0;
+    }
+
     /** A source over an in-memory codestream. */
     final class ArraySource implements CodestreamSource {
         private final byte[] data;
+        private final int level;
 
         public ArraySource(byte[] data) {
+            this(data, 0);
+        }
+
+        public ArraySource(byte[] data, int declaredLevel) {
             this.data = data;
+            this.level = declaredLevel;
+        }
+
+        @Override
+        public int declaredLevel() {
+            return level;
         }
 
         @Override
@@ -64,12 +88,23 @@ public interface CodestreamSource {
         private final ImageInputStream in;
         private final List<Segment> segments;
         private final long size;
+        private final int level;
 
         public StreamSource(ImageInputStream in, List<Segment> segments) {
+            this(in, segments, 0);
+        }
+
+        public StreamSource(ImageInputStream in, List<Segment> segments, int declaredLevel) {
             this.in = in;
             this.segments = segments;
+            this.level = declaredLevel;
             Segment last = segments.get(segments.size() - 1);
             this.size = last.csOffset() + last.length();
+        }
+
+        @Override
+        public int declaredLevel() {
+            return level;
         }
 
         @Override
