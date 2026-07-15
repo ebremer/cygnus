@@ -257,6 +257,54 @@ class FfmpegInteropTest {
         assertTrue(worst <= 2, "our XYB-modular decode disagrees with libjxl: worst " + worst);
     }
 
+    /**
+     * Our rectangular (8x16 / 16x8) VarDCT blocks reconstruct the same pixels in
+     * libjxl — the flipped coefficient layout, the shared 8x16 dequant matrix and
+     * the rectangular low-frequency corner all land where the reference reads
+     * them.
+     */
+    @Test
+    void ffmpegAgreesOnOurRectangularBlocks() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 256;
+        int h = 192;
+        int[][] rgb = new int[3][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                // directional: bands down one half, across the other
+                int v = x < w / 2
+                        ? (int) (128 + 120 * Math.sin(y * 0.20))
+                        : (int) (128 + 120 * Math.sin(x * 0.20));
+                v = Math.max(0, Math.min(255, v));
+                rgb[0][i] = v;
+                rgb[1][i] = Math.min(255, v + 20);
+                rgb[2][i] = 255 - v;
+            }
+        }
+        long before = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.RECT_BLOCKS.get();
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encode(rgb, w, h, 1.0f);
+        long fired = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.RECT_BLOCKS.get() - before;
+        assertTrue(fired > 0, "the directional image should use rectangular blocks");
+
+        JxlImage ours = JxlDecoder.decode(jxl);
+        int[][] od = ours.frames.get(0).channels;
+        Path jxlFile = tempDir.resolve("rect.jxl");
+        Files.write(jxlFile, jxl);
+        Path rawFile = tempDir.resolve("rect.raw");
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+
+        int worst = 0;
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < w * h; i++) {
+                worst = Math.max(worst, Math.abs(od[c][i] - theirs[c][i]));
+            }
+        }
+        assertTrue(worst <= 2, "our rectangular-block decode disagrees with libjxl: worst " + worst);
+    }
+
     /** Smooth gradients favour the weighted predictor. */
     @Test
     void ffmpegDecodesOurWeightedPredictorOutput() throws Exception {

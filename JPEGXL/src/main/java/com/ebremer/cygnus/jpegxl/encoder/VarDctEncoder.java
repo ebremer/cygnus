@@ -82,10 +82,24 @@ public final class VarDctEncoder {
     private static final TransformType DCT8 = TransformType.byType(0);
     private static final TransformType DCT16 = TransformType.byType(4);
     private static final TransformType DCT32 = TransformType.byType(5);
+    private static final TransformType DCT8_16 = TransformType.byType(7);  // 8 tall, 16 wide
+    private static final TransformType DCT16_8 = TransformType.byType(6);  // 16 tall, 8 wide
     /** The largest transform this encoder chooses, and its LLF (side/8) squared. */
     private static final int MAX_DIM = 32;
     private static final int MAX_LLF = (MAX_DIM / 8) * (MAX_DIM / 8);
     private static final boolean NO_DCT32 = Boolean.getBoolean("jxl.enc.nodct32");
+    private static final boolean NO_RECT = Boolean.getBoolean("jxl.enc.norect");
+    /**
+     * How much cheaper a rectangular transform must estimate before it replaces
+     * the four 8x8s it covers. Like {@link #DCT32_GAIN}, below 1 by a margin: the
+     * rate estimate is blind to the DC image a bigger block rearranges, so a
+     * rectangular block is taken only where it clearly pays — content smooth
+     * along one axis and detailed across the other, a horizon or a wall's edge.
+     */
+    private static final double RECT_GAIN = 0.90;
+    /** Count of rectangular blocks committed, for tests to confirm the path fires. */
+    public static final java.util.concurrent.atomic.AtomicLong RECT_BLOCKS =
+            new java.util.concurrent.atomic.AtomicLong();
     /**
      * How much cheaper the 32x32 transform must estimate before it replaces the
      * sixteen-cell subdivision. Below 1 by a margin because the rate estimate is
@@ -613,6 +627,15 @@ public final class VarDctEncoder {
             }
         });
         chooseSharpness();
+        // count the rectangular blocks that survived into the final layout (a
+        // committed one can still be overwritten by a 32x32); tests read this.
+        long rect = 0;
+        for (byte t : blockType) {
+            if (t == DCT8_16.type || t == DCT16_8.type) {
+                rect++;
+            }
+        }
+        RECT_BLOCKS.addAndGet(rect);
     }
 
     private static final int[] Y_FIRST = {1, 0, 2};
@@ -690,125 +713,258 @@ public final class VarDctEncoder {
     }
 
     /**
-     * Decides the aligned 16x16 area: the 16x16 transform if its rate is clearly
-     * lower than four 8x8s, otherwise the four 8x8s. Always commits, and returns
-     * the rate estimate of whatever it chose.
+     * Quantises one rectangular block (8x16 or 16x8) in every channel, luma
+     * first for chroma-from-luma, into {@code qOut} (coefficients in block-local
+     * layout) and {@code dcOut} (the DC entries reproducing its low-frequency
+     * corner, one per covered cell). Mirrors {@link #quantiseDct8} at the
+     * rectangular scale; returns its high-frequency rate estimate. Nothing is
+     * committed — the caller compares it against the alternatives first.
+     */
+    private double quantiseRect(int cellBy, int cellBx, TransformType tt, int mul,
+            Scratch s, int[][] qOut, int[][] dcOut) {
+        int ph = tt.pixelHeight;
+        int pw = tt.pixelWidth;
+        int bH = tt.blockHeight;
+        int bW = tt.blockWidth;
+        int mw = tt.matrixWidth;
+        boolean flip = tt.flip();
+        float[] block = s.block;
+        float[] coef = s.c32;   // >= 256, holds the ph x pw forward transform
+        float[] dqY = s.dqY;
+        double cost = 0;
+        for (int ci = 0; ci < 3; ci++) {
+            int c = Y_FIRST[ci];
+            float cfl = cflFactor(c, cellBy, cellBx);
+            for (int y = 0; y < ph; y++) {
+                System.arraycopy(xyb[c], (y0 + cellBy * 8 + y) * paddedWidth + cellBx * 8,
+                        block, y * pw, pw);
+            }
+            Dct.forward2D(block, 0, pw, coef, 0, pw, ph, pw, s.s0, s.s1);
+            float sfc = baseSfc[c] / mul;
+            float[] wc = weightsOf[tt.parameterIndex][c];
+            int[] q = new int[ph * pw];
+            for (int y = 0; y < ph; y++) {
+                for (int x = 0; x < pw; x++) {
+                    if (y < bH && x < bW) {
+                        continue; // LLF comes from the DC image
+                    }
+                    int j = y * pw + x;
+                    int wy = flip ? x : y;
+                    int wx = flip ? y : x;
+                    float step = sfc * wc[wy * mw + wx];
+                    q[j] = Math.round((coef[j] - cfl * dqY[j]) / step);
+                    if (c == 1) {
+                        dqY[j] = q[j] * step;
+                    }
+                    cost += tokenCost(q[j]);
+                }
+            }
+            qOut[c] = q;
+            // the DC entries that reproduce the true low-frequency corner
+            for (int i = 0; i < bH * bW; i++) {
+                s.llf[i] = coef[(i / bW) * pw + i % bW] / tt.llfScale[i];
+            }
+            Dct.inverse2D(s.llf, 0, bW, s.dcT, 0, bW, bH, bW, s.s0, s.s1, false);
+            for (int i = 0; i < bH * bW; i++) {
+                dcOut[c][i] = Math.round(s.dcT[i] / scaledDequant[c]);
+            }
+        }
+        return cost;
+    }
+
+    /**
+     * Quantises the two rectangular blocks that tile the 16x16 area — vertical
+     * (two 16x8 side by side) or horizontal (two 8x16 stacked) — and commits
+     * them over the four cells, origin cells carrying the type and the other two
+     * marked covered.
+     */
+    private void commitRect(int by, int bx, TransformType tt, int[] mul,
+            int[][][] q, int[][][] dc) {
+        boolean vertical = tt.isVertical();  // 16x8: two columns; else 8x16: two rows
+        for (int b = 0; b < 2; b++) {
+            int oBy = vertical ? by : by + b;
+            int oBx = vertical ? bx + b : bx;
+            int origin = oBy * w8 + oBx;
+            blockType[origin] = (byte) tt.type;
+            blockMul[origin] = mul[b];
+            for (int c = 0; c < 3; c++) {
+                hfQuant[c][origin] = q[b][c];
+            }
+            // the block's two covered cells and their DC entries
+            for (int i = 0; i < 2; i++) {
+                int cBy = vertical ? oBy + i : oBy;
+                int cBx = vertical ? oBx : oBx + i;
+                int cell = cBy * w8 + cBx;
+                if (cell != origin) {
+                    blockType[cell] = -2;
+                    blockMul[cell] = mul[b];
+                }
+                for (int c = 0; c < 3; c++) {
+                    dcQuant[c][cell] = dc[b][c][i];
+                }
+            }
+        }
+    }
+
+    /**
+     * Decides the aligned 16x16 area. The four 8x8s are the baseline; the 16x16
+     * replaces them where the area is smooth and its rate is clearly lower, and
+     * failing that a rectangular pair (two 16x8 or two 8x16) replaces them where
+     * the content runs one way — smooth along the block's long axis, detailed
+     * across it. Always commits, and returns the rate estimate of whatever it
+     * chose.
      */
     private double chooseDct16(int by, int bx, float[] factor, Scratch s) {
         int[] cells = {by * w8 + bx, by * w8 + bx + 1, (by + 1) * w8 + bx, (by + 1) * w8 + bx + 1};
         float f4 = (factor[cells[0]] + factor[cells[1]] + factor[cells[2]] + factor[cells[3]]) / 4;
-        if (f4 < 0.95f) {
-            // busy area: 8x8 blocks localise the error better; do not even try 16x16
-            double cost = 0;
-            for (int i = 0; i < 4; i++) {
-                cost += quantiseDct8(by + (i >> 1), bx + (i & 1), factor, s);
-            }
-            return cost;
-        }
-        int mul16 = clampMul(Math.round(hfMul * f4));
+
+        // ---- 8x8 baseline: always quantised into temp, committed only if it wins
         int[] mul8 = new int[4];
         for (int i = 0; i < 4; i++) {
             mul8[i] = clampMul(Math.round(hfMul * factor[cells[i]]));
         }
-
-        float[] block = s.block;
-        float[][] c8 = s.c8;
-        float[] c16 = s.c16;
-        double cost16 = 8;
-        double cost8 = 32;
-        int[][] q16 = new int[3][];
-        int[][][] q8 = new int[3][4][];
+        int[][][] q8c = new int[3][4][];
         int[][] dc8 = new int[3][4];
-        int[][] dc16 = new int[3][4];
-        float[] dqY16 = new float[256];
-        float[][] dqY8 = new float[4][64];
-        for (int ci = 0; ci < 3; ci++) {
-            int c = Y_FIRST[ci];
-            float cfl = cflFactor(c, by, bx);
-            // 16x16 candidate
-            for (int y = 0; y < 16; y++) {
-                System.arraycopy(xyb[c], (y0 + by * 8 + y) * paddedWidth + bx * 8, block, y * 16, 16);
-            }
-            Dct.forward2D(block, 0, 16, c16, 0, 16, 16, 16, s.s0, s.s1);
-            float sfc16 = baseSfc[c] / mul16;
-            float[] w16 = weightsOf[DCT16.parameterIndex][c];
-            int[] q = new int[256];
-            for (int y = 0; y < 16; y++) {
-                for (int x = 0; x < 16; x++) {
-                    if (y < 2 && x < 2) {
-                        continue; // LLF comes from the DC image
+        double cost8 = 32;
+        {
+            float[] block = s.block;
+            float[][] c8 = s.c8;
+            float[][] dqY8 = new float[4][64];
+            for (int ci = 0; ci < 3; ci++) {
+                int c = Y_FIRST[ci];
+                float cfl = cflFactor(c, by, bx);
+                float[] wc = weightsOf[DCT8.parameterIndex][c];
+                for (int i = 0; i < 4; i++) {
+                    int cy = by + (i >> 1);
+                    int cx = bx + (i & 1);
+                    for (int y = 0; y < 8; y++) {
+                        System.arraycopy(xyb[c], (y0 + cy * 8 + y) * paddedWidth + cx * 8,
+                                block, y * 8, 8);
                     }
-                    int j = y * 16 + x;
-                    float step = sfc16 * w16[x * 16 + y];
-                    q[j] = Math.round((c16[j] - cfl * dqY16[j]) / step);
-                    if (c == 1) {
-                        dqY16[j] = q[j] * step;
+                    Dct.forward2D(block, 0, 8, c8[i], 0, 8, 8, 8, s.s0, s.s1);
+                    dc8[c][i] = Math.round(c8[i][0] / scaledDequant[c]);
+                    float sfc = baseSfc[c] / mul8[i];
+                    int[] qq = new int[64];
+                    for (int j = 1; j < 64; j++) {
+                        int wIdx = (j & 7) * 8 + (j >> 3);
+                        float step = sfc * wc[wIdx];
+                        qq[j] = Math.round((c8[i][j] - cfl * dqY8[i][j]) / step);
+                        if (c == 1) {
+                            dqY8[i][j] = qq[j] * step;
+                        }
+                        cost8 += tokenCost(qq[j]);
                     }
-                    cost16 += tokenCost(q[j]);
+                    q8c[c][i] = qq;
                 }
-            }
-            q16[c] = q;
-            // derive the DC entries that reproduce the true LLF coefficients
-            for (int i = 0; i < 4; i++) {
-                s.llf[i] = c16[(i >> 1) * 16 + (i & 1)] / DCT16.llfScale[i];
-            }
-            Dct.inverse2D(s.llf, 0, 2, s.dcT, 0, 2, 2, 2, s.s0, s.s1, false);
-            for (int i = 0; i < 4; i++) {
-                dc16[c][i] = Math.round(s.dcT[i] / scaledDequant[c]);
-            }
-
-            // the four 8x8 alternatives
-            float[] wc = weightsOf[DCT8.parameterIndex][c];
-            for (int i = 0; i < 4; i++) {
-                int cy = by + (i >> 1);
-                int cx = bx + (i & 1);
-                for (int y = 0; y < 8; y++) {
-                    System.arraycopy(xyb[c], (y0 + cy * 8 + y) * paddedWidth + cx * 8,
-                            block, y * 8, 8);
-                }
-                Dct.forward2D(block, 0, 8, c8[i], 0, 8, 8, 8, s.s0, s.s1);
-                dc8[c][i] = Math.round(c8[i][0] / scaledDequant[c]);
-                float sfc = baseSfc[c] / mul8[i];
-                int[] qq = new int[64];
-                for (int j = 1; j < 64; j++) {
-                    int wIdx = (j & 7) * 8 + (j >> 3);
-                    float step = sfc * wc[wIdx];
-                    qq[j] = Math.round((c8[i][j] - cfl * dqY8[i][j]) / step);
-                    if (c == 1) {
-                        dqY8[i][j] = qq[j] * step;
-                    }
-                    cost8 += tokenCost(qq[j]);
-                }
-                q8[c][i] = qq;
             }
         }
 
-        if (cost16 >= 0.94 * cost8) {
-            // keep the 8x8 blocks (reuse the already-quantised data)
-            for (int i = 0; i < 4; i++) {
-                int k = cells[i];
-                blockType[k] = 0;
-                blockMul[k] = mul8[i];
+        // ---- 16x16 where the area is smooth; a clear win takes it outright
+        if (f4 >= 0.95f) {
+            int mul16 = clampMul(Math.round(hfMul * f4));
+            int[][] q16 = new int[3][];
+            int[][] dc16 = new int[3][4];
+            double cost16 = 8;
+            float[] block = s.block;
+            float[] c16 = s.c16;
+            float[] dqY16 = new float[256];
+            for (int ci = 0; ci < 3; ci++) {
+                int c = Y_FIRST[ci];
+                float cfl = cflFactor(c, by, bx);
+                for (int y = 0; y < 16; y++) {
+                    System.arraycopy(xyb[c], (y0 + by * 8 + y) * paddedWidth + bx * 8,
+                            block, y * 16, 16);
+                }
+                Dct.forward2D(block, 0, 16, c16, 0, 16, 16, 16, s.s0, s.s1);
+                float sfc16 = baseSfc[c] / mul16;
+                float[] w16 = weightsOf[DCT16.parameterIndex][c];
+                int[] q = new int[256];
+                for (int y = 0; y < 16; y++) {
+                    for (int x = 0; x < 16; x++) {
+                        if (y < 2 && x < 2) {
+                            continue; // LLF comes from the DC image
+                        }
+                        int j = y * 16 + x;
+                        float step = sfc16 * w16[x * 16 + y];
+                        q[j] = Math.round((c16[j] - cfl * dqY16[j]) / step);
+                        if (c == 1) {
+                            dqY16[j] = q[j] * step;
+                        }
+                        cost16 += tokenCost(q[j]);
+                    }
+                }
+                q16[c] = q;
+                for (int i = 0; i < 4; i++) {
+                    s.llf[i] = c16[(i >> 1) * 16 + (i & 1)] / DCT16.llfScale[i];
+                }
+                Dct.inverse2D(s.llf, 0, 2, s.dcT, 0, 2, 2, 2, s.s0, s.s1, false);
+                for (int i = 0; i < 4; i++) {
+                    dc16[c][i] = Math.round(s.dcT[i] / scaledDequant[c]);
+                }
+            }
+            if (cost16 < 0.94 * cost8) {
+                for (int i = 0; i < 4; i++) {
+                    int k = cells[i];
+                    blockType[k] = (byte) (i == 0 ? DCT16.type : -2);
+                    blockMul[k] = mul16;
+                    for (int c = 0; c < 3; c++) {
+                        dcQuant[c][k] = dc16[c][i];
+                    }
+                }
                 for (int c = 0; c < 3; c++) {
-                    dcQuant[c][k] = dc8[c][i];
-                    hfQuant[c][k] = q8[c][i];
+                    hfQuant[c][cells[0]] = q16[c];
+                }
+                return cost16;
+            }
+        }
+
+        // ---- rectangular pair where it clearly beats the four 8x8s
+        if (!NO_RECT) {
+            double bestRect = Double.MAX_VALUE;
+            TransformType bestTt = null;
+            int[] bestMul = null;
+            int[][][] bestQ = null;
+            int[][][] bestDc = null;
+            for (TransformType tt : new TransformType[] {DCT16_8, DCT8_16}) {
+                boolean vert = tt.isVertical();
+                int[] mul = new int[2];
+                int[][][] q = new int[2][3][];
+                int[][][] dc = new int[2][3][2];
+                double pairCost = 16;
+                for (int b = 0; b < 2; b++) {
+                    int cBy = vert ? by : by + b;
+                    int cBx = vert ? bx + b : bx;
+                    int cellA = cBy * w8 + cBx;
+                    int cellB = vert ? (cBy + 1) * w8 + cBx : cBy * w8 + cBx + 1;
+                    float f2 = (factor[cellA] + factor[cellB]) / 2;
+                    mul[b] = clampMul(Math.round(hfMul * f2));
+                    pairCost += quantiseRect(cBy, cBx, tt, mul[b], s, q[b], dc[b]);
+                }
+                if (pairCost < bestRect) {
+                    bestRect = pairCost;
+                    bestTt = tt;
+                    bestMul = mul;
+                    bestQ = q;
+                    bestDc = dc;
                 }
             }
-            return cost8;
+            if (bestRect < RECT_GAIN * cost8) {
+                commitRect(by, bx, bestTt, bestMul, bestQ, bestDc);
+                return bestRect;
+            }
         }
+
+        // ---- 8x8 fallback
         for (int i = 0; i < 4; i++) {
             int k = cells[i];
-            // -2 marks a covered cell, distinct from -1 "not yet decided"
-            blockType[k] = (byte) (i == 0 ? DCT16.type : -2);
-            blockMul[k] = mul16;
+            blockType[k] = 0;
+            blockMul[k] = mul8[i];
             for (int c = 0; c < 3; c++) {
-                dcQuant[c][k] = dc16[c][i];
+                dcQuant[c][k] = dc8[c][i];
+                hfQuant[c][k] = q8c[c][i];
             }
         }
-        for (int c = 0; c < 3; c++) {
-            hfQuant[c][cells[0]] = q16[c];
-        }
-        return cost16;
+        return cost8;
     }
 
     /**
@@ -1044,43 +1200,49 @@ public final class VarDctEncoder {
                     continue; // covered by the larger block that owns the cell
                 }
                 TransformType tt = TransformType.byType(type);
-                int dim = tt.pixelWidth;      // square DCTs only, here
-                int llfDim = dim >> 3;
+                int ph = tt.pixelHeight;
+                int pw = tt.pixelWidth;
+                int bH = tt.blockHeight;
+                int bW = tt.blockWidth;
+                int mw = tt.matrixWidth;
+                boolean flip = tt.flip();
                 for (int ci = 0; ci < 3; ci++) {
                     int c = Y_FIRST[ci];
                     float cfl = cflFactor(c, by, bx);
                     float sfc = baseSfc[c] / blockMul[k];
                     float[] wc = weightsOf[tt.parameterIndex][c];
                     int[] q = hfQuant[c][k];
-                    for (int y = 0; y < dim; y++) {
-                        for (int x = 0; x < dim; x++) {
-                            if (y < llfDim && x < llfDim) {
+                    for (int y = 0; y < ph; y++) {
+                        for (int x = 0; x < pw; x++) {
+                            if (y < bH && x < bW) {
                                 continue; // LLF comes from the DC image, below
                             }
-                            int j = y * dim + x;
-                            float hf = q[j] * sfc * wc[x * dim + y];
+                            int j = y * pw + x;
+                            int wy = flip ? x : y;
+                            int wx = flip ? y : x;
+                            float hf = q[j] * sfc * wc[wy * mw + wx];
                             deq[j] = hf + cfl * dqY[j];
                             if (c == 1) {
                                 dqY[j] = hf;
                             }
                         }
                     }
-                    // The DC entries were derived from the LLF coefficients by an
-                    // llfDim-square inverse DCT; run it forwards to get them back.
-                    if (llfDim == 1) {
+                    // The DC entries were derived from the LLF coefficients by a
+                    // blockHeight x blockWidth inverse DCT; run it forwards again.
+                    if (bH == 1 && bW == 1) {
                         deq[0] = dcQuant[c][k] * scaledDequant[c];
                     } else {
-                        for (int i = 0; i < llfDim * llfDim; i++) {
-                            int cell = (by + i / llfDim) * w8 + bx + i % llfDim;
+                        for (int i = 0; i < bH * bW; i++) {
+                            int cell = (by + i / bW) * w8 + bx + i % bW;
                             dcT[i] = dcQuant[c][cell] * scaledDequant[c];
                         }
-                        Dct.forward2D(dcT, 0, llfDim, llf, 0, llfDim, llfDim, llfDim, s0, s1);
-                        for (int i = 0; i < llfDim * llfDim; i++) {
-                            deq[(i / llfDim) * dim + i % llfDim] = llf[i] * tt.llfScale[i];
+                        Dct.forward2D(dcT, 0, bW, llf, 0, bW, bH, bW, s0, s1);
+                        for (int i = 0; i < bH * bW; i++) {
+                            deq[(i / bW) * pw + i % bW] = llf[i] * tt.llfScale[i];
                         }
                     }
-                    Dct.inverse2D(deq, 0, dim, out[c], by * 8 * paddedWidth + bx * 8,
-                            paddedWidth, dim, dim, s0, s1, false);
+                    Dct.inverse2D(deq, 0, pw, out[c], by * 8 * paddedWidth + bx * 8,
+                            paddedWidth, ph, pw, s0, s1, false);
                 }
             }
         });
@@ -1564,6 +1726,7 @@ public final class VarDctEncoder {
                 int[] order = HfPass.naturalOrder(tt.orderId);
                 int orderSize = order.length;
                 int pw = tt.pixelWidth;
+                boolean flip = tt.flip();
                 for (int ci = 0; ci < 3; ci++) {
                     int c = C_MAP[ci];
                     int groupY = by - by0;
@@ -1601,9 +1764,11 @@ public final class VarDctEncoder {
                         int o = order[j];
                         int oy = o >> 16;
                         int ox = o & 0xffff;
-                        // the decoder writes this token at the flipped grid
-                        // position (ox, oy)
-                        int v = q[ox * pw + oy];
+                        // the decoder writes this token at the plane position the
+                        // flip maps the natural order slot to: (ox, oy) for a
+                        // flipped (square or vertical) block, (oy, ox) otherwise.
+                        // hfQuant is held in that plane layout.
+                        int v = q[(flip ? ox : oy) * pw + (flip ? oy : ox)];
                         int prev = j == numBlocks
                                 ? (nonZero > orderSize / 16 ? 0 : 1)
                                 : (prevToken != 0 ? 1 : 0);
