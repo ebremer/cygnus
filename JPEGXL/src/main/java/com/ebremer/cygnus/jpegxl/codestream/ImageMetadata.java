@@ -169,17 +169,26 @@ public final class ImageMetadata {
                 && previewWidth == 0;
         out.writeBool(allDefault);
         if (!allDefault) {
-            boolean extraFields = previewWidth > 0;
+            boolean extraFields = previewWidth > 0 || haveAnimation || orientation != 1;
             out.writeBool(extraFields);
             if (extraFields) {
                 out.write(orientation - 1, 3);
                 out.writeBool(false); // no intrinsic size
-                out.writeBool(true);  // have_preview
-                out.writeBool(false); // preview not div8
-                out.writeU32Auto(previewHeight, 1, 6, 65, 8, 321, 10, 1345, 12);
-                out.write(0, 3);      // explicit width
-                out.writeU32Auto(previewWidth, 1, 6, 65, 8, 321, 10, 1345, 12);
-                out.writeBool(false); // no animation
+                boolean havePreview = previewWidth > 0;
+                out.writeBool(havePreview);
+                if (havePreview) {
+                    out.writeBool(false); // preview not div8
+                    out.writeU32Auto(previewHeight, 1, 6, 65, 8, 321, 10, 1345, 12);
+                    out.write(0, 3);      // explicit width
+                    out.writeU32Auto(previewWidth, 1, 6, 65, 8, 321, 10, 1345, 12);
+                }
+                out.writeBool(haveAnimation);
+                if (haveAnimation) {
+                    out.writeU32Auto(animTpsNumerator, 100, 0, 1000, 0, 1, 10, 1, 30);
+                    out.writeU32Auto(animTpsDenominator, 1, 0, 1001, 0, 1, 8, 1, 10);
+                    writeNumLoops(out, animNumLoops);
+                    out.writeBool(animHaveTimecodes);
+                }
             }
             bitDepth.write(out);
             out.writeBool(modular16BitBuffers);
@@ -195,12 +204,28 @@ public final class ImageMetadata {
             }
             out.writeBool(xybEncoded);
             colourEncoding.write(out);
-            if (previewWidth > 0) {
+            if (extraFields) {
                 out.writeBool(true); // ToneMapping.all_default
             }
             out.writeU64(0); // extensions
         }
         out.writeBool(true); // default_m
+    }
+
+    /** num_loops: U32(0, u(3), u(16), u(32)); 0 means loop forever. */
+    private static void writeNumLoops(BitWriter out, long loops) {
+        if (loops == 0) {
+            out.write(0, 2);
+        } else if (loops < (1 << 3)) {
+            out.write(1, 2);
+            out.write((int) loops, 3);
+        } else if (loops < (1 << 16)) {
+            out.write(2, 2);
+            out.write((int) loops, 16);
+        } else {
+            out.write(3, 2);
+            out.write((int) loops, 32);
+        }
     }
 
     public static void readExtensions(Bits in) throws IOException {

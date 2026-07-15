@@ -122,6 +122,7 @@ public final class JxlEncoder {
     private int paletteNumC;     // channels folded into the palette
     private boolean squeezed;    // the channel list has been squeezed
     private boolean prepared;
+    private FrameParams frameParams; // set when this encoder writes one frame of many
 
     /**
      * Passes a progressive frame is cut into. Squeeze leaves channels at shifts
@@ -431,6 +432,150 @@ public final class JxlEncoder {
         buildMetadata(depth, grey, extras).write(out);
         writeFrame(out);
         return out.toByteArray();
+    }
+
+    // ------------------------------------------------------------- animation
+
+    /**
+     * One frame of an animation: its pixels, how long it shows, where it sits on
+     * the canvas, and how it combines with what is already there.
+     *
+     * <p>Most frames are whole pictures shown one after another — {@link #full}.
+     * A frame can instead cover only a rectangle of the canvas ({@link #patch},
+     * for when little changes between frames) or lay itself over the running
+     * canvas through its alpha ({@link #blended}, for a translucent overlay). The
+     * encoder keeps whatever earlier frame a later one needs to build on; the
+     * caller only describes each frame.
+     */
+    public static final class AnimationFrame {
+        final int[][] planes;
+        final int width;
+        final int height;
+        final int x0;
+        final int y0;
+        final int durationTicks;
+        final int blendMode;
+        final int blendAlphaChannel;
+
+        private AnimationFrame(int[][] planes, int width, int height, int x0, int y0,
+                int durationTicks, int blendMode, int blendAlphaChannel) {
+            if (durationTicks < 0) {
+                throw new IllegalArgumentException("negative frame duration");
+            }
+            this.planes = planes;
+            this.width = width;
+            this.height = height;
+            this.x0 = x0;
+            this.y0 = y0;
+            this.durationTicks = durationTicks;
+            this.blendMode = blendMode;
+            this.blendAlphaChannel = blendAlphaChannel;
+        }
+
+        /** A whole-canvas frame that replaces everything before it. */
+        public static AnimationFrame full(int[][] planes, int width, int height,
+                int durationTicks) {
+            return new AnimationFrame(planes, width, height, 0, 0, durationTicks,
+                    BLEND_REPLACE, 0);
+        }
+
+        /**
+         * A whole-canvas frame laid over the running canvas through its alpha:
+         * where the alpha is opaque the frame shows, where it is clear the frame
+         * before it shows through. {@code alphaChannel} is the extra channel that
+         * carries it (0 for the first).
+         */
+        public static AnimationFrame blended(int[][] planes, int width, int height,
+                int durationTicks, int alphaChannel) {
+            return new AnimationFrame(planes, width, height, 0, 0, durationTicks,
+                    BLEND_BLEND, alphaChannel);
+        }
+
+        /**
+         * A frame covering only the rectangle at {@code (x0, y0)} of the given
+         * size; the rest of the canvas keeps the frame before it. What an
+         * animation uses when little moves between frames.
+         */
+        public static AnimationFrame patch(int[][] planes, int width, int height,
+                int x0, int y0, int durationTicks) {
+            return new AnimationFrame(planes, width, height, x0, y0, durationTicks,
+                    BLEND_REPLACE, 0);
+        }
+    }
+
+    /**
+     * Encodes an animation: a sequence of frames shown one after another, at
+     * {@code tpsNumerator/tpsDenominator} ticks per second, looping
+     * {@code numLoops} times (0 = forever). Each frame carries its own duration
+     * in ticks and its own way of combining with the canvas; see
+     * {@link AnimationFrame}. Lossless throughout — every frame comes back
+     * exactly — with any set of extra channels.
+     */
+    public static byte[] encodeAnimation(List<AnimationFrame> frames, int width, int height,
+            int bits, boolean grey, List<ExtraChannelInfo> extras,
+            int tpsNumerator, int tpsDenominator, long numLoops) throws IOException {
+        if (frames.isEmpty()) {
+            throw new IllegalArgumentException("an animation needs at least one frame");
+        }
+        if (width <= 0 || height <= 0) {
+            throw new IllegalArgumentException("bad dimensions " + width + "x" + height);
+        }
+        if (tpsNumerator <= 0 || tpsDenominator <= 0) {
+            throw new IllegalArgumentException("ticks per second must be positive");
+        }
+        BitDepth depth = BitDepth.of(bits);
+        ImageMetadata meta = buildMetadata(depth, grey, extras);
+        meta.haveAnimation = true;
+        meta.animTpsNumerator = tpsNumerator;
+        meta.animTpsDenominator = tpsDenominator;
+        meta.animNumLoops = numLoops;
+
+        BitWriter out = new BitWriter();
+        out.write(0xff, 8);
+        out.write(0x0a, 8);
+        new SizeHeader(width, height).write(out);
+        meta.write(out);
+
+        int n = frames.size();
+        for (int i = 0; i < n; i++) {
+            AnimationFrame f = frames.get(i);
+            boolean isLast = i == n - 1;
+            boolean partial = f.width != width || f.height != height || f.x0 != 0 || f.y0 != 0;
+            boolean composite = partial || f.blendMode != BLEND_REPLACE;
+
+            JxlEncoder enc = new JxlEncoder(f.planes, f.width, f.height, depth, grey, extras,
+                    false);
+            FrameParams p = new FrameParams();
+            p.canvasWidth = width;
+            p.canvasHeight = height;
+            p.frameWidth = f.width;
+            p.frameHeight = f.height;
+            p.x0 = f.x0;
+            p.y0 = f.y0;
+            p.haveCrop = partial;
+            p.haveAnimation = true;
+            p.duration = f.durationTicks;
+            p.blendMode = f.blendMode;
+            p.blendAlphaChannel = f.blendAlphaChannel;
+            p.isLast = isLast;
+            // a compositing frame builds on the canvas kept in slot 1; keep this
+            // frame there too when the next one will need it
+            if (composite) {
+                p.blendSource = 1;
+            }
+            if (!isLast && buildsOnCanvas(frames.get(i + 1), width, height)) {
+                p.saveAsReference = 1;
+            }
+            enc.frameParams = p;
+            enc.writeFrame(out);
+        }
+        return out.toByteArray();
+    }
+
+    /** Whether a frame needs the running canvas beneath it (it is a patch or a blend). */
+    private static boolean buildsOnCanvas(AnimationFrame f, int width, int height) {
+        return f.width != width || f.height != height || f.x0 != 0 || f.y0 != 0
+                || f.blendMode != BLEND_REPLACE;
     }
 
     // ------------------------------------------------------------ transforms
@@ -1009,7 +1154,11 @@ public final class JxlEncoder {
         }
 
         // ---- assemble the frame
-        writeFrameHeader(out, extras.size(), numPasses);
+        FrameParams fp = frameParams != null ? frameParams
+                : FrameParams.single(extras.size(), numPasses, width, height);
+        fp.numExtra = extras.size();
+        fp.numPasses = numPasses;
+        writeFrameHeader(out, fp);
 
         out.writeBool(false); // TOC not permuted
         out.zeroPadToByte();
@@ -1214,18 +1363,68 @@ public final class JxlEncoder {
         return meta;
     }
 
+    static final int BLEND_REPLACE = 0;
+    static final int BLEND_BLEND = 2;
+
+    /**
+     * Everything a frame header carries beyond the pixels: how many extra
+     * channels, how many passes, and — for a frame that is one of several — where
+     * it sits on the canvas, how it blends, how long it shows, and whether it is
+     * kept as a reference for the frames after it. A lone still needs none of
+     * this, so {@link #single} fills in the defaults: a full-canvas replace frame
+     * that is the last (and only) one.
+     */
+    static final class FrameParams {
+        int numExtra;
+        int numPasses = 1;
+        int canvasWidth;
+        int canvasHeight;
+        int frameWidth;      // this frame's coded size (the crop, for a partial frame)
+        int frameHeight;
+        int x0;              // top-left on the canvas
+        int y0;
+        boolean haveCrop;    // false for a full-canvas frame
+        boolean haveAnimation;
+        long duration;       // ticks this frame shows for
+        int blendMode = BLEND_REPLACE;
+        int blendSource;     // reference slot a non-replace frame blends over
+        int blendAlphaChannel;
+        int saveAsReference; // slot to keep this frame in (0 = keep none)
+        boolean isLast = true;
+
+        static FrameParams single(int numExtra, int numPasses, int w, int h) {
+            FrameParams p = new FrameParams();
+            p.numExtra = numExtra;
+            p.numPasses = numPasses;
+            p.canvasWidth = w;
+            p.canvasHeight = h;
+            p.frameWidth = w;
+            p.frameHeight = h;
+            return p;
+        }
+    }
+
     static void writeFrameHeader(BitWriter out, boolean alpha) {
         writeFrameHeader(out, alpha ? 1 : 0, 1);
     }
 
-    /**
-     * @param numPasses 1 for an ordinary frame; 3 for a progressive one, whose
-     *        passes are told apart by the downsampling each is enough for — 4x,
-     *        then 2x, then full. That is what puts each squeezed channel in a
-     *        pass: the decoder derives a shift range per pass from these
-     *        markers and takes the channels whose shift falls in it.
-     */
     static void writeFrameHeader(BitWriter out, int numExtra, int numPasses) {
+        writeFrameHeader(out, FrameParams.single(numExtra, numPasses, 0, 0));
+    }
+
+    /**
+     * Writes a frame header, mirroring {@link com.ebremer.cygnus.jpegxl.codestream.FrameHeader#read}
+     * field for field. Modular, no colour transform, no restoration filter — the
+     * lossless frame this encoder writes — but general over the animation and
+     * compositing fields, so the same routine serves a lone still, a progressive
+     * frame's three passes, and one frame of many.
+     *
+     * <p>{@code num_passes} of 3 marks a progressive frame: the passes are told
+     * apart by the downsampling each is enough for — 4x, then 2x, then full — and
+     * the decoder derives a shift range per pass from these markers and takes the
+     * channels whose shift falls in it.
+     */
+    static void writeFrameHeader(BitWriter out, FrameParams p) {
         out.zeroPadToByte();
         out.writeBool(false);        // !all_default
         out.write(0, 2);             // frame_type: regular
@@ -1233,15 +1432,15 @@ public final class JxlEncoder {
         out.writeU64(0);             // flags
         out.writeBool(false);        // do_YCbCr (xyb_encoded is false)
         out.write(0, 2);             // log upsampling
-        for (int i = 0; i < numExtra; i++) {
+        for (int i = 0; i < p.numExtra; i++) {
             // 0 here, so the channel's own dim_shift is the whole of its
             // upsampling: the decoder multiplies the two
             out.write(0, 2);         // extra channel upsampling
         }
         out.write(GROUP_SIZE_SHIFT_BITS, 2); // group_size_shift = 8
-        if (numPasses == 1) {
+        if (p.numPasses == 1) {
             out.write(0, 2);         // num_passes = 1 (U32 selector 0)
-        } else if (numPasses == PROGRESSIVE_PASSES) {
+        } else if (p.numPasses == PROGRESSIVE_PASSES) {
             out.write(2, 2);         // num_passes = 3
             out.write(2, 2);         // num_ds = 2
             out.write(0, 2);         // pass 0 coefficient shift (VarDCT only)
@@ -1251,20 +1450,69 @@ public final class JxlEncoder {
             out.write(0, 2);         // last_pass[0] = 0
             out.write(1, 2);         // last_pass[1] = 1
         } else {
-            throw new IllegalArgumentException("unsupported pass count " + numPasses);
+            throw new IllegalArgumentException("unsupported pass count " + p.numPasses);
         }
-        out.writeBool(false);        // have_crop
-        int blendEntries = 1 + numExtra;
-        for (int i = 0; i < blendEntries; i++) {
-            out.write(0, 2);         // blend mode: replace (full frame -> no source)
+        boolean fullFrame;
+        if (p.haveCrop) {
+            out.writeBool(true);     // have_crop
+            out.writeU32Auto(packSigned(p.x0), 0, 8, 256, 11, 2304, 14, 18688, 30);
+            out.writeU32Auto(packSigned(p.y0), 0, 8, 256, 11, 2304, 14, 18688, 30);
+            out.writeU32Auto(p.frameWidth, 0, 8, 256, 11, 2304, 14, 18688, 30);
+            out.writeU32Auto(p.frameHeight, 0, 8, 256, 11, 2304, 14, 18688, 30);
+            fullFrame = p.x0 <= 0 && p.y0 <= 0
+                    && p.frameWidth + p.x0 >= p.canvasWidth
+                    && p.frameHeight + p.y0 >= p.canvasHeight;
+        } else {
+            out.writeBool(false);    // have_crop
+            fullFrame = true;
         }
-        out.writeBool(true);         // is_last
+        // per-channel blend info: colour (index -1), then each extra channel
+        for (int i = -1; i < p.numExtra; i++) {
+            out.writeU32Auto(p.blendMode, 0, 0, 1, 0, 2, 0, 3, 2);
+            if (p.numExtra > 0 && p.blendMode == BLEND_BLEND) {
+                out.writeU32Auto(p.blendAlphaChannel, 0, 0, 1, 0, 2, 0, 3, 3);
+                out.write(0, 1);     // clamp = false
+            }
+            if (!fullFrame || p.blendMode != BLEND_REPLACE) {
+                out.write(p.blendSource, 2);
+            }
+        }
+        if (p.haveAnimation) {
+            writeDuration(out, p.duration);
+        }
+        out.writeBool(p.isLast);
+        if (!p.isLast) {
+            out.write(p.saveAsReference, 2);
+        }
+        // save_before_colour_transform is only coded for the frames that could
+        // be kept; we never keep before-transform (there is no colour transform),
+        // so a false here matches what the decoder derives for the rest
+        boolean codesSaveBefore = fullFrame && p.blendMode == BLEND_REPLACE
+                && (p.duration == 0 || p.saveAsReference != 0) && !p.isLast;
+        if (codesSaveBefore) {
+            out.writeBool(false);    // save after colour transform
+        }
         out.write(0, 2);             // name length (U32 selector 0)
         out.writeBool(false);        // RestorationFilter not all_default
         out.writeBool(false);        // gaborish off
         out.write(0, 2);             // epf iterations = 0
         out.writeU64(0);             // restoration filter extensions
         out.writeU64(0);             // frame header extensions
+    }
+
+    /** duration: sel 0 -> 0, sel 1 -> 1, sel 2 -> u(8), sel 3 -> u(32). */
+    private static void writeDuration(BitWriter out, long duration) {
+        if (duration == 0) {
+            out.write(0, 2);
+        } else if (duration == 1) {
+            out.write(1, 2);
+        } else if (duration < 256) {
+            out.write(2, 2);
+            out.write((int) duration, 8);
+        } else {
+            out.write(3, 2);
+            out.write((int) duration, 32);
+        }
     }
 
     static void writeTocEntry(BitWriter out, int size) {

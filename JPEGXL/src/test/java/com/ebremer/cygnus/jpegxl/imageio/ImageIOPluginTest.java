@@ -381,4 +381,70 @@ class ImageIOPluginTest {
         assertNotNull(back, "no jxl reader found");
         return back;
     }
+
+    /** An animation written through the ImageIO sequence API reads back frame for frame. */
+    @Test
+    void writesAndReadsAnimationSequence() throws Exception {
+        int w = 96;
+        int h = 72;
+        int n = 4;
+        int[] durations = {5, 10, 15, 20};
+        BufferedImage[] src = new BufferedImage[n];
+        Random rnd = new Random(3);
+        for (int k = 0; k < n; k++) {
+            src[k] = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    src[k].setRGB(x, y, (rnd.nextInt(256) << 16)
+                            | (((k * 40 + x) & 0xff) << 8) | ((y * 3) & 0xff));
+                }
+            }
+        }
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        javax.imageio.ImageWriter writer =
+                ImageIO.getImageWritersByFormatName("jxl").next();
+        assertTrue(writer.canWriteSequence(), "writer should support sequences");
+        try (javax.imageio.stream.ImageOutputStream ios =
+                ImageIO.createImageOutputStream(baos)) {
+            writer.setOutput(ios);
+            com.ebremer.cygnus.jpegxl.codestream.ImageMetadata sm =
+                    new com.ebremer.cygnus.jpegxl.codestream.ImageMetadata();
+            sm.haveAnimation = true;
+            sm.animTpsNumerator = 50;
+            sm.animTpsDenominator = 1;
+            sm.animNumLoops = 2;
+            writer.prepareWriteSequence(new JXLMetadata(sm, -1));
+            for (int k = 0; k < n; k++) {
+                writer.writeToSequence(new javax.imageio.IIOImage(src[k], null,
+                        new JXLMetadata(sm, durations[k])), null);
+            }
+            writer.endWriteSequence();
+        }
+
+        ImageReader reader = ImageIO.getImageReadersByFormatName("jxl").next();
+        try (ImageInputStream iis =
+                ImageIO.createImageInputStream(new ByteArrayInputStream(baos.toByteArray()))) {
+            reader.setInput(iis);
+            assertEquals(n, reader.getNumImages(true));
+            for (int k = 0; k < n; k++) {
+                BufferedImage got = reader.read(k);
+                for (int y = 0; y < h; y++) {
+                    for (int x = 0; x < w; x++) {
+                        assertEquals(src[k].getRGB(x, y) & 0xffffff, got.getRGB(x, y) & 0xffffff,
+                                "frame " + k + " at " + x + "," + y);
+                    }
+                }
+                Node root = reader.getImageMetadata(k).getAsTree(JXLMetadata.NATIVE_FORMAT);
+                long ticks = -1;
+                for (Node node = root.getFirstChild(); node != null; node = node.getNextSibling()) {
+                    if ("Frame".equals(node.getNodeName())) {
+                        ticks = Long.parseLong(node.getAttributes()
+                                .getNamedItem("durationTicks").getNodeValue());
+                    }
+                }
+                assertEquals(durations[k], ticks, "duration of frame " + k);
+            }
+        }
+    }
 }

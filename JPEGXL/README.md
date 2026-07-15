@@ -8,7 +8,8 @@ for JDK 25, exposed through the standard Java ImageIO API.
 - **ImageIO plug-ins** — auto-registered via `META-INF/services`; plain
   `ImageIO.read(...)` and `ImageIO.write(image, "jxl", ...)` work for both
   bare codestreams and ISOBMFF `.jxl` containers. Previews surface as
-  thumbnails, animation timing as native image metadata, an explicit
+  thumbnails, animations read frame by frame and write through the sequence API
+  (`writeToSequence`) with timing in native image metadata, an explicit
   compression quality below 1.0 selects lossy encoding, `setProgressiveMode`
   selects the responsive layout, and a `TYPE_FLOAT` raster is written (and read
   back) as a floating-point image.
@@ -187,6 +188,14 @@ cropped result; reference, LF and preview frames always decode whole.
   only on the blocks it measurably helps. Together these are what let a fine
   distance actually buy quality: a greyscale image at distance 0.3 comes back
   bit-exact.
+- **Animation**: `JxlEncoder.encodeAnimation` writes a sequence of frames with a
+  timebase (ticks per second, loop count) and, per frame, a duration and a way
+  of joining the canvas — a whole picture that replaces (`AnimationFrame.full`),
+  a rectangle that updates in place with the rest inherited
+  (`AnimationFrame.patch`), or a whole frame laid over the canvas through its
+  alpha (`AnimationFrame.blended`). Patches and blends use the reference-frame
+  machinery, which the encoder manages itself. Lossless, any extra channels, and
+  writable through the standard ImageIO sequence API (`writeToSequence`) as well.
 - **Streaming (chunked) encoding, lossless or lossy**: `JxlStreamingEncoder`
   consumes rows top to bottom and compresses each 256-row band of groups as it
   completes, so peak memory is one band plus the compressed sections — the image
