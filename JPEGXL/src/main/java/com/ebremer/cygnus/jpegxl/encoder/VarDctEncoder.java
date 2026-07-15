@@ -111,6 +111,7 @@ public final class VarDctEncoder {
     private final double maxVal;   // integer samples only
     private final boolean grey;
     private final java.util.List<ExtraChannelInfo> extras;
+    private float[] noiseLut;      // 8-point photon-noise strengths, or null for no noise
     private final int globalScale;
     private int hfMul;
     private final float[] scaledDequant = new float[3];
@@ -1146,6 +1147,38 @@ public final class VarDctEncoder {
     }
 
     /**
+     * Lossy colour with synthetic photon noise: the frame carries a noise model
+     * (see {@link com.ebremer.cygnus.jpegxl.features.Noise#photonNoiseLut}) and
+     * the decoder synthesizes grain, rather than the encoder spending bits coding
+     * it. What {@code cjxl --photon_noise_iso} does — and because the synthesis is
+     * normative, the same {@code iso} through libjxl produces the same grain.
+     *
+     * <p>It is a perceptual trade, not a fidelity one: the synthesized grain is
+     * not the image's own, so a pixel metric sees the added noise as error even
+     * where a viewer sees a more natural picture. It pays on film and high-ISO
+     * photography, where a smooth lossy render looks plasticky; give it the
+     * quantiser (a higher {@code distance}) to smooth the real grain away and let
+     * the model put grain back.
+     *
+     * @param iso the photon-noise level, higher being grainier; 0 disables it
+     */
+    public static byte[] encodeWithPhotonNoise(int[][] planes, int width, int height, int bits,
+            boolean grey, java.util.List<ExtraChannelInfo> extras, float distance, double iso)
+            throws IOException {
+        BitDepth depth = BitDepth.of(bits);
+        checkInput(planes, width, height, depth, grey, extras);
+        VarDctEncoder enc = new VarDctEncoder(width, height, depth, grey, extras, distance);
+        if (iso > 0) {
+            enc.noiseLut = com.ebremer.cygnus.jpegxl.features.Noise.photonNoiseLut(
+                    width, height, iso);
+        }
+        int colour = grey ? 1 : 3;
+        enc.loadWhole(java.util.Arrays.copyOf(planes, colour));
+        enc.quantiseWindow(Double.NaN);
+        return enc.standalone(java.util.Arrays.copyOfRange(planes, colour, planes.length));
+    }
+
+    /**
      * Encodes floating-point samples lossily.
      *
      * <p>The float goes straight into the XYB conversion, and that is the whole
@@ -1441,7 +1474,7 @@ public final class VarDctEncoder {
             }
             one.zeroPadToByte();
             byte[] payload = one.toByteArray();
-            writeFrameHeader(out, extras.size());
+            writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0));
             out.writeBool(false); // TOC not permuted
             out.zeroPadToByte();
             writeTocEntry(out, payload.length);
@@ -1483,7 +1516,7 @@ public final class VarDctEncoder {
         }
 
         // ---- header + TOC + payload
-        writeFrameHeader(out, extras.size());
+        writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0));
         out.writeBool(false); // TOC not permuted
         out.zeroPadToByte();
         writeTocEntry(out, lfGlobalBytes.length);
@@ -1589,6 +1622,13 @@ public final class VarDctEncoder {
     }
 
     void writeLfGlobalBits(BitWriter w, boolean single, int[][] extraPlanes) {
+        // patches and splines are off (their flags are clear); the noise table,
+        // if any, is the first thing the LfGlobal section carries
+        if (noiseLut != null) {
+            for (int i = 0; i < 8; i++) {
+                w.write(Math.min(1023, Math.round(noiseLut[i] * 1024f)), 10);
+            }
+        }
         w.writeBool(true);   // LfChannelDequantization.all_default
         if (globalScale <= 2048) {
             w.write(0, 2);
@@ -1798,15 +1838,19 @@ public final class VarDctEncoder {
     }
 
     static void writeFrameHeader(BitWriter out, boolean alpha) {
-        writeFrameHeader(out, alpha ? 1 : 0);
+        writeFrameHeader(out, alpha ? 1 : 0, 128);
     }
 
     static void writeFrameHeader(BitWriter out, int numExtra) {
+        writeFrameHeader(out, numExtra, 128);
+    }
+
+    static void writeFrameHeader(BitWriter out, int numExtra, long flags) {
         out.zeroPadToByte();
         out.writeBool(false);        // !all_default
         out.write(0, 2);             // frame_type: regular
         out.writeBool(false);        // encoding: VarDCT
-        out.writeU64(128);           // flags: skip adaptive LF smoothing
+        out.writeU64(flags);         // 128 = skip adaptive LF smoothing (+1 for noise)
         // xyb encoded => no do_YCbCr bit
         out.write(0, 2);             // log upsampling
         for (int i = 0; i < numExtra; i++) {

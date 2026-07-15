@@ -16,6 +16,56 @@ public final class Noise {
     private Noise() {
     }
 
+    /** XYB opsin absorbance bias (18181-1); the encoder's inverse of it is negative. */
+    private static final double OPSIN_ABSORBANCE_BIAS = 0.0037930732552754493;
+
+    // Photon-noise model constants (libjxl SimulatePhotonNoise): a daylight
+    // spectrum, a 2010s camera's quantum efficiency and read noise, a 35mm sensor.
+    private static final double PHOTONS_PER_LXS_PER_UM2 = 11260;
+    private static final double EFFECTIVE_QUANTUM_EFFICIENCY = 0.20;
+    private static final double PHOTO_RESPONSE_NON_UNIFORMITY = 0.005;
+    private static final double INPUT_REFERRED_READ_NOISE = 3;
+    private static final double SENSOR_AREA_UM2 = 36000.0 * 24000;
+
+    /**
+     * The 8-point noise strength table a photon-noise level produces, computed the
+     * way {@code cjxl --photon_noise_iso} does (libjxl's {@code SimulatePhotonNoise}):
+     * a physical shot-noise model — read noise, photon shot noise growing with the
+     * square root of the signal, and photo-response non-uniformity — carried
+     * through the opsin curve into XYB, where the decoder's synthesis adds it. The
+     * table is what the frame carries; feeding it and the same {@code iso} to
+     * libjxl yields the same grain, because the synthesis is normative.
+     *
+     * @param iso the photon-noise level; higher is grainier (as a camera's ISO)
+     */
+    public static float[] photonNoiseLut(long xsize, long ysize, double iso) {
+        double biasCbrt = Math.cbrt(OPSIN_ABSORBANCE_BIAS);
+        double h18 = 10 / iso;                                 // ISO = 10 lx*s / H
+        double pixelAreaUm2 = SENSOR_AREA_UM2 / ((double) xsize * ysize);
+        double electronsPer18 = EFFECTIVE_QUANTUM_EFFICIENCY * PHOTONS_PER_LXS_PER_UM2
+                * h18 * pixelAreaUm2;
+        float[] lut = new float[8];
+        for (int i = 0; i < 8; i++) {
+            double scaledIndex = i / 6.0;                      // (kNumNoisePoints - 2)
+            double y = 2 * scaledIndex;                        // XYB Y at this point
+            double diff = y - biasCbrt;
+            double linear = Math.max(0.0, diff * diff * diff + OPSIN_ABSORBANCE_BIAS);
+            double electrons = electronsPer18 * (linear / 0.18);
+            // quadrature sum of read noise, shot noise (sqrt(S), so unsquared), PRNU
+            double noise = Math.sqrt(INPUT_REFERRED_READ_NOISE * INPUT_REFERRED_READ_NOISE
+                    + electrons
+                    + Math.pow(PHOTO_RESPONSE_NON_UNIFORMITY * electrons, 2));
+            double linearNoise = noise * (0.18 / electronsPer18);
+            double root = Math.cbrt(linear - OPSIN_ABSORBANCE_BIAS);
+            double opsinDerivative = (1.0 / 3) / (root * root);
+            double opsinNoise = linearNoise * opsinDerivative;
+            // norm_const * (red+green) * per-plane stddev of the generated field
+            double v = opsinNoise / (0.22 * Math.sqrt(2.0) * 1.13);
+            lut[i] = (float) Math.min(Math.max(v, 0.0), 1.0);
+        }
+        return lut;
+    }
+
     /** Generates the convolved noise field for a frame. */
     public static float[][] initialize(long seed0, int width, int height,
             int groupDim, int groupColumns, int numGroups) {

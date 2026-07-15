@@ -194,6 +194,12 @@ cropped result; reference, LF and preview frames always decode whole.
   only on the blocks it measurably helps. Together these are what let a fine
   distance actually buy quality: a greyscale image at distance 0.3 comes back
   bit-exact.
+- **Photon-noise synthesis**: `VarDctEncoder.encodeWithPhotonNoise(..., iso)`
+  writes a noise model (the same eight-point table `cjxl --photon_noise_iso`
+  computes) and flags the frame, so the decoder synthesizes film grain rather
+  than the encoder coding it — eighty bits that turn a plasticky smooth lossy
+  render grainy again. The synthesis is normative, so libjxl reproduces it pixel
+  for pixel.
 - **Animation**: `JxlEncoder.encodeAnimation` writes a sequence of frames with a
   timebase (ticks per second, loop count) and, per frame, a duration and a way
   of joining the canvas — a whole picture that replaces (`AnimationFrame.full`),

@@ -153,6 +153,43 @@ class FfmpegInteropTest {
         assertTrue(worst <= 1, "our decode and libjxl's differ by " + worst + " on a DCT32 image");
     }
 
+    /**
+     * A frame carrying a photon-noise model synthesizes grain the same way in
+     * libjxl and in us — the synthesis is normative, so if the model is written
+     * right the two decoders land on the same pixels, to a rounding step.
+     */
+    @Test
+    void ffmpegSynthesizesOurNoiseIdentically() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 256;
+        int h = 192;
+        int[][] src = new int[3][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                src[0][i] = 100 + x * 80 / w;
+                src[1][i] = 110 + y * 70 / h;
+                src[2][i] = 120;
+            }
+        }
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encodeWithPhotonNoise(
+                src, w, h, 8, false, java.util.List.of(), 1.5f, 6400);
+        Path jxlFile = tempDir.resolve("ours-noise.jxl");
+        Path rawFile = tempDir.resolve("ffdec-noise.raw");
+        Files.write(jxlFile, jxl);
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+        int[][] ours = JxlDecoder.decode(jxl).frames.get(0).channels;
+        int worst = 0;
+        for (int p = 0; p < 3; p++) {
+            for (int i = 0; i < w * h; i++) {
+                worst = Math.max(worst, Math.abs(ours[p][i] - theirs[p][i]));
+            }
+        }
+        assertTrue(worst <= 1, "libjxl's synthesized noise differs from ours by " + worst);
+    }
+
     /** Smooth gradients favour the weighted predictor. */
     @Test
     void ffmpegDecodesOurWeightedPredictorOutput() throws Exception {
