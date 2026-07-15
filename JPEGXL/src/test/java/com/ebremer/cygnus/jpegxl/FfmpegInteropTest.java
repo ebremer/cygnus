@@ -404,6 +404,57 @@ class FfmpegInteropTest {
         assertTrue(worst <= 2, "our DCT2/DCT4 decode disagrees with libjxl: worst " + worst);
     }
 
+    /** The DCT4x8 / DCT8x4 varblocks reconstruct identically in libjxl too. */
+    @Test
+    void ffmpegAgreesOnOurRectangularSmallTransforms() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 256;
+        int h = 192;
+        int[][] rgb = new int[3][w * h];
+        for (int i = 0; i < w * h; i++) {
+            rgb[0][i] = rgb[1][i] = rgb[2][i] = 128;
+        }
+        for (int by = 0; by < h / 8; by++) {
+            for (int bx = 0; bx < w / 8; bx++) {
+                if (((bx * 5 + by * 11) % 6) != 0) {
+                    continue;
+                }
+                boolean t48 = ((bx + by) & 1) == 0;
+                for (int y = 0; y < 8; y++) {
+                    for (int x = 0; x < 8; x++) {
+                        int v = t48
+                                ? (y < 4 ? Math.min(255, 30 + x * 24) : Math.max(0, 230 - x * 24))
+                                : (x < 4 ? Math.min(255, 30 + y * 24) : Math.max(0, 230 - y * 24));
+                        int i = (by * 8 + y) * w + bx * 8 + x;
+                        rgb[0][i] = rgb[1][i] = rgb[2][i] = v;
+                    }
+                }
+            }
+        }
+        long before = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(12)
+                + com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(13);
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encode(rgb, w, h, 1.0f);
+        long fired = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(12)
+                + com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(13) - before;
+        assertTrue(fired > 0, "the split-block image should use DCT4x8/DCT8x4");
+
+        JxlImage ours = JxlDecoder.decode(jxl);
+        int[][] od = ours.frames.get(0).channels;
+        Path jxlFile = tempDir.resolve("rect48.jxl");
+        Files.write(jxlFile, jxl);
+        Path rawFile = tempDir.resolve("rect48.raw");
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+        int worst = 0;
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < w * h; i++) {
+                worst = Math.max(worst, Math.abs(od[c][i] - theirs[c][i]));
+            }
+        }
+        assertTrue(worst <= 2, "our DCT4x8/DCT8x4 decode disagrees with libjxl: worst " + worst);
+    }
+
     /**
      * A patch-coded image — a reference frame of glyphs stamped over the canvas —
      * is a valid two-frame codestream libjxl reads back exactly, reference-only

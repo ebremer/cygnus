@@ -71,6 +71,66 @@ public final class SmallDct {
     }
 
     /**
+     * DCT4x8 forward (4 tall, 8 wide): two 4x8 halves stacked, each forward-DCT'd,
+     * their DCs feeding a 1x2 butterfly into the coefficient corner and their AC
+     * laid at the strided rows the decoder reads. {@code s0}/{@code s1} are ≥32.
+     */
+    public static void forwardDct4x8(float[] block, float[] coeffs, float[] s0, float[] s1) {
+        float[] half = new float[32];
+        float[] c = new float[32];
+        float[] dc = new float[2];
+        for (int y = 0; y < 2; y++) {
+            for (int r = 0; r < 4; r++) {
+                for (int col = 0; col < 8; col++) {
+                    half[r * 8 + col] = block[(y * 4 + r) * 8 + col];
+                }
+            }
+            Dct.forward2D(half, 0, 8, c, 0, 8, 4, 8, s0, s1);
+            dc[y] = c[0];
+            for (int iy = 0; iy < 4; iy++) {
+                for (int ix = 0; ix < 8; ix++) {
+                    if (iy == 0 && ix == 0) {
+                        continue;
+                    }
+                    coeffs[(y + iy * 2) * 8 + ix] = c[iy * 8 + ix];
+                }
+            }
+        }
+        coeffs[0] = (dc[0] + dc[1]) * 0.5f;   // invert the 1x2 DC butterfly
+        coeffs[8] = (dc[0] - dc[1]) * 0.5f;
+    }
+
+    /**
+     * DCT8x4 forward (8 tall, 4 wide): two 8x4 halves side by side, each
+     * forward-DCT'd on its transpose (the decoder inverts it transposed), the same
+     * 1x2 DC butterfly and strided AC layout as {@link #forwardDct4x8}.
+     */
+    public static void forwardDct8x4(float[] block, float[] coeffs, float[] s0, float[] s1) {
+        float[] half = new float[32];
+        float[] c = new float[32];
+        float[] dc = new float[2];
+        for (int x = 0; x < 2; x++) {
+            for (int col = 0; col < 4; col++) {
+                for (int r = 0; r < 8; r++) {
+                    half[col * 8 + r] = block[r * 8 + x * 4 + col]; // transpose 8x4 -> 4x8
+                }
+            }
+            Dct.forward2D(half, 0, 8, c, 0, 8, 4, 8, s0, s1);
+            dc[x] = c[0];
+            for (int iy = 0; iy < 4; iy++) {
+                for (int ix = 0; ix < 8; ix++) {
+                    if (iy == 0 && ix == 0) {
+                        continue;
+                    }
+                    coeffs[(x + iy * 2) * 8 + ix] = c[iy * 8 + ix];
+                }
+            }
+        }
+        coeffs[0] = (dc[0] + dc[1]) * 0.5f;
+        coeffs[8] = (dc[0] - dc[1]) * 0.5f;
+    }
+
+    /**
      * Undoes {@link Transforms}' 2×2 Hadamard butterfly over the {@code s}×{@code
      * s} corner: reads the interleaved output, writes the quadrant input, scaled
      * by 1/4. The rest of the 8×8 passes through.

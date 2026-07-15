@@ -176,10 +176,11 @@ cropped result; reference, LF and preview frames always decode whole.
   reads it back exactly). Lossless, and it never grows an image: the plain encode
   is produced alongside and the smaller returned.
 - **Lossy (VarDCT) mode**: XYB colour, square 8×8/16×16/32×32, rectangular
-  8×16/16×8/32×16/16×32, and the small DCT2/DCT4 blocks chosen by a rate estimate
-  — the 32×32 taking a smooth region (a sky, a road) in one block, the rectangular
-  blocks content that runs one way (a horizon, a wall's edge), DCT2/DCT4 the
-  piecewise-flat blocks a plain DCT8 rings on (a hard edge, a text stroke), about
+  8×16/16×8/32×16/16×32, and the small DCT2/DCT4/DCT4×8/DCT8×4 blocks chosen by a
+  rate estimate — the 32×32 taking a smooth region (a sky, a road) in one block,
+  the rectangular blocks content that runs one way (a horizon, a wall's edge), the
+  small transforms the piecewise-flat blocks a plain DCT8 rings on (a hard edge, a
+  text stroke), about
   10% smaller on a directional photograph (`bike`) — activity-masked adaptive
   quantisation, default quantisation tables with a distance-controlled quantiser
   (`VarDctEncoder.encode(rgb, w, h, distance)`), and an iterative

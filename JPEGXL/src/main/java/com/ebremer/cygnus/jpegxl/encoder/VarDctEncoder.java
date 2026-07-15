@@ -84,6 +84,8 @@ public final class VarDctEncoder {
     private static final TransformType DCT8 = TransformType.byType(0);
     private static final TransformType DCT2 = TransformType.byType(2);   // hierarchical 2/4/8
     private static final TransformType DCT4 = TransformType.byType(3);   // four 4x4 quadrants
+    private static final TransformType DCT4_8 = TransformType.byType(12); // two 4x8 halves
+    private static final TransformType DCT8_4 = TransformType.byType(13); // two 8x4 halves
     private static final TransformType DCT16 = TransformType.byType(4);
     private static final TransformType DCT32 = TransformType.byType(5);
     private static final TransformType DCT8_16 = TransformType.byType(7);  // 8 tall, 16 wide
@@ -762,6 +764,8 @@ public final class VarDctEncoder {
             switch (tt.method) {
                 case DCT2 -> SmallDct.forwardDct2(block, coeffs);
                 case DCT4 -> SmallDct.forwardDct4(block, coeffs, s.s0, s.s1);
+                case DCT4_8 -> SmallDct.forwardDct4x8(block, coeffs, s.s0, s.s1);
+                case DCT8_4 -> SmallDct.forwardDct8x4(block, coeffs, s.s0, s.s1);
                 default -> Dct.forward2D(block, 0, 8, coeffs, 0, 8, 8, 8, s.s0, s.s1);
             }
             dcOut[c] = Math.round(coeffs[0] / scaledDequant[c]);
@@ -790,37 +794,48 @@ public final class VarDctEncoder {
      * DCT8 (or a larger block) already handles. Runs before sharpness, so the EPF
      * estimate sees the final types.
      */
+    private static final TransformType[] SMALL_TYPES = {DCT2, DCT4, DCT4_8, DCT8_4};
+
     private void postPassSmall() {
         sweep(h8, by -> {
             Scratch s = new Scratch();
-            int[][] q2 = new int[3][];
-            int[][] q4 = new int[3][];
-            int[] dc2 = new int[3];
-            int[] dc4 = new int[3];
+            int[][] q = new int[3][];
+            int[] dc = new int[3];
+            int[][] bestQ = new int[3][];
+            int[] bestDc = new int[3];
             for (int bx = 0; bx < w8; bx++) {
                 int k = by * w8 + bx;
                 if (blockType[k] != DCT8.type) {
                     continue;   // only plain 8x8 blocks; the margin does the rest
                 }
                 // the committed DCT8's rate, from its stored coefficients — no need
-                // to transform it again, only DCT2 and DCT4 are new work here
+                // to transform it again, only the small candidates are new work here
                 double cost8 = 1;
                 for (int c = 0; c < 3; c++) {
-                    int[] q = hfQuant[c][k];
+                    int[] qc = hfQuant[c][k];
                     for (int j = 1; j < 64; j++) {
-                        cost8 += tokenCost(q[j]);
+                        cost8 += tokenCost(qc[j]);
                     }
                 }
                 int mul = blockMul[k];
-                double cost2 = quantiseCell(by, bx, DCT2, mul, s, q2, dc2);
-                double cost4 = quantiseCell(by, bx, DCT4, mul, s, q4, dc4);
-                double bestAlt = Math.min(cost2, cost4);
-                if (bestAlt < SMALL_GAIN * cost8) {
-                    boolean two = cost2 <= cost4;
-                    blockType[k] = (byte) (two ? DCT2.type : DCT4.type);
+                double best = SMALL_GAIN * cost8;   // an alternative must beat this
+                TransformType bestTt = null;
+                for (TransformType tt : SMALL_TYPES) {
+                    double cost = quantiseCell(by, bx, tt, mul, s, q, dc);
+                    if (cost < best) {
+                        best = cost;
+                        bestTt = tt;
+                        for (int c = 0; c < 3; c++) {
+                            bestQ[c] = q[c];
+                            bestDc[c] = dc[c];
+                        }
+                    }
+                }
+                if (bestTt != null) {
+                    blockType[k] = (byte) bestTt.type;
                     for (int c = 0; c < 3; c++) {
-                        hfQuant[c][k] = two ? q2[c] : q4[c];
-                        dcQuant[c][k] = two ? dc2[c] : dc4[c];
+                        hfQuant[c][k] = bestQ[c];
+                        dcQuant[c][k] = bestDc[c];
                     }
                 }
             }
