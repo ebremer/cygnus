@@ -1666,6 +1666,36 @@ public final class VarDctEncoder {
     }
 
     /**
+     * Progressive lossy colour: the same quantised image, but the AC coefficients
+     * are split across {@code shifts.length} passes so a decoder can show a coarse
+     * version and refine it as more of the stream arrives. {@code shifts} is the
+     * per-pass coefficient shift, strictly decreasing and ending at zero — e.g.
+     * {@code {1,0}} for a two-pass encode where the first pass drops each
+     * coefficient's low bit. A full decode is bit-identical to
+     * {@link #encode}; an early-terminated one is a coarser but valid picture. No
+     * extra channels (colour only).
+     */
+    public static byte[] encodeProgressive(int[][] planes, int width, int height, int bits,
+            boolean grey, float distance, int[] shifts) throws IOException {
+        if (shifts.length < 2 || shifts[shifts.length - 1] != 0) {
+            throw new IllegalArgumentException("progressive needs >= 2 passes, shifts ending at 0");
+        }
+        for (int i = 1; i < shifts.length; i++) {
+            if (shifts[i] >= shifts[i - 1]) {
+                throw new IllegalArgumentException("shifts must strictly decrease");
+            }
+        }
+        BitDepth depth = BitDepth.of(bits);
+        java.util.List<ExtraChannelInfo> extras = JxlEncoder.alphaOnly(depth, false, false);
+        checkInput(planes, width, height, depth, grey, extras);
+        VarDctEncoder enc = new VarDctEncoder(width, height, depth, grey, extras, distance);
+        int colour = grey ? 1 : 3;
+        enc.loadWhole(java.util.Arrays.copyOf(planes, colour));
+        enc.quantiseWindow(Double.NaN);
+        return enc.standaloneProgressive(shifts);
+    }
+
+    /**
      * Encodes floating-point samples lossily.
      *
      * <p>The float goes straight into the XYB conversion, and that is the whole
@@ -2071,9 +2101,129 @@ public final class VarDctEncoder {
         }
     }
 
+    /**
+     * A progressive (multi-pass) VarDCT frame. The quantised coefficients are the
+     * same as a single-pass encode; each pass carries a shifted slice of them
+     * ({@link #passSplit}), and the slices sum back on decode, so a full decode is
+     * the single-pass image while a decode that stops after an early pass is a
+     * coarser but valid picture. The DC/LF is not split — it stays whole in its own
+     * sections — so an LfGroup already gives the 1:8 preview; the passes refine the
+     * AC on top. Always multi-section (a pass is a section of its own); no extra
+     * channels.
+     */
+    private void writeProgressiveFrame(BitWriter out, int[] shifts) throws IOException {
+        int numPasses = shifts.length;
+        int groupColumns = ceilDiv(width, GROUP_DIM);
+        int numGroups = groupColumns * ceilDiv(height, GROUP_DIM);
+        int lfDim = GROUP_DIM * 8;
+        int lfCols = ceilDiv(width, lfDim);
+        int numLfGroups = lfCols * ceilDiv(height, lfDim);
+
+        Cells cells = windowCells();
+
+        // tokenize every group for every pass; one entropy code per pass
+        EntropyEncoder[] passEnc = new EntropyEncoder[numPasses];
+        int[][][] passCtx = new int[numPasses][numGroups][];
+        int[][][] passVal = new int[numPasses][numGroups][];
+        for (int p = 0; p < numPasses; p++) {
+            passEnc[p] = new EntropyEncoder(CONTEXTS_PER_PRESET, false);
+            for (int g = 0; g < numGroups; g++) {
+                Tokens t = new Tokens();
+                tokenizeGroup(g / groupColumns, g % groupColumns, t, p, shifts);
+                passCtx[p][g] = java.util.Arrays.copyOf(t.ctx, t.n);
+                passVal[p][g] = java.util.Arrays.copyOf(t.val, t.n);
+                for (int i = 0; i < t.n; i++) {
+                    passEnc[p].count(t.ctx[i], t.val[i]);
+                }
+            }
+        }
+
+        BitWriter lfg = new BitWriter();
+        writeLfGlobalBits(lfg, false, new int[0][]);
+        lfg.zeroPadToByte();
+        byte[] lfGlobalBytes = lfg.toByteArray();
+        byte[][] lfGroupBytes = new byte[numLfGroups][];
+        for (int gg = 0; gg < numLfGroups; gg++) {
+            BitWriter w = new BitWriter();
+            writeLfGroupBits(w, cells, gg, lfCols);
+            w.zeroPadToByte();
+            lfGroupBytes[gg] = w.toByteArray();
+        }
+        BitWriter hfg = new BitWriter();
+        writeHfGlobalBits(hfg, passEnc, numGroups, 1);
+        hfg.zeroPadToByte();
+        byte[] hfGlobalBytes = hfg.toByteArray();
+
+        // pass-group sections, pass-major to match Toc.passGroupIndex
+        byte[][] passGroupBytes = new byte[numPasses * numGroups][];
+        for (int p = 0; p < numPasses; p++) {
+            for (int g = 0; g < numGroups; g++) {
+                BitWriter gw = new BitWriter();
+                for (int i = 0; i < passCtx[p][g].length; i++) {
+                    passEnc[p].write(gw, passCtx[p][g][i], passVal[p][g][i]);
+                }
+                gw.zeroPadToByte();
+                passGroupBytes[p * numGroups + g] = gw.toByteArray();
+            }
+        }
+
+        writeFrameHeader(out, 0, 128 | (noiseLut != null ? 1 : 0), shifts);
+        out.writeBool(false); // TOC not permuted
+        out.zeroPadToByte();
+        writeTocEntry(out, lfGlobalBytes.length);
+        for (byte[] b : lfGroupBytes) {
+            writeTocEntry(out, b.length);
+        }
+        writeTocEntry(out, hfGlobalBytes.length);
+        for (byte[] b : passGroupBytes) {
+            writeTocEntry(out, b.length);
+        }
+        out.zeroPadToByte();
+        out.writeBytes(lfGlobalBytes);
+        for (byte[] b : lfGroupBytes) {
+            out.writeBytes(b);
+        }
+        out.writeBytes(hfGlobalBytes);
+        for (byte[] b : passGroupBytes) {
+            out.writeBytes(b);
+        }
+    }
+
+    /** {@link #standalone} for a progressive frame. */
+    byte[] standaloneProgressive(int[] shifts) throws IOException {
+        BitWriter out = new BitWriter();
+        out.write(0xff, 8);
+        out.write(0x0a, 8);
+        new SizeHeader(width, height).write(out);
+        ImageMetadata meta = JxlEncoder.buildMetadata(depth, grey, extras);
+        meta.xybEncoded = true;
+        meta.write(out);
+        writeProgressiveFrame(out, shifts);
+        return out.toByteArray();
+    }
+
     /** The default block context of visual channel {@code c} for an order id. */
     private static int blockCtxOf(int c, int orderId) {
         return DEFAULT_CTX_MAP[(c < 2 ? 1 - c : c) * 13 + orderId];
+    }
+
+    /** One pass, shift zero: the whole coefficient in a single pass. */
+    private static final int[] SINGLE_SHIFT = {0};
+
+    /**
+     * The value pass {@code p} codes for a quantised coefficient {@code q}, so the
+     * passes sum back to it — the decoder does {@code coeffs += value << shift[p]}.
+     * With shifts strictly decreasing to zero, pass p carries q's bits in
+     * [shift[p], shift[p-1]); pass 0 the top bits, the last pass the remainder. A
+     * single pass (shift 0) returns q unchanged.
+     */
+    static int passSplit(int q, int pass, int[] shifts) {
+        int s = shifts[pass];
+        if (pass == 0) {
+            return q >> s;
+        }
+        int prev = shifts[pass - 1];
+        return (q >> s) - ((q >> prev) << (prev - s));
     }
 
     /**
@@ -2081,6 +2231,11 @@ public final class VarDctEncoder {
      * in the image; the window must hold it.
      */
     void tokenizeGroup(int gRow, int gCol, Tokens tokens) {
+        tokenizeGroup(gRow, gCol, tokens, 0, SINGLE_SHIFT);
+    }
+
+    /** Tokenizes one group for one progressive pass ({@link #passSplit}). */
+    void tokenizeGroup(int gRow, int gCol, Tokens tokens, int pass, int[] shifts) {
         int by0 = (gRow << 5) - cellRow0;
         int bx0 = gCol << 5;
         int byN = Math.min(by0 + 32, h8);
@@ -2109,7 +2264,7 @@ public final class VarDctEncoder {
                             if (y < tt.blockHeight && x < tt.blockWidth) {
                                 continue;
                             }
-                            if (q[y * pw + x] != 0) {
+                            if (passSplit(q[y * pw + x], pass, shifts) != 0) {
                                 nonZero++;
                             }
                         }
@@ -2139,7 +2294,7 @@ public final class VarDctEncoder {
                         // flip maps the natural order slot to: (ox, oy) for a
                         // flipped (square or vertical) block, (oy, ox) otherwise.
                         // hfQuant is held in that plane layout.
-                        int v = q[(flip ? ox : oy) * pw + (flip ? oy : ox)];
+                        int v = passSplit(q[(flip ? ox : oy) * pw + (flip ? oy : ox)], pass, shifts);
                         int prev = j == numBlocks
                                 ? (nonZero > orderSize / 16 ? 0 : 1)
                                 : (prevToken != 0 ? 1 : 0);
@@ -2365,12 +2520,19 @@ public final class VarDctEncoder {
     }
 
     void writeHfGlobalBits(BitWriter w, EntropyEncoder hfEnc, int numGroups, int numHfPresets) {
+        writeHfGlobalBits(w, new EntropyEncoder[] {hfEnc}, numGroups, numHfPresets);
+    }
+
+    /** HfGlobal for {@code passEnc.length} progressive passes: one HfPass spec each. */
+    void writeHfGlobalBits(BitWriter w, EntropyEncoder[] passEnc, int numGroups, int numHfPresets) {
         writeDequantHeader(w);
         int bits = numGroups > 1 ? 32 - Integer.numberOfLeadingZeros(numGroups - 1) : 0;
         w.write(numHfPresets - 1, bits);
-        // HfPass 0: no coded orders, then the coefficient code spec
-        w.write(2, 2);     // used_orders selector 2 -> 0
-        hfEnc.writeSpec(w);
+        // one HfPass per pass: no coded orders, then that pass's coefficient code spec
+        for (EntropyEncoder e : passEnc) {
+            w.write(2, 2);     // used_orders selector 2 -> 0
+            e.writeSpec(w);
+        }
     }
 
     /**
@@ -2440,6 +2602,14 @@ public final class VarDctEncoder {
     }
 
     static void writeFrameHeader(BitWriter out, int numExtra, long flags) {
+        writeFrameHeader(out, numExtra, flags, null);
+    }
+
+    /**
+     * {@code shifts} non-null and longer than one selects progressive: {@code shifts.length}
+     * passes (the last shift zero, not written) with no downsampling.
+     */
+    static void writeFrameHeader(BitWriter out, int numExtra, long flags, int[] shifts) {
         out.zeroPadToByte();
         out.writeBool(false);        // !all_default
         out.write(0, 2);             // frame_type: regular
@@ -2452,7 +2622,7 @@ public final class VarDctEncoder {
         }
         out.write(2, 3);             // x_qm_scale = 2
         out.write(2, 3);             // b_qm_scale = 2
-        out.write(0, 2);             // num_passes = 1
+        writePasses(out, shifts);
         out.writeBool(false);        // have_crop
         int blendEntries = 1 + numExtra;
         for (int i = 0; i < blendEntries; i++) {
@@ -2469,6 +2639,27 @@ public final class VarDctEncoder {
             out.writeBool(true);     // RestorationFilter all_default: gaborish + EPF
         }
         out.writeU64(0);             // frame header extensions
+    }
+
+    /** The Passes bundle: {@code num_passes}, {@code num_ds}=0, then each pass's shift. */
+    private static void writePasses(BitWriter out, int[] shifts) {
+        int n = shifts == null ? 1 : shifts.length;
+        if (n == 1) {
+            out.write(0, 2);         // num_passes = 1 (u32 selector 0)
+            return;
+        }
+        if (n == 2) {
+            out.write(1, 2);
+        } else if (n == 3) {
+            out.write(2, 2);
+        } else {
+            out.write(3, 2);
+            out.write(n - 4, 3);
+        }
+        out.write(0, 2);             // num_ds = 0 (no downsampling)
+        for (int i = 0; i < n - 1; i++) {
+            out.write(shifts[i], 2); // last pass's shift is zero, not written
+        }
     }
 
     static void writeTocEntry(BitWriter out, int size) {

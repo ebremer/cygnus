@@ -198,7 +198,11 @@ cropped result; reference, LF and preview frames always decode whole.
   artefact outweighs the same error smeared thin, which stops it banding a
   gradient the way a mean-error target does (`PerceptualDistortion`; a proxy, not
   a port of libjxl's Butteraugli, `-Djxl.enc.maeRate` for the old mean-error
-  loop); the ImageIO quality knob uses the latter.
+  loop); the ImageIO quality knob uses the latter. A frame can also be made
+  **progressive** (`encodeProgressive(rgb, w, h, bits, grey, distance, shifts)`):
+  the AC coefficients are split across passes by a per-pass shift so a prefix of
+  the bytes decodes to a coarse picture and more of them refine it, a full decode
+  being bit-for-bit the single-pass image.
 - **Lossy XYB-modular mode**: the second lossy path, coding the same XYB colour
   through the modular coder instead of the DCT — `JxlEncoder.encodeXyb(rgb, w, h,
   bits, distance)`, or the `modular-lossy` ImageIO compression type. Each XYB

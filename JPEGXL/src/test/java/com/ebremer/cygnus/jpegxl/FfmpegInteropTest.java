@@ -206,6 +206,45 @@ class FfmpegInteropTest {
     }
 
     /**
+     * A progressive (multi-pass) VarDCT frame. libjxl decodes all passes and must
+     * reconstruct the same image we do — the passes are a re-partitioning of the
+     * same coefficients, so a full decode is the single-pass picture. This checks
+     * the passes bundle in the header, the per-pass HfPass specs, and the pass-major
+     * section layout are all signalled correctly.
+     */
+    @Test
+    void ffmpegAgreesOnOurProgressiveOutput() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 300;
+        int h = 260;
+        int[][] src = new int[3][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                src[0][i] = Math.max(0, Math.min(255, 120 + (int) (80 * Math.sin(x * 0.04) * Math.cos(y * 0.03))));
+                src[1][i] = Math.max(0, Math.min(255, 110 + (int) (70 * Math.sin((x + y) * 0.02))));
+                src[2][i] = Math.max(0, Math.min(255, 100 + (int) (60 * Math.cos(x * 0.015 - y * 0.025))));
+            }
+        }
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encodeProgressive(
+                deepCopy(src), w, h, 8, false, 1.5f, new int[] {2, 1, 0});
+        Path jxlFile = tempDir.resolve("ours-progressive.jxl");
+        Path rawFile = tempDir.resolve("ffdec-progressive.raw");
+        Files.write(jxlFile, jxl);
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+        int[][] ours = JxlDecoder.decode(jxl).frames.get(0).channels;
+        int worst = 0;
+        for (int p = 0; p < 3; p++) {
+            for (int i = 0; i < w * h; i++) {
+                worst = Math.max(worst, Math.abs(ours[p][i] - theirs[p][i]));
+            }
+        }
+        assertTrue(worst <= 2, "our progressive decode disagrees with libjxl: worst " + worst);
+    }
+
+    /**
      * A custom (non-default) DCT8 quant matrix, signalled as MODE_DCT distance
      * bands in the codestream, must be read and applied by libjxl exactly as we
      * apply it — otherwise our decode and libjxl's would diverge on every 8x8
