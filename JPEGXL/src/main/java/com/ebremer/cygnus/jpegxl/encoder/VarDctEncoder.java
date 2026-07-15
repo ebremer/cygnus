@@ -1703,13 +1703,18 @@ public final class VarDctEncoder {
             boolean grey, java.util.List<ExtraChannelInfo> extras, float distance)
             throws IOException {
         float d = Math.max(0.1f, distance);
-        double target = targetError(d);
+        // Read dynamically (not a static-final flag) so tests can toggle the
+        // metric between encodes in one JVM, as the other -Djxl flags do.
+        boolean perceptual = !Boolean.getBoolean("jxl.enc.maeRate");
+        double target = perceptual ? perceptualTarget(d) : targetError(d);
         byte[] best = null;
         double bestMiss = Double.MAX_VALUE;
         float tryD = d;
         for (int round = 0; round < 3; round++) {
             byte[] jxl = encodeSamples(planes, width, height, depth, grey, extras, tryD);
-            double err = measureError(planes, width, height, depth, grey, jxl);
+            double err = perceptual
+                    ? measurePerceptual(planes, width, height, depth, grey, jxl)
+                    : measureError(planes, width, height, depth, grey, jxl);
             double miss = Math.abs(Math.log(Math.max(err, 1e-3) / target));
             if (miss < bestMiss) {
                 bestMiss = miss;
@@ -1730,6 +1735,19 @@ public final class VarDctEncoder {
     /** The weighted mean absolute sRGB error a distance is expected to produce. */
     static double targetError(float distance) {
         return 0.9 * Math.pow(distance, 0.9);
+    }
+
+    /**
+     * The {@link PerceptualDistortion} a distance is meant to achieve — the
+     * curve the perceptual rate control steers toward. Calibrated so that a
+     * typical photograph coded at the requested distance already lands near its
+     * target (little iteration needed), leaving the loop to correct the content
+     * the base quantiser misjudges: smooth gradients it bands, busy frames it
+     * over-spends on. The metric's own scale is arbitrary, so this curve — not
+     * any libjxl number — is the anchor.
+     */
+    static double perceptualTarget(float distance) {
+        return 0.056 * Math.pow(distance, 0.73);
     }
 
     /** The distance to try next, given what the last one achieved. */
@@ -1798,6 +1816,34 @@ public final class VarDctEncoder {
             }
         }
         return sum / (4.0 * n) * (255.0 / ((1 << depth.bitsPerSample) - 1));
+    }
+
+    /**
+     * {@link PerceptualDistortion} between the input and a self-decode, in the
+     * sRGB display space both share. The perceptual rate control drives on this
+     * in place of {@link #measureError}; it is what lets the loop see banding an
+     * absolute-error target averages away.
+     */
+    static double measurePerceptual(int[][] planes, int width, int height, BitDepth depth,
+            boolean grey, byte[] jxl) throws IOException {
+        com.ebremer.cygnus.jpegxl.decoder.JxlFrame frame =
+                com.ebremer.cygnus.jpegxl.decoder.JxlDecoder.decode(jxl).frames.get(0);
+        int n = width * height;
+        int cc = grey ? 1 : 3;
+        float[][] orig = new float[cc][n];
+        float[][] dec = new float[cc][n];
+        double scale = depth.floatingPoint ? 1.0 : 1.0 / ((1 << depth.bitsPerSample) - 1);
+        for (int c = 0; c < cc; c++) {
+            for (int i = 0; i < n; i++) {
+                orig[c][i] = depth.floatingPoint
+                        ? depth.sampleToFloat(planes[c][i])
+                        : (float) (planes[c][i] * scale);
+                dec[c][i] = depth.floatingPoint
+                        ? frame.floatChannels[c][i]
+                        : (float) (frame.channels[c][i] * scale);
+            }
+        }
+        return new PerceptualDistortion(width, height).distance(orig, dec, grey);
     }
 
     // --------------------------------------------------------------- frame

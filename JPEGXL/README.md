@@ -184,8 +184,13 @@ cropped result; reference, LF and preview frames always decode whole.
   10% smaller on a directional photograph (`bike`) — activity-masked adaptive
   quantisation, default quantisation tables with a distance-controlled quantiser
   (`VarDctEncoder.encode(rgb, w, h, distance)`), and an iterative
-  rate-control mode (`encodeToTarget`) that refines the quantiser against
-  the achieved error; the ImageIO quality knob uses the latter.
+  rate-control mode (`encodeToTarget`) that refines the quantiser against a
+  perceptual, Butteraugli-inspired error measure — opsin-domain, split into
+  frequency bands, masking-aware, and pooled with a p-norm so a concentrated
+  artefact outweighs the same error smeared thin, which stops it banding a
+  gradient the way a mean-error target does (`PerceptualDistortion`; a proxy, not
+  a port of libjxl's Butteraugli, `-Djxl.enc.maeRate` for the old mean-error
+  loop); the ImageIO quality knob uses the latter.
 - **Lossy XYB-modular mode**: the second lossy path, coding the same XYB colour
   through the modular coder instead of the DCT — `JxlEncoder.encodeXyb(rgb, w, h,
   bits, distance)`, or the `modular-lossy` ImageIO compression type. Each XYB
@@ -262,10 +267,11 @@ cropped result; reference, LF and preview frames always decode whole.
     than one band is byte-identical to the whole-image encoder.
   - *Rate control* (`targetingQuality`) sets each band's quantiser by encoding and
     decoding the busiest group in it, so quality tracks the requested distance
-    without a whole-image pass. On slide-like content it beats whole-image
-    `encodeToTarget` outright — that loop drives the error *averaged over the
-    frame* to the target, and when most of the frame is blank, the average is the
-    blank.
+    without a whole-image pass. It keeps an edge on slide-like content over
+    whole-image `encodeToTarget`: even now that the whole-image loop pools its
+    error with a p-norm that lifts the busy regions above a mostly-blank frame's
+    average, a per-band quantiser still fits that frame's few dense groups more
+    tightly than one global setting can.
 - **Floating-point samples**, everywhere the integer path goes: whole-image
   (`JxlEncoder.encodeFloat`), streaming (`JxlStreamingEncoder.floatSamples`),
   lossy (`VarDctEncoder.encodeFloat`), and through ImageIO on a `TYPE_FLOAT`
