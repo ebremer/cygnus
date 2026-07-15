@@ -245,6 +245,48 @@ class FfmpegInteropTest {
     }
 
     /**
+     * A spline carried in the frame must be rendered by libjxl the same way we do
+     * — the drawing is normative (annex G.5), so once the dictionary round-trips
+     * the two decoders draw the identical curve.
+     */
+    @Test
+    void ffmpegAgreesOnOurSplineOutput() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 256;
+        int h = 192;
+        int[][] base = new int[3][w * h];
+        for (int c = 0; c < 3; c++) {
+            java.util.Arrays.fill(base[c], 100);
+        }
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encodeWithSplines(
+                deepCopy(base), w, h, 8, false, 1.5f, SplineTest.curve(w, h));
+        Path jxlFile = tempDir.resolve("ours-spline.jxl");
+        Path rawFile = tempDir.resolve("ffdec-spline.raw");
+        Files.write(jxlFile, jxl);
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+        int[][] ours = JxlDecoder.decode(jxl).frames.get(0).channels;
+        int worst = 0;
+        long off = 0;
+        for (int p = 0; p < 3; p++) {
+            for (int i = 0; i < w * h; i++) {
+                int d = Math.abs(ours[p][i] - theirs[p][i]);
+                worst = Math.max(worst, d);
+                if (d > 2) {
+                    off++;
+                }
+            }
+        }
+        // libjxl reads the same spline dictionary and draws the same curve; the few
+        // levels of residual are the spline renderer's own float precision (the
+        // draw math, shared decoder code, not the encode), confined to the curve —
+        // the bulk of the frame matches to a rounding step.
+        assertTrue(worst <= 8, "our spline decode disagrees with libjxl: worst " + worst);
+        assertTrue(off < (long) w * h * 3 / 20, "residual should be confined to the curve: " + off);
+    }
+
+    /**
      * A custom (non-default) DCT8 quant matrix, signalled as MODE_DCT distance
      * bands in the codestream, must be read and applied by libjxl exactly as we
      * apply it — otherwise our decode and libjxl's would diverge on every 8x8

@@ -6,6 +6,7 @@ import com.ebremer.cygnus.jpegxl.codestream.ImageMetadata;
 import com.ebremer.cygnus.jpegxl.codestream.RestorationFilter;
 import com.ebremer.cygnus.jpegxl.codestream.SizeHeader;
 import com.ebremer.cygnus.jpegxl.decoder.RestorationFilters;
+import com.ebremer.cygnus.jpegxl.features.Splines;
 import com.ebremer.cygnus.jpegxl.io.BitWriter;
 import com.ebremer.cygnus.jpegxl.io.Bits;
 import com.ebremer.cygnus.jpegxl.vardct.Dct;
@@ -188,6 +189,7 @@ public final class VarDctEncoder {
     private final boolean grey;
     private final java.util.List<ExtraChannelInfo> extras;
     private float[] noiseLut;      // 8-point photon-noise strengths, or null for no noise
+    private Splines splines;       // additive curves, or null for none
     private boolean animated;      // this frame is one of an animation (carries a duration)
     private long animDuration;     // ticks this frame shows for
     private boolean animLast = true; // whether this is the animation's final frame
@@ -1760,6 +1762,30 @@ public final class VarDctEncoder {
     }
 
     /**
+     * Lossy colour with a spline overlay: the base image goes through the
+     * quantiser as usual, and {@code splines} — centripetal Catmull-Rom curves
+     * with colour and thickness along their length — are carried in the frame's
+     * LfGlobal and drawn additively over the decoded image, by our decoder and by
+     * libjxl alike. The splines are supplied, not detected: fitting the curves of
+     * an arbitrary picture is its own problem, and left to the caller who knows
+     * where its lines are. Colour only.
+     */
+    public static byte[] encodeWithSplines(int[][] planes, int width, int height, int bits,
+            boolean grey, float distance, Splines splines) throws IOException {
+        if (grey) {
+            throw new IllegalArgumentException("splines need a colour image");
+        }
+        BitDepth depth = BitDepth.of(bits);
+        java.util.List<ExtraChannelInfo> extras = JxlEncoder.alphaOnly(depth, false, false);
+        checkInput(planes, width, height, depth, grey, extras);
+        VarDctEncoder enc = new VarDctEncoder(width, height, depth, grey, extras, distance);
+        enc.splines = splines;
+        enc.loadWhole(java.util.Arrays.copyOf(planes, 3));
+        enc.quantiseWindow(Double.NaN);
+        return enc.standalone(java.util.Arrays.copyOfRange(planes, 3, planes.length));
+    }
+
+    /**
      * Encodes floating-point samples lossily.
      *
      * <p>The float goes straight into the XYB conversion, and that is the whole
@@ -2101,7 +2127,7 @@ public final class VarDctEncoder {
             }
             one.zeroPadToByte();
             byte[] payload = one.toByteArray();
-            writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0), null,
+            writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0) | (splines != null ? 16 : 0), null,
                     animated, animDuration, animLast, animTimecodes, animTimecode);
             out.writeBool(false); // TOC not permuted
             out.zeroPadToByte();
@@ -2144,7 +2170,7 @@ public final class VarDctEncoder {
         }
 
         // ---- header + TOC + payload
-        writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0), null,
+        writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0) | (splines != null ? 16 : 0), null,
                 animated, animDuration, animLast, animTimecodes, animTimecode);
         out.writeBool(false); // TOC not permuted
         out.zeroPadToByte();
@@ -2233,7 +2259,7 @@ public final class VarDctEncoder {
             }
         }
 
-        writeFrameHeader(out, 0, 128 | (noiseLut != null ? 1 : 0), shifts);
+        writeFrameHeader(out, 0, 128 | (noiseLut != null ? 1 : 0) | (splines != null ? 16 : 0), shifts);
         out.writeBool(false); // TOC not permuted
         out.zeroPadToByte();
         writeTocEntry(out, lfGlobalBytes.length);
@@ -2379,8 +2405,11 @@ public final class VarDctEncoder {
     }
 
     void writeLfGlobalBits(BitWriter w, boolean single, int[][] extraPlanes) {
-        // patches and splines are off (their flags are clear); the noise table,
-        // if any, is the first thing the LfGlobal section carries
+        // patches are off; the spline dictionary (if any) heads the LfGlobal
+        // section, then the noise table, then the dequantisation
+        if (splines != null) {
+            SplineWriter.write(w, splines);
+        }
         if (noiseLut != null) {
             for (int i = 0; i < 8; i++) {
                 w.write(Math.min(1023, Math.round(noiseLut[i] * 1024f)), 10);

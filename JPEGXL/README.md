@@ -251,6 +251,11 @@ cropped result; reference, LF and preview frames always decode whole.
   than the encoder coding it — eighty bits that turn a plasticky smooth lossy
   render grainy again. The synthesis is normative, so libjxl reproduces it pixel
   for pixel.
+- **Splines**: `VarDctEncoder.encodeWithSplines(base, …, splines)` carries
+  caller-supplied curves — a colour and thickness varying along a centripetal
+  Catmull-Rom spline — in the frame, drawn additively over the decode. The encoder
+  writes them, it does not detect them (fitting the curves of an arbitrary picture
+  is its own problem); the drawing is normative, so libjxl renders the same curve.
 - **Animation**: `JxlEncoder.encodeAnimation` writes a sequence of frames with a
   timebase (ticks per second, loop count) and, per frame, a duration and a way
   of joining the canvas — a whole picture that replaces (`AnimationFrame.full`),
