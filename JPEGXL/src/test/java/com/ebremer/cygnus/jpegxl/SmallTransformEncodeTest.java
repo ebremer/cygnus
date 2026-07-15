@@ -103,6 +103,50 @@ class SmallTransformEncodeTest {
         assertTrue(meanError(src, img.frames.get(0).channels, w, h) < 6.0, "round-trip off");
     }
 
+    /** Flat background with scattered diagonal-corner blocks — the AFV transform's territory. */
+    static int[][] diagonalCorners(int w, int h) {
+        int[][] p = new int[3][w * h];
+        for (int i = 0; i < w * h; i++) {
+            p[0][i] = p[1][i] = p[2][i] = 128;
+        }
+        for (int by = 0; by < h / 8; by++) {
+            for (int bx = 0; bx < w / 8; bx++) {
+                if ((bx * 7 + by * 13) % 3 != 0) {
+                    continue;
+                }
+                boolean fl = ((bx + by) & 1) == 0;
+                for (int y = 0; y < 8; y++) {
+                    for (int x = 0; x < 8; x++) {
+                        boolean in = fl ? (x + y < 8) : (x > y);
+                        int v = in ? 40 : 220;
+                        int i = (by * 8 + y) * w + bx * 8 + x;
+                        p[0][i] = p[1][i] = p[2][i] = v;
+                    }
+                }
+            }
+        }
+        return p;
+    }
+
+    @Test
+    void afvFiresOnDiagonalCorners() throws Exception {
+        int w = 256;
+        int h = 192;
+        int[][] src = diagonalCorners(w, h);
+        long before = 0;
+        for (int t = 14; t <= 17; t++) {
+            before += VarDctEncoder.TYPE_HIST.get(t);
+        }
+        byte[] jxl = VarDctEncoder.encode(src, w, h, 1.0f);
+        long fired = 0;
+        for (int t = 14; t <= 17; t++) {
+            fired += VarDctEncoder.TYPE_HIST.get(t);
+        }
+        assertTrue(fired - before > 0, "diagonal-corner blocks should draw AFV transforms");
+        JxlImage img = JxlDecoder.decode(jxl);
+        assertTrue(meanError(src, img.frames.get(0).channels, w, h) < 6.0, "AFV round-trip off");
+    }
+
     /** The choice never breaks an image it does not help: a smooth gradient still round-trips. */
     @Test
     void smoothImageUnharmed() throws Exception {

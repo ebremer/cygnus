@@ -86,6 +86,11 @@ public final class VarDctEncoder {
     private static final TransformType DCT4 = TransformType.byType(3);   // four 4x4 quadrants
     private static final TransformType DCT4_8 = TransformType.byType(12); // two 4x8 halves
     private static final TransformType DCT8_4 = TransformType.byType(13); // two 8x4 halves
+    private static final TransformType HORNUSS = TransformType.byType(1);  // spike model
+    private static final TransformType AFV0 = TransformType.byType(14);    // asymmetric corner
+    private static final TransformType AFV1 = TransformType.byType(15);
+    private static final TransformType AFV2 = TransformType.byType(16);
+    private static final TransformType AFV3 = TransformType.byType(17);
     private static final TransformType DCT16 = TransformType.byType(4);
     private static final TransformType DCT32 = TransformType.byType(5);
     private static final TransformType DCT8_16 = TransformType.byType(7);  // 8 tall, 16 wide
@@ -766,6 +771,8 @@ public final class VarDctEncoder {
                 case DCT4 -> SmallDct.forwardDct4(block, coeffs, s.s0, s.s1);
                 case DCT4_8 -> SmallDct.forwardDct4x8(block, coeffs, s.s0, s.s1);
                 case DCT8_4 -> SmallDct.forwardDct8x4(block, coeffs, s.s0, s.s1);
+                case HORNUSS -> Transforms.forwardHornuss(block, coeffs);
+                case AFV -> Transforms.forwardAfv(tt, block, coeffs, s.s0, s.s1);
                 default -> Dct.forward2D(block, 0, 8, coeffs, 0, 8, 8, 8, s.s0, s.s1);
             }
             dcOut[c] = Math.round(coeffs[0] / scaledDequant[c]);
@@ -794,7 +801,11 @@ public final class VarDctEncoder {
      * DCT8 (or a larger block) already handles. Runs before sharpness, so the EPF
      * estimate sees the final types.
      */
-    private static final TransformType[] SMALL_TYPES = {DCT2, DCT4, DCT4_8, DCT8_4};
+    // HORNUSS is implemented (SmallDct/Transforms) and reads back, but is left out
+    // of the tried set: DCT2's hierarchical Hadamard beats it on the dot/spike
+    // patterns it targets, so it never won a block across the test content.
+    private static final TransformType[] SMALL_TYPES =
+            {DCT2, DCT4, DCT4_8, DCT8_4, AFV0, AFV1, AFV2, AFV3};
 
     private void postPassSmall() {
         sweep(h8, by -> {

@@ -266,4 +266,122 @@ public final class Transforms {
             }
         }
     }
+
+    /**
+     * HORNUSS forward: the exact inverse of the decode path — a 2x2 grid of 4x4
+     * cells, each modelled as a centre value with the rest as residuals off it.
+     * {@code block} and {@code coeffs} are 8x8, row-major.
+     */
+    public static void forwardHornuss(float[] block, float[] coeffs) {
+        float[] blockLf = new float[4];   // per cell (Y,X) -> Y*2 + X
+        for (int y = 0; y < 2; y++) {
+            for (int x = 0; x < 2; x++) {
+                float centre = block[(4 * y + 1) * 8 + 4 * x + 1];
+                float residual = 0f;
+                for (int iy = 0; iy < 4; iy++) {
+                    for (int ix = 0; ix < 4; ix++) {
+                        if (iy == 0 && ix == 0) {
+                            continue;   // the cell's DC, carried by blockLf below
+                        }
+                        // the (0,0) pixel carries the (1,1) coefficient; the rest map straight
+                        float v = (iy == 1 && ix == 1)
+                                ? block[4 * y * 8 + 4 * x] - centre
+                                : block[(4 * y + iy) * 8 + 4 * x + ix] - centre;
+                        coeffs[(y + iy * 2) * 8 + x + ix * 2] = v;
+                        residual += v;
+                    }
+                }
+                blockLf[y * 2 + x] = centre + residual * 0.0625f;
+            }
+        }
+        // invert the 2x2 Hadamard butterfly of the DC corner
+        float a = blockLf[0];
+        float b = blockLf[1];
+        float c = blockLf[2];
+        float d = blockLf[3];
+        coeffs[0] = (a + b + c + d) * 0.25f;
+        coeffs[1] = (a + b - c - d) * 0.25f;
+        coeffs[8] = (a - b + c - d) * 0.25f;
+        coeffs[9] = (a - b - c + d) * 0.25f;
+    }
+
+    /**
+     * AFV forward for one of the four variants: the exact inverse of {@link
+     * #invertAFV}. The block is the AFV 4x4 corner (projected onto the orthonormal
+     * basis), a 4x4 DCT corner and a 4x8 DCT half; their three DCs are a coupled
+     * combination of {@code coeffs[0], coeffs[8], coeffs[1]}, solved back here.
+     * {@code s0}/{@code s1} are ≥32 scratch.
+     */
+    public static void forwardAfv(TransformType tt, float[] block, float[] coeffs,
+            float[] s0, float[] s1) {
+        int flipY = tt == TransformType.AFV2 || tt == TransformType.AFV3 ? 1 : 0;
+        int flipX = tt == TransformType.AFV1 || tt == TransformType.AFV3 ? 1 : 0;
+
+        // AFV 4x4 corner: undo the sample flips, project onto the basis
+        float[] samples = new float[16];
+        for (int iy = 0; iy < 4; iy++) {
+            for (int ix = 0; ix < 4; ix++) {
+                samples[(flipY == 1 ? 3 - iy : iy) * 4 + (flipX == 1 ? 3 - ix : ix)] =
+                        block[(flipY * 4 + iy) * 8 + flipX * 4 + ix];
+            }
+        }
+        float[] afv = new float[16];
+        for (int j = 0; j < 16; j++) {
+            float sum = 0f;
+            for (int k = 0; k < 16; k++) {
+                sum += AFV_BASIS[j][k] * samples[k];
+            }
+            afv[j] = sum;
+        }
+        for (int iy = 0; iy < 4; iy++) {
+            for (int ix = 0; ix < 4; ix++) {
+                if (iy == 0 && ix == 0) {
+                    continue;
+                }
+                coeffs[iy * 2 * 8 + ix * 2] = afv[iy * 4 + ix];
+            }
+        }
+
+        // 4x4 DCT corner: undo the transpose, forward-transform
+        float[] tq = new float[16];
+        for (int iy = 0; iy < 4; iy++) {
+            for (int ix = 0; ix < 4; ix++) {
+                tq[ix * 4 + iy] = block[(flipY * 4 + iy) * 8 + (flipX == 1 ? 0 : 4) + ix];
+            }
+        }
+        float[] c44 = new float[16];
+        Dct.forward2D(tq, 0, 4, c44, 0, 4, 4, 4, s0, s1);
+        for (int iy = 0; iy < 4; iy++) {
+            for (int ix = 0; ix < 4; ix++) {
+                if (iy == 0 && ix == 0) {
+                    continue;
+                }
+                coeffs[iy * 2 * 8 + ix * 2 + 1] = c44[iy * 4 + ix];
+            }
+        }
+
+        // 4x8 DCT half
+        float[] r48 = new float[32];
+        for (int iy = 0; iy < 4; iy++) {
+            for (int ix = 0; ix < 8; ix++) {
+                r48[iy * 8 + ix] = block[((flipY == 1 ? 0 : 4) + iy) * 8 + ix];
+            }
+        }
+        float[] c48 = new float[32];
+        Dct.forward2D(r48, 0, 8, c48, 0, 8, 4, 8, s0, s1);
+        for (int iy = 0; iy < 4; iy++) {
+            for (int ix = 0; ix < 8; ix++) {
+                if (iy == 0 && ix == 0) {
+                    continue;
+                }
+                coeffs[(1 + iy * 2) * 8 + ix] = c48[iy * 8 + ix];
+            }
+        }
+
+        // solve the coupled DCs: afv/4 = c0+c8+c1, dc44 = c0+c8-c1, dc48 = c0-c8
+        float sum08 = (afv[0] / 4f + c44[0]) * 0.5f;
+        coeffs[1] = (afv[0] / 4f - c44[0]) * 0.5f;
+        coeffs[0] = (sum08 + c48[0]) * 0.5f;
+        coeffs[8] = (sum08 - c48[0]) * 0.5f;
+    }
 }

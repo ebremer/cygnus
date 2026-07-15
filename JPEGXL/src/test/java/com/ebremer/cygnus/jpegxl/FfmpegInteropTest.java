@@ -404,6 +404,60 @@ class FfmpegInteropTest {
         assertTrue(worst <= 2, "our DCT2/DCT4 decode disagrees with libjxl: worst " + worst);
     }
 
+    /** The four AFV varblocks (asymmetric diagonal corners) reconstruct identically in libjxl. */
+    @Test
+    void ffmpegAgreesOnOurAfvTransforms() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 256;
+        int h = 192;
+        int[][] rgb = new int[3][w * h];
+        for (int i = 0; i < w * h; i++) {
+            rgb[0][i] = rgb[1][i] = rgb[2][i] = 128;
+        }
+        for (int by = 0; by < h / 8; by++) {
+            for (int bx = 0; bx < w / 8; bx++) {
+                if ((bx * 7 + by * 13) % 3 != 0) {
+                    continue;
+                }
+                boolean fl = ((bx + by) & 1) == 0;
+                for (int y = 0; y < 8; y++) {
+                    for (int x = 0; x < 8; x++) {
+                        boolean in = fl ? (x + y < 8) : (x > y);
+                        int v = in ? 40 : 220;
+                        int i = (by * 8 + y) * w + bx * 8 + x;
+                        rgb[0][i] = rgb[1][i] = rgb[2][i] = v;
+                    }
+                }
+            }
+        }
+        long before = 0;
+        for (int t = 14; t <= 17; t++) {
+            before += com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(t);
+        }
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encode(rgb, w, h, 1.0f);
+        long fired = 0;
+        for (int t = 14; t <= 17; t++) {
+            fired += com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(t);
+        }
+        assertTrue(fired - before > 0, "the diagonal-corner image should use AFV blocks");
+
+        JxlImage ours = JxlDecoder.decode(jxl);
+        int[][] od = ours.frames.get(0).channels;
+        Path jxlFile = tempDir.resolve("afv.jxl");
+        Files.write(jxlFile, jxl);
+        Path rawFile = tempDir.resolve("afv.raw");
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+        int worst = 0;
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < w * h; i++) {
+                worst = Math.max(worst, Math.abs(od[c][i] - theirs[c][i]));
+            }
+        }
+        assertTrue(worst <= 2, "our AFV decode disagrees with libjxl: worst " + worst);
+    }
+
     /** The DCT4x8 / DCT8x4 varblocks reconstruct identically in libjxl too. */
     @Test
     void ffmpegAgreesOnOurRectangularSmallTransforms() throws Exception {

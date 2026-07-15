@@ -20,6 +20,8 @@ class SmallDctTest {
             case DCT4 -> SmallDct.forwardDct4(block, coeffs, s0, s1);
             case DCT4_8 -> SmallDct.forwardDct4x8(block, coeffs, s0, s1);
             case DCT8_4 -> SmallDct.forwardDct8x4(block, coeffs, s0, s1);
+            case HORNUSS -> Transforms.forwardHornuss(block, coeffs);
+            case AFV0, AFV1, AFV2, AFV3 -> Transforms.forwardAfv(tt, block, coeffs, s0, s1);
             default -> throw new IllegalArgumentException();
         }
         float[] out = new float[64];
@@ -37,7 +39,8 @@ class SmallDctTest {
     void dct2InvertsExactly() {
         Random rnd = new Random(7);
         for (TransformType tt : new TransformType[] {TransformType.DCT2, TransformType.DCT4,
-                TransformType.DCT4_8, TransformType.DCT8_4}) {
+                TransformType.DCT4_8, TransformType.DCT8_4, TransformType.HORNUSS,
+                TransformType.AFV0, TransformType.AFV1, TransformType.AFV2, TransformType.AFV3}) {
             for (int trial = 0; trial < 200; trial++) {
                 float[] block = new float[64];
                 for (int i = 0; i < 64; i++) {
