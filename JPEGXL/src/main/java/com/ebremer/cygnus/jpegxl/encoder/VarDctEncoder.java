@@ -190,6 +190,7 @@ public final class VarDctEncoder {
     private final java.util.List<ExtraChannelInfo> extras;
     private float[] noiseLut;      // 8-point photon-noise strengths, or null for no noise
     private Splines splines;       // additive curves, or null for none
+    private JxlEncoder.FrameParams frameParams; // compositing header, or null for the simple path
     private boolean animated;      // this frame is one of an animation (carries a duration)
     private long animDuration;     // ticks this frame shows for
     private boolean animLast = true; // whether this is the animation's final frame
@@ -1702,18 +1703,35 @@ public final class VarDctEncoder {
         return enc.standaloneProgressive(shifts);
     }
 
-    /**
-     * A lossy (VarDCT) animation: a sequence of full-canvas frames, each coded
-     * through the quantiser and shown for its own duration, at {@code
-     * tpsNumerator/tpsDenominator} ticks per second, looping {@code numLoops} times
-     * (0 = forever). Where {@link JxlEncoder#encodeAnimation} keeps every frame
-     * lossless, this trades exactness for size — the natural choice for video-like
-     * content. Only full-frame {@code REPLACE} frames (each an independent picture);
-     * the crop and blend compositing the lossless path offers, and extra channels,
-     * are not carried here.
-     */
+    /** Whether a later frame builds on the canvas a frame leaves — a crop or a blend. */
+    private static boolean buildsOnCanvas(JxlEncoder.AnimationFrame f, int width, int height) {
+        return f.width != width || f.height != height || f.x0 != 0 || f.y0 != 0
+                || f.blendMode != JxlEncoder.BLEND_REPLACE;
+    }
+
+    /** {@link #encodeVarDctAnimation} with no extra channels (colour only). */
     public static byte[] encodeVarDctAnimation(java.util.List<JxlEncoder.AnimationFrame> frames,
             int width, int height, int bits, boolean grey, float distance,
+            int tpsNumerator, int tpsDenominator, long numLoops) throws IOException {
+        return encodeVarDctAnimation(frames, width, height, bits, grey, java.util.List.of(),
+                distance, tpsNumerator, tpsDenominator, numLoops);
+    }
+
+    /**
+     * A lossy (VarDCT) animation with full compositing: each frame is coded through
+     * the quantiser and shown for its duration, at {@code tps} ticks per second,
+     * looping {@code numLoops} times (0 = forever). Where
+     * {@link JxlEncoder#encodeAnimation} keeps every frame lossless, this trades
+     * exactness for size. Frames may be whole pictures that replace the canvas
+     * ({@link JxlEncoder.AnimationFrame#full}), rectangles that update in place with
+     * the rest inherited ({@code patch}), or whole frames laid over the canvas
+     * through an alpha extra channel ({@code blended}). The encoder manages the
+     * reference slots itself: a frame a later one builds on is kept, and the crop or
+     * blend composites over it — the same machinery the lossless path uses.
+     */
+    public static byte[] encodeVarDctAnimation(java.util.List<JxlEncoder.AnimationFrame> frames,
+            int width, int height, int bits, boolean grey,
+            java.util.List<ExtraChannelInfo> extras, float distance,
             int tpsNumerator, int tpsDenominator, long numLoops) throws IOException {
         if (frames.isEmpty()) {
             throw new IllegalArgumentException("an animation needs at least one frame");
@@ -1722,7 +1740,6 @@ public final class VarDctEncoder {
             throw new IllegalArgumentException("ticks per second must be positive");
         }
         BitDepth depth = BitDepth.of(bits);
-        java.util.List<ExtraChannelInfo> extras = JxlEncoder.alphaOnly(depth, false, false);
         ImageMetadata meta = JxlEncoder.buildMetadata(depth, grey, extras);
         meta.xybEncoded = true;
         meta.haveAnimation = true;
@@ -1742,21 +1759,43 @@ public final class VarDctEncoder {
         int n = frames.size();
         for (int i = 0; i < n; i++) {
             JxlEncoder.AnimationFrame f = frames.get(i);
-            if (f.width != width || f.height != height || f.x0 != 0 || f.y0 != 0
-                    || f.blendMode != JxlEncoder.BLEND_REPLACE) {
-                throw new IllegalArgumentException(
-                        "lossy animation supports only full-frame REPLACE frames");
+            boolean isLast = i == n - 1;
+            boolean partial = f.width != width || f.height != height || f.x0 != 0 || f.y0 != 0;
+            boolean composite = partial || f.blendMode != JxlEncoder.BLEND_REPLACE;
+
+            JxlEncoder.FrameParams p = new JxlEncoder.FrameParams();
+            p.canvasWidth = width;
+            p.canvasHeight = height;
+            p.frameWidth = f.width;
+            p.frameHeight = f.height;
+            p.x0 = f.x0;
+            p.y0 = f.y0;
+            p.haveCrop = partial;
+            p.numExtra = extras.size();
+            p.xyb = true;
+            p.haveAnimation = true;
+            p.duration = f.durationTicks;
+            p.haveTimecodes = haveTimecodes;
+            p.timecode = f.timecode;
+            p.blendMode = f.blendMode;
+            p.blendAlphaChannel = f.blendAlphaChannel;
+            p.isLast = isLast;
+            if (composite) {
+                p.blendSource = 1;   // composite over the frame kept in slot 1
             }
-            checkInput(f.planes, width, height, depth, grey, extras);
-            VarDctEncoder enc = new VarDctEncoder(width, height, depth, grey, extras, distance);
-            enc.animated = true;
-            enc.animDuration = f.durationTicks;
-            enc.animLast = i == n - 1;
-            enc.animTimecodes = haveTimecodes;
-            enc.animTimecode = f.timecode;
+            if (!isLast && buildsOnCanvas(frames.get(i + 1), width, height)) {
+                p.saveAsReference = 1;
+            }
+            // reference frames snapshot the composited canvas after the colour
+            // transform, which is the space the crop and blend composite in
+            p.saveBeforeCT = false;
+
+            checkInput(f.planes, f.width, f.height, depth, grey, extras);
+            VarDctEncoder enc = new VarDctEncoder(f.width, f.height, depth, grey, extras, distance);
+            enc.frameParams = p;
             enc.loadWhole(java.util.Arrays.copyOf(f.planes, colour));
             enc.quantiseWindow(Double.NaN);
-            enc.writeFrame(out, new int[0][]);
+            enc.writeFrame(out, java.util.Arrays.copyOfRange(f.planes, colour, f.planes.length));
         }
         return out.toByteArray();
     }
@@ -2127,8 +2166,7 @@ public final class VarDctEncoder {
             }
             one.zeroPadToByte();
             byte[] payload = one.toByteArray();
-            writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0) | (splines != null ? 16 : 0), null,
-                    animated, animDuration, animLast, animTimecodes, animTimecode);
+            emitFrameHeader(out);
             out.writeBool(false); // TOC not permuted
             out.zeroPadToByte();
             writeTocEntry(out, payload.length);
@@ -2170,8 +2208,7 @@ public final class VarDctEncoder {
         }
 
         // ---- header + TOC + payload
-        writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0) | (splines != null ? 16 : 0), null,
-                animated, animDuration, animLast, animTimecodes, animTimecode);
+        emitFrameHeader(out);
         out.writeBool(false); // TOC not permuted
         out.zeroPadToByte();
         writeTocEntry(out, lfGlobalBytes.length);
@@ -2776,6 +2813,96 @@ public final class VarDctEncoder {
         } else {
             out.write(3, 2);
             out.write((int) duration, 32);
+        }
+    }
+
+    /**
+     * A VarDCT frame header from a {@link JxlEncoder.FrameParams} — the compositing
+     * animation path (crop and blend frames, reference slots). It is the modular
+     * {@link JxlEncoder#writeFrameHeader(BitWriter, JxlEncoder.FrameParams)} with
+     * the four VarDCT differences: the encoding bit is VarDCT, the x/b quant-matrix
+     * scales stand in for the modular group-size shift, the flags skip LF smoothing,
+     * and the restoration filter is gaborish + EPF. Single-pass only.
+     */
+    private void writeFrameHeader(BitWriter out, JxlEncoder.FrameParams p) {
+        long flags = 128 | (noiseLut != null ? 1 : 0) | (splines != null ? 16 : 0)
+                | (p.patches ? com.ebremer.cygnus.jpegxl.codestream.FrameHeader.FLAG_PATCHES : 0);
+        out.zeroPadToByte();
+        out.writeBool(false);        // !all_default
+        out.write(p.frameType, 2);   // frame_type: 0 regular, 2 reference-only
+        out.writeBool(false);        // encoding: VarDCT
+        out.writeU64(flags);
+        // xyb encoded => no do_YCbCr bit
+        out.write(0, 2);             // log upsampling
+        for (int i = 0; i < p.numExtra; i++) {
+            out.write(0, 2);         // extra channel upsampling
+        }
+        out.write(2, 3);             // x_qm_scale = 2
+        out.write(2, 3);             // b_qm_scale = 2
+        if (p.frameType != 2) {
+            out.write(0, 2);         // num_passes = 1 (compositing is single-pass)
+        }
+        boolean fullFrame;
+        if (p.haveCrop) {
+            out.writeBool(true);     // have_crop
+            out.writeU32Auto(packSigned(p.x0), 0, 8, 256, 11, 2304, 14, 18688, 30);
+            out.writeU32Auto(packSigned(p.y0), 0, 8, 256, 11, 2304, 14, 18688, 30);
+            out.writeU32Auto(p.frameWidth, 0, 8, 256, 11, 2304, 14, 18688, 30);
+            out.writeU32Auto(p.frameHeight, 0, 8, 256, 11, 2304, 14, 18688, 30);
+            fullFrame = p.x0 <= 0 && p.y0 <= 0
+                    && p.frameWidth + p.x0 >= p.canvasWidth
+                    && p.frameHeight + p.y0 >= p.canvasHeight;
+        } else {
+            out.writeBool(false);    // have_crop
+            fullFrame = true;
+        }
+        if (p.frameType == 0 || p.frameType == 3) {
+            for (int i = -1; i < p.numExtra; i++) {
+                out.writeU32Auto(p.blendMode, 0, 0, 1, 0, 2, 0, 3, 2);
+                if (p.numExtra > 0 && p.blendMode == JxlEncoder.BLEND_BLEND) {
+                    out.writeU32Auto(p.blendAlphaChannel, 0, 0, 1, 0, 2, 0, 3, 3);
+                    out.write(0, 1); // clamp = false
+                }
+                if (!fullFrame || p.blendMode != JxlEncoder.BLEND_REPLACE) {
+                    out.write(p.blendSource, 2);
+                }
+            }
+            if (p.haveAnimation) {
+                writeDuration(out, p.duration);
+                if (p.haveTimecodes) {
+                    out.write((int) p.timecode, 32);
+                }
+            }
+            out.writeBool(p.isLast);
+        }
+        if (!p.isLast) {
+            out.write(p.saveAsReference, 2);
+        }
+        boolean codesSaveBefore = p.frameType == 2 || (fullFrame && p.blendMode == JxlEncoder.BLEND_REPLACE
+                && (p.duration == 0 || p.saveAsReference != 0) && !p.isLast);
+        if (codesSaveBefore) {
+            out.writeBool(p.saveBeforeCT);
+        }
+        out.write(0, 2);             // name length
+        if (NO_FILTERS) {
+            out.writeBool(false);
+            out.writeBool(false);
+            out.write(0, 2);
+            out.writeU64(0);
+        } else {
+            out.writeBool(true);     // RestorationFilter all_default: gaborish + EPF
+        }
+        out.writeU64(0);             // frame header extensions
+    }
+
+    /** The frame header for this frame: the compositing one if set, else the simple path. */
+    private void emitFrameHeader(BitWriter out) {
+        if (frameParams != null) {
+            writeFrameHeader(out, frameParams);
+        } else {
+            writeFrameHeader(out, extras.size(),
+                    128 | (noiseLut != null ? 1 : 0) | (splines != null ? 16 : 0), null,
+                    animated, animDuration, animLast, animTimecodes, animTimecode);
         }
     }
 

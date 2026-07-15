@@ -940,6 +940,62 @@ class FfmpegInteropTest {
         }
     }
 
+    /**
+     * A cropped (patch) lossy animation: the reference implementation must
+     * composite frame 1 onto frame 0 exactly as we do. Outside the patch the
+     * pixels are inherited from frame 0 (bit-exact, straight from libjxl's
+     * reference buffer); inside, they carry the patch colour. If our VarDCT
+     * frame header signalled the crop/reference machinery wrongly, libjxl would
+     * leave the uncovered region black instead of inheriting it.
+     */
+    @Test
+    void ffmpegDecodesLossyCropAnimation() throws Exception {
+        int w = 128;
+        int h = 96;
+        int cw = 48;
+        int ch = 40;
+        int x0 = 32;
+        int y0 = 24;
+
+        int[][] base = TestImages.mixed(w, h, 3, 8, 7);
+        int[][] patch = new int[3][cw * ch];
+        for (int c = 0; c < 3; c++) {
+            java.util.Arrays.fill(patch[c], c == 0 ? 230 : 20);   // saturated, unmistakable
+        }
+        java.util.List<JxlEncoder.AnimationFrame> frames = java.util.List.of(
+                JxlEncoder.AnimationFrame.full(base, w, h, 10),
+                JxlEncoder.AnimationFrame.patch(patch, cw, ch, x0, y0, 10));
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encodeVarDctAnimation(
+                frames, w, h, 8, false, 1.0f, 100, 1, 0);
+
+        Path jxlFile = tempDir.resolve("lossy-crop-anim.jxl");
+        Path rawFile = tempDir.resolve("lossy-crop-anim.raw");
+        Files.write(jxlFile, jxl);
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-vsync", "0", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+
+        byte[] raw = Files.readAllBytes(rawFile);
+        int frameBytes = w * h * 3;
+        assertEquals(0, raw.length % frameBytes, "whole frames");
+        int nFrames = raw.length / frameBytes;
+        assertTrue(nFrames >= 2, "expected >= 2 frames, got " + nFrames);
+        // first output frame is frame 0; last is the composited frame 1
+        // (reading the last is robust to any constant-fps frame duplication)
+        int[][] f0 = readRaw(java.util.Arrays.copyOfRange(raw, 0, frameBytes), w, h, 8, 3);
+        int[][] f1 = readRaw(
+                java.util.Arrays.copyOfRange(raw, (nFrames - 1) * frameBytes, nFrames * frameBytes),
+                w, h, 8, 3);
+
+        int outside = 4 * w + 4;   // top-left corner, well clear of the patch
+        for (int c = 0; c < 3; c++) {
+            assertEquals(f0[c][outside], f1[c][outside], "inherited pixel channel " + c);
+        }
+        int inside = (y0 + ch / 2) * w + (x0 + cw / 2);
+        assertTrue(Math.abs(f1[0][inside] - 230) < 12, "patch red " + f1[0][inside]);
+        assertTrue(Math.abs(f1[1][inside] - 20) < 12, "patch green " + f1[1][inside]);
+    }
+
     private static void run(String... cmd) throws Exception {
         Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
         String out = new String(p.getInputStream().readAllBytes());

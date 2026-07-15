@@ -266,9 +266,10 @@ cropped result; reference, LF and preview frames always decode whole.
   writable through the standard ImageIO sequence API (`writeToSequence`) as well.
   For video-like content there is a lossy path too —
   `VarDctEncoder.encodeVarDctAnimation` codes each frame through the quantiser at a
-  chosen distance instead of losslessly (full-canvas replace frames only). Frames
-  may also carry a SMPTE timecode (`AnimationFrame.withTimecode`, read back as
-  `JxlFrame.timecode`), on either path.
+  chosen distance instead of losslessly, and composites the same way: replace, crop
+  (patch), or blend, over the reference-frame machinery, with extra channels for the
+  alpha a blend needs. Frames may also carry a SMPTE timecode
+  (`AnimationFrame.withTimecode`, read back as `JxlFrame.timecode`), on either path.
 - **Streaming (chunked) encoding, lossless or lossy**: `JxlStreamingEncoder`
   consumes rows top to bottom and compresses each 256-row band of groups as it
   completes, so peak memory is one band plus the compressed sections — the image

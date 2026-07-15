@@ -225,14 +225,87 @@ class AnimationVarDctTest {
         assertEquals(0, img.frames.get(0).timecode);
     }
 
+    /**
+     * A crop (patch) frame updates only its rectangle; the rest of the canvas is
+     * inherited exactly from the frame it builds on, through the reference slot.
+     */
     @Test
-    void rejectsNonFullFrames() {
-        int w = 64;
-        int h = 64;
-        List<AnimationFrame> patch =
-                List.of(AnimationFrame.patch(frame(32, 32, 0), 32, 32, 8, 8, 10));
-        assertThrows(IllegalArgumentException.class,
-                () -> VarDctEncoder.encodeVarDctAnimation(patch, w, h, 8, false, 1.0f, 100, 1, 0));
+    void cropFrameComposites() throws Exception {
+        int w = 160;
+        int h = 128;
+        int x0 = 48;
+        int y0 = 32;
+        int cw = 64;
+        int ch = 48;
+        int[][] base = frame(w, h, 0);
+        int[][] patch = new int[3][cw * ch];   // a distinct solid patch
+        for (int c = 0; c < 3; c++) {
+            java.util.Arrays.fill(patch[c], c == 0 ? 220 : c == 1 ? 40 : 180);
+        }
+        List<AnimationFrame> frames = List.of(
+                AnimationFrame.full(deep(base), w, h, 10),
+                AnimationFrame.patch(patch, cw, ch, x0, y0, 10));
+        JxlImage img = JxlDecoder.decode(
+                VarDctEncoder.encodeVarDctAnimation(frames, w, h, 8, false, 1.5f, 100, 1, 0));
+        assertEquals(2, img.frames.size());
+        int[][] f0 = img.frames.get(0).channels;
+        int[][] f1 = img.frames.get(1).channels;
+
+        // outside the crop, frame 1 is exactly the reference (frame 0's canvas)
+        int outside = (10 * w + 10);
+        for (int c = 0; c < 3; c++) {
+            assertEquals(f0[c][outside], f1[c][outside], "inherited pixel channel " + c);
+        }
+        // inside the crop, frame 1 shows the patch (lossy, so within tolerance)
+        int in = (y0 + ch / 2) * w + (x0 + cw / 2);
+        double e = Math.abs(f1[0][in] - 220) + Math.abs(f1[1][in] - 40) + Math.abs(f1[2][in] - 180);
+        assertTrue(e / 3 < 6, "patch pixel should show the patch colour, err " + e / 3);
+        // and it differs from what frame 0 had there
+        assertTrue(Math.abs(f1[0][in] - f0[0][in]) > 20, "the crop should change its region");
+    }
+
+    /**
+     * A blended frame lays over the canvas through its alpha: opaque where the
+     * alpha is high, showing the frame beneath where it is clear.
+     */
+    @Test
+    void blendFrameComposites() throws Exception {
+        int w = 128;
+        int h = 96;
+        var depth = com.ebremer.cygnus.jpegxl.codestream.BitDepth.of(8);
+        var extras = List.of(
+                com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo.alpha(depth, false));
+
+        // frame 0: a flat base (opaque alpha), REPLACE
+        int[][] base = new int[4][w * h];
+        for (int c = 0; c < 3; c++) {
+            java.util.Arrays.fill(base[c], 90);
+        }
+        java.util.Arrays.fill(base[3], 255);
+
+        // frame 1: an overlay, opaque only in the left half
+        int[][] over = new int[4][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                over[0][i] = 210;
+                over[1][i] = 60;
+                over[2][i] = 60;
+                over[3][i] = x < w / 2 ? 255 : 0;   // opaque left, clear right
+            }
+        }
+        List<AnimationFrame> frames = List.of(
+                AnimationFrame.full(base, w, h, 10),
+                AnimationFrame.blended(over, w, h, 10, 0));
+        JxlImage img = JxlDecoder.decode(VarDctEncoder.encodeVarDctAnimation(
+                frames, w, h, 8, false, extras, 1.5f, 100, 1, 0));
+        assertEquals(2, img.frames.size());
+        int[][] f1 = img.frames.get(1).channels;
+
+        int left = (h / 2) * w + (w / 4);     // opaque -> overlay shows
+        int right = (h / 2) * w + (3 * w / 4); // clear -> base shows through
+        assertTrue(Math.abs(f1[0][left] - 210) < 8, "overlay where opaque: " + f1[0][left]);
+        assertTrue(Math.abs(f1[0][right] - 90) < 8, "base shows where clear: " + f1[0][right]);
     }
 
     private static int[][] deep(int[][] x) {
