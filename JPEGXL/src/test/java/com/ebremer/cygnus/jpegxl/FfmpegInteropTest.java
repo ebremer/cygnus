@@ -190,6 +190,40 @@ class FfmpegInteropTest {
         assertTrue(worst <= 1, "libjxl's synthesized noise differs from ours by " + worst);
     }
 
+    /**
+     * An XYB image with an sRGB-like embedded ICC profile now displays with the
+     * right brightness — the sRGB transfer applied — so our eight-bit decode
+     * tracks libjxl's rather than coming out far too dark (which it did while the
+     * linear samples were shown as if already gamma-encoded).
+     */
+    @Test
+    void ffmpegAgreesOnOurIccDisplay() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        Path input = Path.of("test-data", "conformance", "patches", "input.jxl");
+        assumeTrue(Files.exists(input), "conformance corpus not present");
+        JxlImage img = JxlDecoder.decode(Files.readAllBytes(input));
+        assumeTrue(img.metadata.xybEncoded && img.metadata.iccProfile != null,
+                "expected an XYB image with an embedded ICC");
+        int w = img.width;
+        int h = img.height;
+
+        Path rawFile = tempDir.resolve("ffdec-icc.raw");
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", input.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+        int[][] ours = img.frames.get(0).channels;
+        long sum = 0;
+        for (int p = 0; p < 3; p++) {
+            for (int i = 0; i < w * h; i++) {
+                sum += Math.abs(ours[p][i] - theirs[p][i]);
+            }
+        }
+        double mean = sum / (3.0 * w * h);
+        // an sRGB-ish profile: within a couple of levels of libjxl (a raw linear
+        // display was tens of levels off)
+        assertTrue(mean < 3, "our ICC display is far from libjxl's: mean " + mean);
+    }
+
     /** Smooth gradients favour the weighted predictor. */
     @Test
     void ffmpegDecodesOurWeightedPredictorOutput() throws Exception {

@@ -1188,10 +1188,21 @@ public final class JxlDecoder {
         int ch = crop == null ? height : crop.height;
         int[][] intPlanes = new int[canvas.length][];
         float[][] floatPlanes = new float[canvas.length][];
+        // An XYB frame with an embedded ICC profile is left in linear light by the
+        // colour transform, because the ICC — not an enumerated transfer function —
+        // is what the coded output declares, and the conformance references keep it
+        // linear (they are the coded samples plus the profile). Displaying those
+        // linear samples as if they were sRGB shows the picture far too dark. The
+        // eight-bit output is display-oriented, so the sRGB transfer is applied to
+        // its colour channels here — the same curve an enumerated-sRGB XYB frame
+        // already gets — while the float output stays linear for anyone matching
+        // the reference or applying the profile themselves.
+        boolean linearColour = meta.xybEncoded && meta.iccProfile != null && canvasColour >= 3;
         for (int c = 0; c < canvas.length; c++) {
             var depth = c < canvasColour
                     ? meta.bitDepth
                     : meta.extraChannels.get(c - canvasColour).bitDepth;
+            boolean toSrgb = linearColour && c < canvasColour;
             if (floatOut || depth.floatingPoint) {
                 float[] p = new float[cw * ch];
                 for (int y = 0; y < ch; y++) {
@@ -1222,7 +1233,8 @@ public final class JxlDecoder {
                     int srcRow = (cy + y) * width + cx;
                     int dstRow = y * cw;
                     for (int x = 0; x < cw; x++) {
-                        long v = Math.round((double) f[srcRow + x] * max);
+                        float s = toSrgb ? srgbOetf(f[srcRow + x]) : f[srcRow + x];
+                        long v = Math.round((double) s * max);
                         p[dstRow + x] = v < 0 ? 0 : (int) Math.min(v, max);
                     }
                 }
@@ -1230,6 +1242,17 @@ public final class JxlDecoder {
             }
         }
         return orient(meta, cw, ch, duration, intPlanes, floatPlanes);
+    }
+
+    /** The sRGB opto-electronic transfer function: linear light to the display encoding. */
+    private static float srgbOetf(float v) {
+        if (v <= 0f) {
+            return 0f;
+        }
+        if (v >= 1f) {
+            return 1f;
+        }
+        return v <= 0.0031308f ? 12.92f * v : 1.055f * (float) Math.pow(v, 1 / 2.4) - 0.055f;
     }
 
     private static Bits section(CodestreamSource src, Toc toc, int index) throws IOException {
