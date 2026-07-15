@@ -94,6 +94,24 @@ class AnimationTest {
         }
     }
 
+    /** Per-frame timecodes ride the lossless frame headers and come back exactly. */
+    @Test
+    void timecodesRoundTrip() throws Exception {
+        int w = 48;
+        int h = 32;
+        long[] tc = {0x01020304L, 0x01020308L, 0xFF00AA55L};
+        List<AnimationFrame> frames = new ArrayList<>();
+        for (int i = 0; i < tc.length; i++) {
+            frames.add(AnimationFrame.full(noise(w, h, 3, i), w, h, 10).withTimecode(tc[i]));
+        }
+        byte[] jxl = JxlEncoder.encodeAnimation(frames, w, h, 8, false, List.of(), 100, 1, 0);
+        JxlImage img = JxlDecoder.decode(jxl);
+        assertTrue(img.metadata.animHaveTimecodes);
+        for (int i = 0; i < tc.length; i++) {
+            assertEquals(tc[i], img.frames.get(i).timecode, "timecode of frame " + i);
+        }
+    }
+
     /** A single-frame animation is legal (a still with a declared duration). */
     @Test
     void singleFrameAnimation() throws Exception {

@@ -523,9 +523,18 @@ public final class JxlEncoder {
         final int durationTicks;
         final int blendMode;
         final int blendAlphaChannel;
+        final long timecode;
+        final boolean hasTimecode;
 
         private AnimationFrame(int[][] planes, int width, int height, int x0, int y0,
                 int durationTicks, int blendMode, int blendAlphaChannel) {
+            this(planes, width, height, x0, y0, durationTicks, blendMode, blendAlphaChannel,
+                    0, false);
+        }
+
+        private AnimationFrame(int[][] planes, int width, int height, int x0, int y0,
+                int durationTicks, int blendMode, int blendAlphaChannel, long timecode,
+                boolean hasTimecode) {
             if (durationTicks < 0) {
                 throw new IllegalArgumentException("negative frame duration");
             }
@@ -537,6 +546,18 @@ public final class JxlEncoder {
             this.durationTicks = durationTicks;
             this.blendMode = blendMode;
             this.blendAlphaChannel = blendAlphaChannel;
+            this.timecode = timecode;
+            this.hasTimecode = hasTimecode;
+        }
+
+        /**
+         * A copy of this frame stamped with a SMPTE-packed 32-bit {@code timecode}.
+         * Setting a timecode on any frame turns timecodes on for the whole
+         * animation; frames left without one carry timecode 0.
+         */
+        public AnimationFrame withTimecode(long timecode) {
+            return new AnimationFrame(planes, width, height, x0, y0, durationTicks, blendMode,
+                    blendAlphaChannel, timecode & 0xffffffffL, true);
         }
 
         /** A whole-canvas frame that replaces everything before it. */
@@ -596,6 +617,8 @@ public final class JxlEncoder {
         meta.animTpsNumerator = tpsNumerator;
         meta.animTpsDenominator = tpsDenominator;
         meta.animNumLoops = numLoops;
+        boolean haveTimecodes = frames.stream().anyMatch(f -> f.hasTimecode);
+        meta.animHaveTimecodes = haveTimecodes;
 
         BitWriter out = new BitWriter();
         out.write(0xff, 8);
@@ -622,6 +645,8 @@ public final class JxlEncoder {
             p.haveCrop = partial;
             p.haveAnimation = true;
             p.duration = f.durationTicks;
+            p.haveTimecodes = haveTimecodes;
+            p.timecode = f.timecode;
             p.blendMode = f.blendMode;
             p.blendAlphaChannel = f.blendAlphaChannel;
             p.isLast = isLast;
@@ -1711,6 +1736,8 @@ public final class JxlEncoder {
         boolean haveCrop;    // false for a full-canvas frame
         boolean haveAnimation;
         long duration;       // ticks this frame shows for
+        boolean haveTimecodes; // frame headers carry a timecode
+        long timecode;       // SMPTE-packed 32-bit timecode
         int blendMode = BLEND_REPLACE;
         int blendSource;     // reference slot a non-replace frame blends over
         int blendAlphaChannel;
@@ -1816,6 +1843,9 @@ public final class JxlEncoder {
             }
             if (p.haveAnimation) {
                 writeDuration(out, p.duration);
+                if (p.haveTimecodes) {
+                    out.write((int) p.timecode, 32);
+                }
             }
             out.writeBool(p.isLast);
         }

@@ -191,6 +191,8 @@ public final class VarDctEncoder {
     private boolean animated;      // this frame is one of an animation (carries a duration)
     private long animDuration;     // ticks this frame shows for
     private boolean animLast = true; // whether this is the animation's final frame
+    private boolean animTimecodes; // the animation carries per-frame timecodes
+    private long animTimecode;     // this frame's SMPTE-packed timecode
     private final int globalScale;
     private final float distance;   // the requested distance, gates the largest blocks
     private int hfMul;
@@ -1725,6 +1727,8 @@ public final class VarDctEncoder {
         meta.animTpsNumerator = tpsNumerator;
         meta.animTpsDenominator = tpsDenominator;
         meta.animNumLoops = numLoops;
+        boolean haveTimecodes = frames.stream().anyMatch(f -> f.hasTimecode);
+        meta.animHaveTimecodes = haveTimecodes;
 
         BitWriter out = new BitWriter();
         out.write(0xff, 8);
@@ -1746,6 +1750,8 @@ public final class VarDctEncoder {
             enc.animated = true;
             enc.animDuration = f.durationTicks;
             enc.animLast = i == n - 1;
+            enc.animTimecodes = haveTimecodes;
+            enc.animTimecode = f.timecode;
             enc.loadWhole(java.util.Arrays.copyOf(f.planes, colour));
             enc.quantiseWindow(Double.NaN);
             enc.writeFrame(out, new int[0][]);
@@ -2096,7 +2102,7 @@ public final class VarDctEncoder {
             one.zeroPadToByte();
             byte[] payload = one.toByteArray();
             writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0), null,
-                    animated, animDuration, animLast);
+                    animated, animDuration, animLast, animTimecodes, animTimecode);
             out.writeBool(false); // TOC not permuted
             out.zeroPadToByte();
             writeTocEntry(out, payload.length);
@@ -2139,7 +2145,7 @@ public final class VarDctEncoder {
 
         // ---- header + TOC + payload
         writeFrameHeader(out, extras.size(), 128 | (noiseLut != null ? 1 : 0), null,
-                animated, animDuration, animLast);
+                animated, animDuration, animLast, animTimecodes, animTimecode);
         out.writeBool(false); // TOC not permuted
         out.zeroPadToByte();
         writeTocEntry(out, lfGlobalBytes.length);
@@ -2670,17 +2676,18 @@ public final class VarDctEncoder {
      * passes (the last shift zero, not written) with no downsampling.
      */
     static void writeFrameHeader(BitWriter out, int numExtra, long flags, int[] shifts) {
-        writeFrameHeader(out, numExtra, flags, shifts, false, 0, true);
+        writeFrameHeader(out, numExtra, flags, shifts, false, 0, true, false, 0);
     }
 
     /**
      * The full-frame REPLACE header, still or animated. Animated frames carry a
      * {@code duration} and a real {@code isLast}; a still frame is the {@code
      * animated=false, isLast=true} case, which writes exactly the bits the still
-     * path always did.
+     * path always did. When {@code haveTimecodes}, a 32-bit {@code timecode}
+     * follows the duration.
      */
     static void writeFrameHeader(BitWriter out, int numExtra, long flags, int[] shifts,
-            boolean animated, long duration, boolean isLast) {
+            boolean animated, long duration, boolean isLast, boolean haveTimecodes, long timecode) {
         out.zeroPadToByte();
         out.writeBool(false);        // !all_default
         out.write(0, 2);             // frame_type: regular
@@ -2701,6 +2708,9 @@ public final class VarDctEncoder {
         }
         if (animated) {
             writeDuration(out, duration);
+            if (haveTimecodes) {
+                out.write((int) timecode, 32);
+            }
         }
         out.writeBool(isLast);
         // full-frame REPLACE frames are independent — none is kept as a reference,

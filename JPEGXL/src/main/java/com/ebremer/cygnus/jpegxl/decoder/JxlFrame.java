@@ -15,17 +15,25 @@ public final class JxlFrame {
     public final float[][] floatChannels;
     /** Animation duration in ticks (0 for stills). */
     public final long duration;
+    /** Animation timecode (SMPTE-packed), 0 when the animation carries none. */
+    public final long timecode;
 
     public JxlFrame(int width, int height, int[][] channels, long duration) {
-        this(width, height, channels, new float[channels.length][], duration);
+        this(width, height, channels, new float[channels.length][], duration, 0);
     }
 
     public JxlFrame(int width, int height, int[][] channels, float[][] floatChannels,
             long duration) {
+        this(width, height, channels, floatChannels, duration, 0);
+    }
+
+    public JxlFrame(int width, int height, int[][] channels, float[][] floatChannels,
+            long duration, long timecode) {
         this.width = width;
         this.height = height;
         this.channels = channels;
         this.floatChannels = floatChannels;
         this.duration = duration;
+        this.timecode = timecode;
     }
 }

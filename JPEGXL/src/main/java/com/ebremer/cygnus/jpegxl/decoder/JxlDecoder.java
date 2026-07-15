@@ -310,7 +310,7 @@ public final class JxlDecoder {
                 }
                 colourTransform(r, meta);
                 preview = canvasToFrame(r.planes, r.exactInt, r.outColour,
-                        r.width, r.height, meta, 0, null, false);
+                        r.width, r.height, meta, 0, 0, null, false);
             } catch (IOException e) {
                 preview = null; // previews are decorative; keep decoding the image
             }
@@ -370,7 +370,7 @@ public final class JxlDecoder {
                 canvasExact = null; // an intersection-free frame never covers the canvas
                 if (visible) {
                     frames.add(emitFrame(canvas, canvasExact, canvasColour, size, meta,
-                            fh.duration, csRegion, floatOut));
+                            fh.duration, fh.timecode, csRegion, floatOut));
                 }
                 if (fh.isLast) {
                     break;
@@ -450,7 +450,7 @@ public final class JxlDecoder {
             }
             if (visible) {
                 frames.add(emitFrame(canvas, canvasExact, canvasColour, size, meta,
-                        fh.duration, csRegion, floatOut));
+                        fh.duration, fh.timecode, csRegion, floatOut));
             }
             if (fh.isLast) {
                 break;
@@ -480,8 +480,8 @@ public final class JxlDecoder {
 
     /** Renders spot colours if any and emits the canvas (cropped to the region). */
     private static JxlFrame emitFrame(float[][] canvas, int[][] canvasExact, int canvasColour,
-            SizeHeader size, ImageMetadata meta, long duration, java.awt.Rectangle csRegion,
-            boolean floatOut) {
+            SizeHeader size, ImageMetadata meta, long duration, long timecode,
+            java.awt.Rectangle csRegion, boolean floatOut) {
         // spot colours are rendered at output only; the canvas and the
         // reference snapshots stay spot-free. CMYK is not composited here: unlike
         // spot colours it is not part of the normative decode (the conformance
@@ -498,7 +498,7 @@ public final class JxlDecoder {
             emitExact = null;
         }
         return canvasToFrame(emit, emitExact, canvasColour,
-                size.width, size.height, meta, duration, csRegion, floatOut);
+                size.width, size.height, meta, duration, timecode, csRegion, floatOut);
     }
 
     private static FrameResult copyResult(FrameResult r) {
@@ -1180,8 +1180,8 @@ public final class JxlDecoder {
      * coordinates) to output planes: clamped ints, or floats as-is.
      */
     private static JxlFrame canvasToFrame(float[][] canvas, int[][] exact, int canvasColour,
-            int width, int height, ImageMetadata meta, long duration, java.awt.Rectangle crop,
-            boolean floatOut) {
+            int width, int height, ImageMetadata meta, long duration, long timecode,
+            java.awt.Rectangle crop, boolean floatOut) {
         int cx = crop == null ? 0 : crop.x;
         int cy = crop == null ? 0 : crop.y;
         int cw = crop == null ? width : crop.width;
@@ -1241,7 +1241,7 @@ public final class JxlDecoder {
                 intPlanes[c] = p;
             }
         }
-        return orient(meta, cw, ch, duration, intPlanes, floatPlanes);
+        return orient(meta, cw, ch, duration, timecode, intPlanes, floatPlanes);
     }
 
     /** The sRGB opto-electronic transfer function: linear light to the display encoding. */
@@ -1698,11 +1698,11 @@ public final class JxlDecoder {
     }
 
     /** Applies the EXIF-style orientation to both integer and float planes. */
-    private static JxlFrame orient(ImageMetadata meta, int w, int h, long duration,
+    private static JxlFrame orient(ImageMetadata meta, int w, int h, long duration, long timecode,
             int[][] intPlanes, float[][] floatPlanes) {
         int orientation = meta.orientation;
         if (orientation == 1) {
-            return new JxlFrame(w, h, intPlanes, floatPlanes, duration);
+            return new JxlFrame(w, h, intPlanes, floatPlanes, duration, timecode);
         }
         boolean transposed = orientation > 4;
         int ow = transposed ? h : w;
@@ -1759,6 +1759,6 @@ public final class JxlDecoder {
             outInt[c] = dstI;
             outFloat[c] = dstF;
         }
-        return new JxlFrame(ow, oh, outInt, outFloat, duration);
+        return new JxlFrame(ow, oh, outInt, outFloat, duration, timecode);
     }
 }

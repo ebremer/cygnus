@@ -171,6 +171,60 @@ class AnimationVarDctTest {
         assertTrue(mean(px, img.frames.get(0).channels, w, h) < 3.0, "multi-group frame fidelity");
     }
 
+    /** Per-frame SMPTE timecodes ride the frame headers and come back exactly. */
+    @Test
+    void timecodesRoundTrip() throws Exception {
+        int w = 128;
+        int h = 96;
+        long[] tc = {0x01020304L, 0x01020305L, 0x0102030AL};
+        List<AnimationFrame> frames = new ArrayList<>();
+        for (int i = 0; i < tc.length; i++) {
+            frames.add(AnimationFrame.full(frame(w, h, i), w, h, 8).withTimecode(tc[i]));
+        }
+        byte[] jxl = VarDctEncoder.encodeVarDctAnimation(frames, w, h, 8, false, 1.5f, 100, 1, 0);
+        JxlImage img = JxlDecoder.decode(jxl);
+        assertTrue(img.metadata.animHaveTimecodes, "metadata should announce timecodes");
+        assertEquals(tc.length, img.frames.size());
+        for (int i = 0; i < tc.length; i++) {
+            assertEquals(tc[i], img.frames.get(i).timecode, "timecode of frame " + i);
+        }
+    }
+
+    /** libjxl accepts an animation whose frames carry timecodes. */
+    @Test
+    void libjxlReadsTimecodes() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not on the PATH");
+        int w = 160;
+        int h = 128;
+        List<AnimationFrame> frames = new ArrayList<>();
+        for (int k = 0; k < 4; k++) {
+            frames.add(AnimationFrame.full(frame(w, h, k), w, h, 10).withTimecode(0x01000000L + k));
+        }
+        byte[] jxl = VarDctEncoder.encodeVarDctAnimation(frames, w, h, 8, false, 1.5f, 100, 1, 0);
+        Path file = tempDir.resolve("tc-anim.jxl");
+        Files.write(file, jxl);
+        Process dec = new ProcessBuilder("ffmpeg", "-v", "error", "-i", file.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-y", tempDir.resolve("tc.raw").toString())
+                .redirectErrorStream(true).start();
+        String log = new String(dec.getInputStream().readAllBytes());
+        dec.waitFor(120, TimeUnit.SECONDS);
+        assertEquals(0, dec.exitValue(), "ffmpeg could not decode our timecoded animation: " + log);
+    }
+
+    /** Without withTimecode, the animation carries no timecodes (byte-for-byte the old path). */
+    @Test
+    void noTimecodesByDefault() throws Exception {
+        int w = 96;
+        int h = 96;
+        List<AnimationFrame> frames =
+                List.of(AnimationFrame.full(frame(w, h, 0), w, h, 8),
+                        AnimationFrame.full(frame(w, h, 1), w, h, 8));
+        JxlImage img = JxlDecoder.decode(
+                VarDctEncoder.encodeVarDctAnimation(frames, w, h, 8, false, 1.5f, 100, 1, 0));
+        assertTrue(!img.metadata.animHaveTimecodes, "no timecodes announced");
+        assertEquals(0, img.frames.get(0).timecode);
+    }
+
     @Test
     void rejectsNonFullFrames() {
         int w = 64;
