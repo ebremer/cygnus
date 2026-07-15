@@ -354,6 +354,56 @@ class FfmpegInteropTest {
         assertTrue(worst <= 2, "our 32-scale rectangular decode disagrees with libjxl: worst " + worst);
     }
 
+    /**
+     * Our DCT2 and DCT4 varblocks — the hierarchical-Hadamard and four-4x4
+     * transforms for piecewise-flat blocks — reconstruct identically in libjxl.
+     */
+    @Test
+    void ffmpegAgreesOnOurSmallTransforms() throws Exception {
+        assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+        int w = 256;
+        int h = 192;
+        int[][] rgb = new int[3][w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                int v = x < w * 43 / 100 || y < h * 37 / 100 ? 235 : 25;
+                if (((x / 24) + (y / 24)) % 3 == 0) {
+                    v = 255 - v;
+                }
+                if (x % 37 < 3 || y % 41 < 3) {
+                    v = 128;
+                }
+                rgb[0][i] = v;
+                rgb[1][i] = v;
+                rgb[2][i] = v;
+            }
+        }
+        long before = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(2)
+                + com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(3);
+        byte[] jxl = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.encode(rgb, w, h, 1.5f);
+        long fired = com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(2)
+                + com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder.TYPE_HIST.get(3) - before;
+        assertTrue(fired > 0, "the edged image should use DCT2/DCT4 blocks");
+
+        JxlImage ours = JxlDecoder.decode(jxl);
+        int[][] od = ours.frames.get(0).channels;
+        Path jxlFile = tempDir.resolve("small.jxl");
+        Files.write(jxlFile, jxl);
+        Path rawFile = tempDir.resolve("small.raw");
+        run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", jxlFile.toString(),
+                "-f", "rawvideo", "-pix_fmt", "rgb24", rawFile.toString());
+        int[][] theirs = readRaw(Files.readAllBytes(rawFile), w, h, 8, 3);
+
+        int worst = 0;
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < w * h; i++) {
+                worst = Math.max(worst, Math.abs(od[c][i] - theirs[c][i]));
+            }
+        }
+        assertTrue(worst <= 2, "our DCT2/DCT4 decode disagrees with libjxl: worst " + worst);
+    }
+
     /** Smooth gradients favour the weighted predictor. */
     @Test
     void ffmpegDecodesOurWeightedPredictorOutput() throws Exception {

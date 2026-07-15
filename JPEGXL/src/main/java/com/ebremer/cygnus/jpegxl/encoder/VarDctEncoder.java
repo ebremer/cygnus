@@ -11,7 +11,9 @@ import com.ebremer.cygnus.jpegxl.io.Bits;
 import com.ebremer.cygnus.jpegxl.vardct.Dct;
 import com.ebremer.cygnus.jpegxl.vardct.DequantMatrices;
 import com.ebremer.cygnus.jpegxl.vardct.HfPass;
+import com.ebremer.cygnus.jpegxl.vardct.SmallDct;
 import com.ebremer.cygnus.jpegxl.vardct.TransformType;
+import com.ebremer.cygnus.jpegxl.vardct.Transforms;
 import com.ebremer.cygnus.jpegxl.vardct.VarDctState;
 import java.io.IOException;
 
@@ -80,6 +82,8 @@ public final class VarDctEncoder {
     private static final boolean NO_CFL = Boolean.getBoolean("jxl.enc.nocfl");
 
     private static final TransformType DCT8 = TransformType.byType(0);
+    private static final TransformType DCT2 = TransformType.byType(2);   // hierarchical 2/4/8
+    private static final TransformType DCT4 = TransformType.byType(3);   // four 4x4 quadrants
     private static final TransformType DCT16 = TransformType.byType(4);
     private static final TransformType DCT32 = TransformType.byType(5);
     private static final TransformType DCT8_16 = TransformType.byType(7);  // 8 tall, 16 wide
@@ -91,6 +95,17 @@ public final class VarDctEncoder {
     private static final int MAX_LLF = (MAX_DIM / 8) * (MAX_DIM / 8);
     private static final boolean NO_DCT32 = Boolean.getBoolean("jxl.enc.nodct32");
     private static final boolean NO_RECT = Boolean.getBoolean("jxl.enc.norect");
+    private static final boolean NO_SMALL = Boolean.getBoolean("jxl.enc.nosmall");
+    /**
+     * How much cheaper DCT2/DCT4 must estimate before replacing a plain DCT8. The
+     * margin does the discriminating: on hard edges and text — the piecewise-flat
+     * blocks these transforms are for — they win by a wide margin, while on
+     * photographic texture the coarse rate proxy at most calls it a hair cheaper
+     * when it is really a hair dearer, so requiring a clear 20% win takes the
+     * former and leaves the latter (a photograph comes out unchanged; a graphic a
+     * couple of percent smaller).
+     */
+    private static final double SMALL_GAIN = 0.80;
     /**
      * How much cheaper a rectangular transform must estimate before it replaces
      * the four 8x8s it covers. Like {@link #DCT32_GAIN}, below 1 by a margin: the
@@ -631,6 +646,9 @@ public final class VarDctEncoder {
                 }
             }
         });
+        if (!NO_SMALL) {
+            postPassSmall();
+        }
         chooseSharpness();
         // count the rectangular blocks (any of the six types, 6..11) that survived
         // into the final layout — a committed one can still be overwritten by a
@@ -719,6 +737,94 @@ public final class VarDctEncoder {
             hfQuant[c][k] = q;
         }
         return cost;
+    }
+
+    /**
+     * Quantises one 8x8 cell with a chosen transform — DCT8, DCT2 or DCT4 — into
+     * {@code qOut}/{@code dcOut} in every channel, luma first for chroma-from-luma.
+     * All three keep the DCT8 layout (position 0 the DC, the rest AC on the same
+     * scale), so only the forward transform, its weights and — via {@code flip} —
+     * the coefficient placement differ. Non-committing; returns the rate estimate.
+     */
+    private double quantiseCell(int by, int bx, TransformType tt, int mul,
+            Scratch s, int[][] qOut, int[] dcOut) {
+        float[] block = s.block;
+        float[] coeffs = s.c8[0];
+        float[] dqY = s.dqY;
+        boolean flip = tt.flip();
+        float[][] w = weightsOf[tt.parameterIndex];
+        double cost = 1;
+        for (int ci = 0; ci < 3; ci++) {
+            int c = Y_FIRST[ci];
+            for (int y = 0; y < 8; y++) {
+                System.arraycopy(xyb[c], (y0 + by * 8 + y) * paddedWidth + bx * 8, block, y * 8, 8);
+            }
+            switch (tt.method) {
+                case DCT2 -> SmallDct.forwardDct2(block, coeffs);
+                case DCT4 -> SmallDct.forwardDct4(block, coeffs, s.s0, s.s1);
+                default -> Dct.forward2D(block, 0, 8, coeffs, 0, 8, 8, 8, s.s0, s.s1);
+            }
+            dcOut[c] = Math.round(coeffs[0] / scaledDequant[c]);
+            float sfc = baseSfc[c] / mul;
+            float cfl = cflFactor(c, by, bx);
+            int[] q = new int[64];
+            float[] wc = w[c];
+            for (int j = 1; j < 64; j++) {
+                int wIdx = flip ? (j & 7) * 8 + (j >> 3) : j;
+                float step = sfc * wc[wIdx];
+                q[j] = Math.round((coeffs[j] - cfl * dqY[j]) / step);
+                if (c == 1) {
+                    dqY[j] = q[j] * step;
+                }
+                cost += tokenCost(q[j]);
+            }
+            qOut[c] = q;
+        }
+        return cost;
+    }
+
+    /**
+     * After the block-choice sweep, retries each plain DCT8 block on busy content
+     * as DCT2 and DCT4, replacing it where one clearly codes smaller — the small
+     * transforms earn their keep on hard edges and text, not the smooth blocks the
+     * DCT8 (or a larger block) already handles. Runs before sharpness, so the EPF
+     * estimate sees the final types.
+     */
+    private void postPassSmall() {
+        sweep(h8, by -> {
+            Scratch s = new Scratch();
+            int[][] q2 = new int[3][];
+            int[][] q4 = new int[3][];
+            int[] dc2 = new int[3];
+            int[] dc4 = new int[3];
+            for (int bx = 0; bx < w8; bx++) {
+                int k = by * w8 + bx;
+                if (blockType[k] != DCT8.type) {
+                    continue;   // only plain 8x8 blocks; the margin does the rest
+                }
+                // the committed DCT8's rate, from its stored coefficients — no need
+                // to transform it again, only DCT2 and DCT4 are new work here
+                double cost8 = 1;
+                for (int c = 0; c < 3; c++) {
+                    int[] q = hfQuant[c][k];
+                    for (int j = 1; j < 64; j++) {
+                        cost8 += tokenCost(q[j]);
+                    }
+                }
+                int mul = blockMul[k];
+                double cost2 = quantiseCell(by, bx, DCT2, mul, s, q2, dc2);
+                double cost4 = quantiseCell(by, bx, DCT4, mul, s, q4, dc4);
+                double bestAlt = Math.min(cost2, cost4);
+                if (bestAlt < SMALL_GAIN * cost8) {
+                    boolean two = cost2 <= cost4;
+                    blockType[k] = (byte) (two ? DCT2.type : DCT4.type);
+                    for (int c = 0; c < 3; c++) {
+                        hfQuant[c][k] = two ? q2[c] : q4[c];
+                        dcQuant[c][k] = two ? dc2[c] : dc4[c];
+                    }
+                }
+            }
+        });
     }
 
     /**
@@ -1256,6 +1362,8 @@ public final class VarDctEncoder {
             float[] llf = new float[MAX_LLF];
             float[] s0 = new float[maxN];
             float[] s1 = new float[maxN];
+            float[] s2 = new float[64];
+            float[] s3 = new float[64];
             for (int bx = 0; bx < w8; bx++) {
                 int k = by * w8 + bx;
                 byte type = blockType[k];
@@ -1304,8 +1412,14 @@ public final class VarDctEncoder {
                             deq[(i / bW) * pw + i % bW] = llf[i] * tt.llfScale[i];
                         }
                     }
-                    Dct.inverse2D(deq, 0, pw, out[c], by * 8 * paddedWidth + bx * 8,
-                            paddedWidth, ph, pw, s0, s1, false);
+                    int off = by * 8 * paddedWidth + bx * 8;
+                    if (tt.method == TransformType.Method.DCT) {
+                        Dct.inverse2D(deq, 0, pw, out[c], off, paddedWidth, ph, pw, s0, s1, false);
+                    } else {
+                        // DCT2/DCT4 and the other special 8x8 methods
+                        Transforms.invert(tt, deq, pw, 0, 0, out[c], off, paddedWidth,
+                                s0, s1, s2, s3);
+                    }
                 }
             }
         });

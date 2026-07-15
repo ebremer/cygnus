@@ -1,7 +1,7 @@
 package com.ebremer.cygnus.jpegxl.vardct;
 
 /** Inverse varblock transforms: plain DCT plus the special 8x8 methods. */
-final class Transforms {
+public final class Transforms {
 
     private static final float[][] AFV_BASIS = {
         {0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f,
@@ -66,7 +66,7 @@ final class Transforms {
      * with row stride {@code cStride}; the output is written at
      * {@code outOff} with {@code outStride}.
      */
-    static void invert(TransformType tt, float[] coeffs, int cStride, int ppgY, int ppgX,
+    public static void invert(TransformType tt, float[] coeffs, int cStride, int ppgY, int ppgX,
             float[] out, int outOff, int outStride,
             float[] s0, float[] s1, float[] s2, float[] s3) {
         int cOff = ppgY * cStride + ppgX;
