@@ -403,6 +403,9 @@ public final class VarDctState {
             }
             TransformType tt = TransformType.byType(type);
             int mul = 1 + blockInfo[nbBlocks + i];
+            if (mul < 1) {
+                throw new IOException("invalid hf multiplier " + mul);
+            }
             // place at the first free position at or after (lastY, lastX) in raster order
             int y = lastY;
             int x = lastX;

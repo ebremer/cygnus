@@ -263,11 +263,11 @@ public final class DequantMatrices {
                 }
                 default -> throw new IOException("bad dequant mode");
             }
-            if (p.mode != MODE_RAW) {
-                for (int i = 0; i < weight.length; i++) {
-                    if (!(weight[i] > 0f) || !Float.isFinite(weight[i])) {
-                        throw new IOException("non-positive dequant weight");
-                    }
+            for (int i = 0; i < weight.length; i++) {
+                if (!(weight[i] > 0f) || !Float.isFinite(weight[i])) {
+                    throw new IOException("non-positive dequant weight");
+                }
+                if (p.mode != MODE_RAW) {
                     weight[i] = 1f / weight[i];
                 }
             }
