@@ -942,7 +942,11 @@ public final class VarDctEncoder {
         double cost = 0;
         for (int ci = 0; ci < 3; ci++) {
             int c = Y_FIRST[ci];
-            float cfl = cflFactor(c, cellBy, cellBx);
+            // a block up to 64px sits inside one 64px CfL tile; the opt-in
+            // 128/256 scales span several, and the decoder's factor follows
+            // each coefficient's tile
+            boolean oneTile = ph <= 64 && pw <= 64;
+            float cflO = cflFactor(c, cellBy, cellBx);
             for (int y = 0; y < ph; y++) {
                 System.arraycopy(xyb[c], (y0 + cellBy * 8 + y) * paddedWidth + cellBx * 8,
                         block, y * pw, pw);
@@ -960,6 +964,8 @@ public final class VarDctEncoder {
                     int wy = flip ? x : y;
                     int wx = flip ? y : x;
                     float step = sfc * wc[wy * mw + wx];
+                    float cfl = oneTile ? cflO
+                            : cflFactor(c, cellBy + (y >> 3), cellBx + (x >> 3));
                     q[j] = Math.round((coef[j] - cfl * dqY[j]) / step);
                     if (c == 1) {
                         dqY[j] = q[j] * step;
@@ -1305,7 +1311,11 @@ public final class VarDctEncoder {
         float[] dqY = s.dqY;
         for (int ci = 0; ci < 3; ci++) {
             int c = Y_FIRST[ci];
-            float cfl = cflFactor(c, by, bx);
+            // 32 and 64px squares sit inside one 64px CfL tile; 128 and 256
+            // span several, and the decoder's factor follows each
+            // coefficient's tile
+            boolean oneTile = px <= 64;
+            float cflO = cflFactor(c, by, bx);
             for (int y = 0; y < px; y++) {
                 System.arraycopy(xyb[c], (y0 + by * 8 + y) * paddedWidth + bx * 8,
                         s.block, y * px, px);
@@ -1321,6 +1331,8 @@ public final class VarDctEncoder {
                     }
                     int j = y * px + x;
                     float step = sfc * wc[x * px + y];
+                    float cfl = oneTile ? cflO
+                            : cflFactor(c, by + (y >> 3), bx + (x >> 3));
                     q[j] = Math.round((coef[j] - cfl * dqY[j]) / step);
                     if (c == 1) {
                         dqY[j] = q[j] * step;
@@ -1518,7 +1530,10 @@ public final class VarDctEncoder {
                 boolean flip = tt.flip();
                 for (int ci = 0; ci < 3; ci++) {
                     int c = Y_FIRST[ci];
-                    float cfl = cflFactor(c, by, bx);
+                    // mirror the decoder: only the opt-in 128/256 scales span
+                    // more than one 64px CfL tile
+                    boolean oneTile = ph <= 64 && pw <= 64;
+                    float cflO = cflFactor(c, by, bx);
                     float sfc = baseSfc[c] / blockMul[k];
                     float[] wc = weightsOf[tt.parameterIndex][c];
                     int[] q = hfQuant[c][k];
@@ -1531,6 +1546,8 @@ public final class VarDctEncoder {
                             int wy = flip ? x : y;
                             int wx = flip ? y : x;
                             float hf = q[j] * sfc * wc[wy * mw + wx];
+                            float cfl = oneTile ? cflO
+                                    : cflFactor(c, by + (y >> 3), bx + (x >> 3));
                             deq[j] = hf + cfl * dqY[j];
                             if (c == 1) {
                                 dqY[j] = hf;
