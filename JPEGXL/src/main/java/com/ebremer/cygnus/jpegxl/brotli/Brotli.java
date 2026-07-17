@@ -14,22 +14,9 @@ public final class Brotli {
     private Brotli() {
     }
 
-    private static byte[] lastPartial = new byte[0];
-
     /** Decompresses a complete brotli stream. */
     public static byte[] decode(byte[] data, int off, int len, int maxOutput) throws IOException {
-        State s = new State(data, off, len, maxOutput);
-        try {
-            return s.run();
-        } catch (IOException | RuntimeException e) {
-            lastPartial = java.util.Arrays.copyOf(s.out, s.outPos);
-            throw e;
-        }
-    }
-
-    /** Output produced before the last failure; debugging aid. */
-    public static byte[] partial() {
-        return lastPartial;
+        return new State(data, off, len, maxOutput).run();
     }
 
     /**
