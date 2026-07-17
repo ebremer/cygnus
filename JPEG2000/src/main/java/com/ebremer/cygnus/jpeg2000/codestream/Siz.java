@@ -54,10 +54,12 @@ public final class Siz {
     public int[] tileBounds(int tileIndex) {
         int p = tileIndex % numXTiles();
         int q = tileIndex / numXTiles();
-        int tx0 = Math.max(xtosiz + p * xtsiz, xosiz);
-        int ty0 = Math.max(ytosiz + q * ytsiz, yosiz);
-        int tx1 = Math.min(xtosiz + (p + 1) * xtsiz, xsiz);
-        int ty1 = Math.min(ytosiz + (q + 1) * ytsiz, ysiz);
+        // in long: the last tile's (p+1)·XTsiz corner can pass 2^31 before
+        // its clamp to Xsiz, and a negative bound reads as an empty tile
+        int tx0 = (int) Math.max(xtosiz + (long) p * xtsiz, xosiz);
+        int ty0 = (int) Math.max(ytosiz + (long) q * ytsiz, yosiz);
+        int tx1 = (int) Math.min(xtosiz + (p + 1L) * xtsiz, xsiz);
+        int ty1 = (int) Math.min(ytosiz + (q + 1L) * ytsiz, ysiz);
         return new int[] {tx0, ty0, tx1, ty1};
     }
 
