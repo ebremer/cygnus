@@ -206,6 +206,39 @@ class ExtraChannelTest {
         assertArrayEquals(planes[4], back[4], "the full-resolution channel behind the mask");
     }
 
+    /**
+     * Hundreds of channels mean hundreds of tree leaves — more contexts than
+     * the cluster merge's quadratic matrix comfortably holds, so the encoder
+     * coarsely pre-folds them first. The fold must keep the context mapping
+     * sound: every channel back exactly.
+     */
+    @Test
+    void hundredsOfExtraChannelsRoundTrip() throws Exception {
+        int w = 32;
+        int h = 32;
+        int count = 400;
+        List<ExtraChannelInfo> ex = new ArrayList<>();
+        int[][] planes = new int[3 + count][];
+        for (int c = 0; c < 3; c++) {
+            planes[c] = ramp(w, h, 255, c);
+        }
+        Random r = new Random(11);
+        for (int i = 0; i < count; i++) {
+            ex.add(ExtraChannelInfo.of(ExtraChannelInfo.TYPE_OPTIONAL, BitDepth.of(8), "c" + i));
+            int[] p = new int[w * h];
+            int bias = r.nextInt(200);
+            for (int j = 0; j < p.length; j++) {
+                p[j] = bias + r.nextInt(56);
+            }
+            planes[3 + i] = p;
+        }
+        byte[] jxl = JxlEncoder.encode(planes, w, h, 8, false, ex);
+        int[][] back = JxlDecoder.decode(jxl).frames.get(0).channels;
+        for (int i = 0; i < planes.length; i++) {
+            assertArrayEquals(planes[i], back[i], "plane " + i);
+        }
+    }
+
     /** A spot colour is an ink: the decoder mixes it onto the picture. */
     @Test
     void spotColourIsComposited() throws Exception {

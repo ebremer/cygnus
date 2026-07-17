@@ -18,6 +18,7 @@ final class EntropyEncoder {
     static final int MIN_SYMBOL = 224;
     static final int MIN_LENGTH = 3;
     private static final int MAX_CLUSTERS = 64;
+    private static final int PRECLUSTER = 256;
     static final int ALPHABET = MIN_SYMBOL + 40;
     private static final HybridUintConfig VALUE_CONFIG = new HybridUintConfig(4, 1, 0);
 
@@ -408,26 +409,57 @@ final class EntropyEncoder {
      * <p>Every pair's merge cost is held in a matrix rather than recomputed each
      * round: absorbing {@code j} into {@code i} only changes the costs against
      * {@code i}, so a round costs one row of entropies, not the whole triangle.
+     *
+     * <p>The matrix is quadratic in its input, which stops being affordable
+     * somewhere past a few hundred contexts (a many-channel image can bring
+     * thousands of tree leaves). Beyond {@link #PRECLUSTER} the first
+     * {@code PRECLUSTER} contexts seed groups and every later one is folded
+     * into whichever group it merges into cheapest; the exact merge then runs
+     * on the groups. At {@code PRECLUSTER} or fewer contexts every context is
+     * its own group and the result is unchanged.
      */
     private void cluster() {
         if (!perContext || explicit) {
             return; // already assigned: one shared cluster, or a given map
         }
         int n = numDist;
-        long[][] hist = new long[n][];
-        int[] owner = new int[n];
-        int[] active = new int[n];
-        double[] self = new double[n];
-        for (int i = 0; i < n; i++) {
+        int m = Math.min(n, PRECLUSTER);
+        int[] group = new int[n];
+        long[][] hist = new long[m][];
+        double[] self = new double[m];
+        for (int i = 0; i < m; i++) {
             hist[i] = histograms[i].clone();
+            self[i] = entropy(hist[i], null);
+            group[i] = i;
+        }
+        for (int i = m; i < n; i++) {
+            long[] h = histograms[i];
+            double hSelf = entropy(h, null);
+            int best = 0;
+            double bestCost = Double.MAX_VALUE;
+            for (int g = 0; g < m; g++) {
+                double c = entropy(hist[g], h) - self[g] - hSelf;
+                if (c < bestCost) {
+                    bestCost = c;
+                    best = g;
+                }
+            }
+            for (int t = 0; t < ALPHABET; t++) {
+                hist[best][t] += h[t];
+            }
+            self[best] = entropy(hist[best], null);
+            group[i] = best;
+        }
+        int[] owner = new int[m];
+        int[] active = new int[m];
+        for (int i = 0; i < m; i++) {
             owner[i] = i;
             active[i] = i;
-            self[i] = entropy(hist[i], null);
         }
-        int live = n;
-        double[][] cost = new double[n][n];
-        for (int a = 0; a < n; a++) {
-            for (int b = a + 1; b < n; b++) {
+        int live = m;
+        double[][] cost = new double[m][m];
+        for (int a = 0; a < m; a++) {
+            for (int b = a + 1; b < m; b++) {
                 cost[a][b] = cost[b][a] = pairCost(hist, self, a, b);
             }
         }
@@ -450,7 +482,7 @@ final class EntropyEncoder {
             for (int t = 0; t < ALPHABET; t++) {
                 hist[i][t] += hist[j][t];
             }
-            for (int k = 0; k < n; k++) {
+            for (int k = 0; k < m; k++) {
                 if (owner[k] == j) {
                     owner[k] = i;
                 }
@@ -464,11 +496,11 @@ final class EntropyEncoder {
                 }
             }
         }
-        int[] rank = new int[n];
+        int[] rank = new int[m];
         java.util.Arrays.fill(rank, -1);
         int next = 0;
         for (int k = 0; k < n; k++) {
-            int root = owner[k];
+            int root = owner[group[k]];
             if (rank[root] < 0) {
                 rank[root] = next++;
             }
