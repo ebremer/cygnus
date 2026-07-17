@@ -232,5 +232,5 @@ to tile area.
 
 ## License / status
 
-Version 0.1.0. Written as a clean-room implementation from the ITU-T T.800
-specification text.
+Version 0.1.0-SNAPSHOT (the version lives in the pom; this line follows it).
+Written as a clean-room implementation from the ITU-T T.800 specification text.

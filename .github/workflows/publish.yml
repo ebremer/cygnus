@@ -17,12 +17,12 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Must match <maven.compiler.release> in pom.xml (25). javac cannot target a
       # release newer than the JDK running it.
       - name: Set up JDK 25
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
         with:
           distribution: temurin
           java-version: '25'
@@ -32,7 +32,7 @@ jobs:
       # in pom.xml looks up to find these credentials. Requires MAVEN_NAME and
       # MAVEN_SECRET to be set as secrets on THIS repository.
       - name: Configure Maven settings
-        uses: s4u/maven-settings-action@v3.0.0
+        uses: s4u/maven-settings-action@7802f6aec16c9098b4798ad1f1d8ac75198194bd # v3.0.0
         with:
           servers: |
             [{
@@ -54,7 +54,7 @@ jobs:
 
       - name: Upload surefire reports
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: surefire-reports
           path: '**/target/surefire-reports'

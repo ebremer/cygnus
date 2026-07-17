@@ -23,11 +23,11 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Must match <maven.compiler.release> in pom.xml (25).
       - name: Set up JDK 25
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
         with:
           distribution: temurin
           java-version: '25'
@@ -37,7 +37,7 @@ jobs:
       # corpus into test-data/ on first run (and skip when offline); the cache
       # keeps every later run from re-downloading it.
       - name: Cache JPEG2000 test corpora
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: JPEG2000/test-data
           key: jpeg2000-test-data-v1
@@ -53,7 +53,7 @@ jobs:
       - name: Cache JXL conformance corpus
         if: runner.os == 'Linux'
         id: jxl-corpus
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: jxl-conformance
           key: jxl-conformance-v1
@@ -78,7 +78,7 @@ jobs:
 
       - name: Upload surefire reports
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: surefire-reports-${{ matrix.os }}
           path: '**/target/surefire-reports'
