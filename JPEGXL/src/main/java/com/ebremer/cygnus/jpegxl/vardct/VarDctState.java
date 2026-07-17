@@ -643,163 +643,144 @@ public final class VarDctState {
                 java.util.Arrays.fill(p, 0f);
             }
 
-            for (int by = 0; by < gg.height8; by++) {
-                for (int bx = 0; bx < gg.width8; bx++) {
-                    int posK = by * gg.width8 + bx;
-                    if (!gg.blockOrigin[posK]) {
+            // dequantise
+            forEachBlock(gg, groupPosY, groupPosX, (by, bx, posK, groupY, groupX, tt) -> {
+                boolean flip = tt.flip();
+                float[][] w2 = dequant.weights[tt.parameterIndex];
+                int matrixWidth = tt.matrixWidth;
+                for (int c = 0; c < 3; c++) {
+                    int sGroupY = groupY >> shiftY[c];
+                    int sGroupX = groupX >> shiftX[c];
+                    if (groupY != sGroupY << shiftY[c] || groupX != sGroupX << shiftX[c]) {
                         continue;
                     }
-                    int groupY = by - groupPosY;
-                    int groupX = bx - groupPosX;
-                    if (groupY < 0 || groupX < 0 || groupY >= 32 || groupX >= 32) {
-                        continue;
-                    }
-                    TransformType tt = TransformType.byType(gg.blockType[posK]);
-                    boolean flip = tt.flip();
-                    float[][] w2 = dequant.weights[tt.parameterIndex];
-                    int matrixWidth = tt.matrixWidth;
-                    // dequantise
-                    for (int c = 0; c < 3; c++) {
-                        int sGroupY = groupY >> shiftY[c];
-                        int sGroupX = groupX >> shiftX[c];
-                        if (groupY != sGroupY << shiftY[c] || groupX != sGroupX << shiftX[c]) {
-                            continue;
-                        }
-                        float sfc = scaleFactor[c] / gg.hfMul[posK];
-                        int pixelGroupY = sGroupY << 3;
-                        int pixelGroupX = sGroupX << 3;
-                        float[] qbc = qbclut[c];
-                        float[] w3 = w2[c];
-                        for (int y = 0; y < tt.pixelHeight; y++) {
-                            for (int x = 0; x < tt.pixelWidth; x++) {
-                                if (y < tt.blockHeight && x < tt.blockWidth) {
-                                    continue;
-                                }
-                                int pY = pixelGroupY + y;
-                                int pX = pixelGroupX + x;
-                                int coeff = coeffs[c][pY * cStride[c] + pX];
-                                float quant = (coeff > -2 && coeff < 2)
-                                        ? qbc[coeff + 1]
-                                        : coeff - meta.quantBiasNumerator / coeff;
-                                int wy = flip ? x : y;
-                                int wx = x ^ y ^ wy;
-                                dq[c][pY * cStride[c] + pX] = quant * sfc * w3[wy * matrixWidth + wx];
+                    float sfc = scaleFactor[c] / gg.hfMul[posK];
+                    int pixelGroupY = sGroupY << 3;
+                    int pixelGroupX = sGroupX << 3;
+                    float[] qbc = qbclut[c];
+                    float[] w3 = w2[c];
+                    for (int y = 0; y < tt.pixelHeight; y++) {
+                        for (int x = 0; x < tt.pixelWidth; x++) {
+                            if (y < tt.blockHeight && x < tt.blockWidth) {
+                                continue;
                             }
+                            int pY = pixelGroupY + y;
+                            int pX = pixelGroupX + x;
+                            int coeff = coeffs[c][pY * cStride[c] + pX];
+                            float quant = (coeff > -2 && coeff < 2)
+                                    ? qbc[coeff + 1]
+                                    : coeff - meta.quantBiasNumerator / coeff;
+                            int wy = flip ? x : y;
+                            int wx = x ^ y ^ wy;
+                            dq[c][pY * cStride[c] + pX] = quant * sfc * w3[wy * matrixWidth + wx];
                         }
                     }
                 }
-            }
+            });
 
             // chroma from luma (per 64x64 tile factors); never with subsampling
             if (!fh.isSubsampled) {
-                for (int by = 0; by < gg.height8; by++) {
-                    for (int bx = 0; bx < gg.width8; bx++) {
-                        int posK = by * gg.width8 + bx;
-                        if (!gg.blockOrigin[posK]) {
-                            continue;
-                        }
-                        int groupY = by - groupPosY;
-                        int groupX = bx - groupPosX;
-                        if (groupY < 0 || groupX < 0 || groupY >= 32 || groupX >= 32) {
-                            continue;
-                        }
-                        TransformType tt = TransformType.byType(gg.blockType[posK]);
-                        int pPosY = by << 3; // within the LF group, in pixels
-                        int pPosX = bx << 3;
-                        for (int iy = 0; iy < tt.pixelHeight; iy++) {
-                            int y = pPosY + iy;
-                            int fy = y >> 6;
-                            for (int ix = 0; ix < tt.pixelWidth; ix++) {
-                                int x = pPosX + ix;
-                                int fx = x >> 6;
-                                float kX = baseCorrelationX
-                                        + gg.xFromY[fy * gg.tileStride + fx] / (float) colorFactor;
-                                float kB = baseCorrelationB
-                                        + gg.bFromY[fy * gg.tileStride + fx] / (float) colorFactor;
-                                int idx = (y & 0xFF) * 256 + (x & 0xFF);
-                                float dequantY = dq[1][idx];
-                                dq[0][idx] += kX * dequantY;
-                                dq[2][idx] += kB * dequantY;
-                            }
+                forEachBlock(gg, groupPosY, groupPosX, (by, bx, posK, groupY, groupX, tt) -> {
+                    int pPosY = by << 3; // within the LF group, in pixels
+                    int pPosX = bx << 3;
+                    for (int iy = 0; iy < tt.pixelHeight; iy++) {
+                        int y = pPosY + iy;
+                        int fy = y >> 6;
+                        for (int ix = 0; ix < tt.pixelWidth; ix++) {
+                            int x = pPosX + ix;
+                            int fx = x >> 6;
+                            float kX = baseCorrelationX
+                                    + gg.xFromY[fy * gg.tileStride + fx] / (float) colorFactor;
+                            float kB = baseCorrelationB
+                                    + gg.bFromY[fy * gg.tileStride + fx] / (float) colorFactor;
+                            int idx = (y & 0xFF) * 256 + (x & 0xFF);
+                            float dequantY = dq[1][idx];
+                            dq[0][idx] += kX * dequantY;
+                            dq[2][idx] += kB * dequantY;
                         }
                     }
-                }
+                });
             }
 
             // LLF: forward-DCT the dequantised LF into the corner coefficients
-            for (int by = 0; by < gg.height8; by++) {
-                for (int bx = 0; bx < gg.width8; bx++) {
-                    int posK = by * gg.width8 + bx;
-                    if (!gg.blockOrigin[posK]) {
+            forEachBlock(gg, groupPosY, groupPosX, (by, bx, posK, groupY, groupX, tt) -> {
+                for (int c = 0; c < 3; c++) {
+                    int sGroupY = groupY >> shiftY[c];
+                    int sGroupX = groupX >> shiftX[c];
+                    if (groupY != sGroupY << shiftY[c] || groupX != sGroupX << shiftX[c]) {
                         continue;
                     }
-                    int groupY = by - groupPosY;
-                    int groupX = bx - groupPosX;
-                    if (groupY < 0 || groupX < 0 || groupY >= 32 || groupX >= 32) {
-                        continue;
-                    }
-                    TransformType tt = TransformType.byType(gg.blockType[posK]);
-                    for (int c = 0; c < 3; c++) {
-                        int sGroupY = groupY >> shiftY[c];
-                        int sGroupX = groupX >> shiftX[c];
-                        if (groupY != sGroupY << shiftY[c] || groupX != sGroupX << shiftX[c]) {
-                            continue;
-                        }
-                        int pixelGroupY = sGroupY << 3;
-                        int pixelGroupX = sGroupX << 3;
-                        int sBy = by >> shiftY[c];
-                        int sBx = bx >> shiftX[c];
-                        if (tt.blockHeight == 1 && tt.blockWidth == 1) {
-                            dq[c][pixelGroupY * cStride[c] + pixelGroupX] =
-                                    gg.lfDeq[c][sBy * gg.cWidth8[c] + sBx];
-                        } else {
-                            Dct.forward2D(gg.lfDeq[c], sBy * gg.cWidth8[c] + sBx, gg.cWidth8[c],
-                                    dq[c], pixelGroupY * cStride[c] + pixelGroupX, cStride[c],
-                                    tt.blockHeight, tt.blockWidth, scratch0, scratch1);
-                            for (int y = 0; y < tt.blockHeight; y++) {
-                                for (int x = 0; x < tt.blockWidth; x++) {
-                                    dq[c][(pixelGroupY + y) * cStride[c] + pixelGroupX + x] *=
-                                            tt.llfScale[y * tt.blockWidth + x];
-                                }
+                    int pixelGroupY = sGroupY << 3;
+                    int pixelGroupX = sGroupX << 3;
+                    int sBy = by >> shiftY[c];
+                    int sBx = bx >> shiftX[c];
+                    if (tt.blockHeight == 1 && tt.blockWidth == 1) {
+                        dq[c][pixelGroupY * cStride[c] + pixelGroupX] =
+                                gg.lfDeq[c][sBy * gg.cWidth8[c] + sBx];
+                    } else {
+                        Dct.forward2D(gg.lfDeq[c], sBy * gg.cWidth8[c] + sBx, gg.cWidth8[c],
+                                dq[c], pixelGroupY * cStride[c] + pixelGroupX, cStride[c],
+                                tt.blockHeight, tt.blockWidth, scratch0, scratch1);
+                        for (int y = 0; y < tt.blockHeight; y++) {
+                            for (int x = 0; x < tt.blockWidth; x++) {
+                                dq[c][(pixelGroupY + y) * cStride[c] + pixelGroupX + x] *=
+                                        tt.llfScale[y * tt.blockWidth + x];
                             }
                         }
                     }
                 }
-            }
+            });
 
             // inverse transforms into the frame planes
             int frameY0 = gRow << 8;
             int frameX0 = gCol << 8;
-            for (int by = 0; by < gg.height8; by++) {
-                for (int bx = 0; bx < gg.width8; bx++) {
-                    int posK = by * gg.width8 + bx;
-                    if (!gg.blockOrigin[posK]) {
+            forEachBlock(gg, groupPosY, groupPosX, (by, bx, posK, groupY, groupX, tt) -> {
+                for (int c = 0; c < 3; c++) {
+                    int sGroupY = groupY >> shiftY[c];
+                    int sGroupX = groupX >> shiftX[c];
+                    if (groupY != sGroupY << shiftY[c] || groupX != sGroupX << shiftX[c]) {
                         continue;
                     }
-                    int groupY = by - groupPosY;
-                    int groupX = bx - groupPosX;
-                    if (groupY < 0 || groupX < 0 || groupY >= 32 || groupX >= 32) {
-                        continue;
-                    }
-                    TransformType tt = TransformType.byType(gg.blockType[posK]);
-                    for (int c = 0; c < 3; c++) {
-                        int sGroupY = groupY >> shiftY[c];
-                        int sGroupX = groupX >> shiftX[c];
-                        if (groupY != sGroupY << shiftY[c] || groupX != sGroupX << shiftX[c]) {
-                            continue;
-                        }
-                        int stride = fh.paddedWidth >> shiftX[c];
-                        int ppgY = sGroupY << 3;
-                        int ppgX = sGroupX << 3;
-                        int ppfY = ppgY + (frameY0 >> shiftY[c]);
-                        int ppfX = ppgX + (frameX0 >> shiftX[c]);
-                        Transforms.invert(tt, dq[c], cStride[c], ppgY, ppgX,
-                                framePlanes[c], ppfY * stride + ppfX, stride,
-                                scratch0, scratch1, scratch2, scratch3);
-                    }
+                    int stride = fh.paddedWidth >> shiftX[c];
+                    int ppgY = sGroupY << 3;
+                    int ppgX = sGroupX << 3;
+                    int ppfY = ppgY + (frameY0 >> shiftY[c]);
+                    int ppfX = ppgX + (frameX0 >> shiftX[c]);
+                    Transforms.invert(tt, dq[c], cStride[c], ppgY, ppgX,
+                            framePlanes[c], ppfY * stride + ppfX, stride,
+                            scratch0, scratch1, scratch2, scratch3);
                 }
-            }
+            });
         });
+    }
+
+    /** One committed block whose origin cell falls inside the current group. */
+    private interface BlockVisitor {
+        void visit(int by, int bx, int posK, int groupY, int groupX, TransformType tt);
+    }
+
+    /**
+     * Walks the block origins of one group in raster order — the boilerplate
+     * every reconstruction stage used to repeat — handing the visitor the
+     * origin cell, its group-relative position, and its transform.
+     */
+    private static void forEachBlock(LfGroupData gg, int groupPosY, int groupPosX,
+            BlockVisitor v) {
+        for (int by = 0; by < gg.height8; by++) {
+            for (int bx = 0; bx < gg.width8; bx++) {
+                int posK = by * gg.width8 + bx;
+                if (!gg.blockOrigin[posK]) {
+                    continue;
+                }
+                int groupY = by - groupPosY;
+                int groupX = bx - groupPosX;
+                if (groupY < 0 || groupX < 0 || groupY >= 32 || groupX >= 32) {
+                    continue;
+                }
+                v.visit(by, bx, posK, groupY, groupX,
+                        TransformType.byType(gg.blockType[posK]));
+            }
+        }
     }
 
     /** Per-8x8-block inverse EPF sigma over the padded frame. */
