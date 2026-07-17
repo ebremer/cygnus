@@ -161,59 +161,76 @@ public final class JXLImageReader extends ImageReader {
 
     @Override
     public BufferedImage read(int imageIndex, ImageReadParam param) throws IOException {
-        java.awt.Rectangle wanted = param != null ? param.getSourceRegion() : null;
-        if (wanted != null) {
-            wanted = wanted.intersection(new java.awt.Rectangle(
-                    info().orientedWidth(), info().orientedHeight()));
-            if (wanted.isEmpty()) {
-                throw new IIOException("source region " + param.getSourceRegion()
-                        + " lies outside the image");
-            }
-        }
+        int width = info().orientedWidth();
+        int height = info().orientedHeight();
+        java.awt.Rectangle srcRegion = new java.awt.Rectangle();
+        java.awt.Rectangle destRegion = new java.awt.Rectangle();
+        computeRegions(param, width, height,
+                param != null ? param.getDestination() : null, srcRegion, destRegion);
+
         JxlImage img;
-        java.awt.Rectangle region; // remaining crop, relative to the frame
-        if (decoded == null && wanted != null
-                && (wanted.width < info().orientedWidth()
-                    || wanted.height < info().orientedHeight())) {
+        int baseX; // srcRegion's origin, relative to the decoded frame
+        int baseY;
+        if (decoded == null && (srcRegion.width < width || srcRegion.height < height)) {
             // group-selective decode of just the requested rectangle; not
             // cached, the result depends on the parameters
-            img = JxlDecoder.decode(source(), wanted);
-            region = null; // the frames already cover exactly the region
+            img = JxlDecoder.decode(source(), srcRegion);
+            baseX = 0;
+            baseY = 0;
         } else {
             checkIndex(imageIndex);
             img = image();
-            region = wanted;
+            baseX = srcRegion.x;
+            baseY = srcRegion.y;
         }
         if (imageIndex < 0 || imageIndex >= img.frames.size()) {
             throw new IndexOutOfBoundsException("image index " + imageIndex);
         }
-        JxlFrame frame = img.frames.get(imageIndex);
-        BufferedImage full = toBufferedImage(img.metadata, frame);
-        if (param == null) {
-            return full;
+        BufferedImage full = toBufferedImage(img.metadata, img.frames.get(imageIndex));
+        int sx = param != null ? param.getSourceXSubsampling() : 1;
+        int sy = param != null ? param.getSourceYSubsampling() : 1;
+        if (param == null
+                || (param.getDestination() == null && param.getDestinationType() == null
+                    && param.getSourceBands() == null && param.getDestinationBands() == null
+                    && destRegion.x == 0 && destRegion.y == 0 && sx == 1 && sy == 1
+                    && baseX == 0 && baseY == 0
+                    && srcRegion.width == full.getWidth()
+                    && srcRegion.height == full.getHeight())) {
+            return full; // the natural image is exactly what was asked for
         }
-        // honor any remaining source region / subsampling by extraction
-        if (region == null) {
-            region = new java.awt.Rectangle(full.getWidth(), full.getHeight());
-        }
-        int sx = Math.max(1, param.getSourceXSubsampling());
-        int sy = Math.max(1, param.getSourceYSubsampling());
-        if (region.x == 0 && region.y == 0 && region.width == full.getWidth()
-                && region.height == full.getHeight() && sx == 1 && sy == 1) {
-            return full;
-        }
-        int ow = (region.width + sx - 1) / sx;
-        int oh = (region.height + sy - 1) / sy;
-        BufferedImage out = new BufferedImage(full.getColorModel(),
-                full.getRaster().createCompatibleWritableRaster(ow, oh),
-                full.isAlphaPremultiplied(), null);
-        for (int y = 0; y < oh; y++) {
-            for (int x = 0; x < ow; x++) {
-                int[] px = full.getRaster().getPixel(region.x + x * sx, region.y + y * sy, (int[]) null);
-                out.getRaster().setPixel(x, y, px);
+        BufferedImage dest = getDestination(param, getImageTypes(imageIndex), width, height);
+        checkReadParamBandSettings(param, full.getRaster().getNumBands(),
+                dest.getRaster().getNumBands());
+        copyRegion(full, baseX, baseY, dest, destRegion, sx, sy,
+                param.getSourceBands(), param.getDestinationBands());
+        return dest;
+    }
+
+    /** Copies the subsampled source region into the destination, band-mapped. */
+    private static void copyRegion(BufferedImage src, int baseX, int baseY, BufferedImage dest,
+            java.awt.Rectangle destRegion, int sx, int sy, int[] srcBands, int[] dstBands) {
+        java.awt.image.Raster in = src.getRaster();
+        WritableRaster out = dest.getRaster();
+        int bands = srcBands != null ? srcBands.length : in.getNumBands();
+        boolean floats = in.getTransferType() == java.awt.image.DataBuffer.TYPE_FLOAT
+                || out.getTransferType() == java.awt.image.DataBuffer.TYPE_FLOAT;
+        for (int y = 0; y < destRegion.height; y++) {
+            int rowY = baseY + y * sy;
+            for (int x = 0; x < destRegion.width; x++) {
+                int colX = baseX + x * sx;
+                for (int b = 0; b < bands; b++) {
+                    int sb = srcBands != null ? srcBands[b] : b;
+                    int db = dstBands != null ? dstBands[b] : b;
+                    if (floats) {
+                        out.setSample(destRegion.x + x, destRegion.y + y, db,
+                                in.getSampleFloat(colX, rowY, sb));
+                    } else {
+                        out.setSample(destRegion.x + x, destRegion.y + y, db,
+                                in.getSample(colX, rowY, sb));
+                    }
+                }
             }
         }
-        return out;
     }
 
     // ------------------------------------------------------------- tile API
