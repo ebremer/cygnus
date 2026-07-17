@@ -65,6 +65,52 @@ class PatchEncodeTest {
         }
     }
 
+    /**
+     * Two glyphs that agree in their low 16 bits must stay two glyphs: the
+     * tile-identity key has to carry all of a deep sample's bits, or one glyph
+     * is silently stamped over the other's sites. (Regression: the key kept
+     * only the low 16 bits of each sample.)
+     */
+    @Test
+    void deepGlyphsCollidingInTheLow16BitsStayDistinct() throws Exception {
+        int w = 256;
+        int h = 256;
+        int bits = 17;
+        int[][] src = new int[3][w * h];
+        for (int c = 0; c < 3; c++) {
+            java.util.Arrays.fill(src[c], 70000);
+        }
+        int[] glyph = new int[16 * 16 * 3];
+        java.util.Random r = new java.util.Random(3);
+        for (int i = 0; i < glyph.length; i++) {
+            glyph[i] = r.nextInt(1 << bits);
+        }
+        for (int ty = 0; ty < h / 16; ty++) {
+            for (int tx = 0; tx < w / 16; tx++) {
+                if ((tx + ty) % 4 != 0) {
+                    continue;
+                }
+                int flip = tx % 2 == 0 ? 0 : 1 << 16; // second glyph: bit 16 flipped
+                for (int c = 0; c < 3; c++) {
+                    for (int y = 0; y < 16; y++) {
+                        for (int x = 0; x < 16; x++) {
+                            src[c][(ty * 16 + y) * w + tx * 16 + x] =
+                                    glyph[(c * 16 + y) * 16 + x] ^ flip;
+                        }
+                    }
+                }
+            }
+        }
+        byte[] plain = JxlEncoder.encode(src, w, h, bits, false, false, false);
+        byte[] patched = JxlEncoder.encodeWithPatches(src, w, h, bits, false);
+        assertTrue(patched.length < plain.length,
+                "patches should engage: " + patched.length + " vs " + plain.length);
+        int[][] out = JxlDecoder.decode(patched).frames.get(0).channels;
+        for (int c = 0; c < 3; c++) {
+            assertArrayEquals(src[c], out[c], "channel " + c + " must be lossless");
+        }
+    }
+
     /** A non-repetitive image just falls through to the plain encode — never larger. */
     @Test
     void photographFallsThroughUnharmed() throws Exception {

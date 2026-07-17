@@ -793,12 +793,14 @@ public final class JxlEncoder {
 
     private static String tileKey(int[][] planes, int numColour, int width,
             int x0, int y0, int t) {
-        StringBuilder sb = new StringBuilder(numColour * t * t);
+        // two chars per sample: a char holds 16 bits, a sample up to 31
+        StringBuilder sb = new StringBuilder(2 * numColour * t * t);
         for (int c = 0; c < numColour; c++) {
             for (int y = 0; y < t; y++) {
                 int row = (y0 + y) * width + x0;
                 for (int x = 0; x < t; x++) {
-                    sb.append((char) planes[c][row + x]);
+                    int v = planes[c][row + x];
+                    sb.append((char) (v >>> 16)).append((char) v);
                 }
             }
         }
