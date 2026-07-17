@@ -73,13 +73,22 @@ class OfficialConformanceTest {
     void conformance(String name) throws IOException {
         assumeTrue(!KNOWN_DEVIATIONS.contains(name),
                 name + " has a small documented deviation (see KNOWN_DEVIATIONS)");
+        // the references keep raw channels: spot colours stay un-composited —
+        // and the property comes off again even when an assertion throws
+        System.setProperty("jxl.skipSpot", "true");
+        try {
+            checkCase(name);
+        } finally {
+            System.clearProperty("jxl.skipSpot");
+        }
+    }
+
+    private void checkCase(String name) throws IOException {
         Path dir = corpusDir().resolve(name);
         String json = Files.readString(dir.resolve("test.json"));
         List<double[]> limits = frameLimits(json); // {rms, peak} per frame
         byte[] input = Files.readAllBytes(dir.resolve("input.jxl"));
 
-        // the references keep raw channels: spot colours stay un-composited
-        System.setProperty("jxl.skipSpot", "true");
         Npy ref = Npy.read(dir.resolve("reference_image.npy"));
         assertEquals(4, ref.shape.length, "reference rank");
         int refFrames = ref.shape[0];
@@ -146,7 +155,6 @@ class OfficialConformanceTest {
             assertArrayEquals(expected, JpegReconstructor.reconstruct(input),
                     "reconstructed JPEG");
         }
-        System.clearProperty("jxl.skipSpot");
     }
 
     private static List<double[]> frameLimits(String json) {
