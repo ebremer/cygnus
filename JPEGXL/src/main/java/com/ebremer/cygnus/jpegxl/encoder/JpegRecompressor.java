@@ -635,19 +635,7 @@ public final class JpegRecompressor {
     }
 
     private static void writeTocEntry(BitWriter out, int size) {
-        if (size < 1024) {
-            out.write(0, 2);
-            out.write(size, 10);
-        } else if (size < 17408) {
-            out.write(1, 2);
-            out.write(size - 1024, 14);
-        } else if (size < 4211712) {
-            out.write(2, 2);
-            out.write(size - 17408, 22);
-        } else {
-            out.write(3, 2);
-            out.write(size - 4211712, 30);
-        }
+        JxlEncoder.writeTocEntry(out, size);
     }
 
     private static int packSigned(int v) {

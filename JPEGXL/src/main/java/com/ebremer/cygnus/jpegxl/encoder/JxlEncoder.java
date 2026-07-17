@@ -1892,6 +1892,10 @@ public final class JxlEncoder {
     }
 
     static void writeTocEntry(BitWriter out, int size) {
+        if (size < 0 || size >= 4211712 + (1 << 30)) {
+            // the widest branch holds 30 bits; masking would corrupt the TOC
+            throw new IllegalArgumentException("no TOC entry can hold " + size + " bytes");
+        }
         if (size < 1024) {
             out.write(0, 2);
             out.write(size, 10);

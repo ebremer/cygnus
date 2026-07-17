@@ -154,8 +154,8 @@ public final class BitWriter {
         bytePos += bytes.length;
     }
 
-    public int bitLength() {
-        return bytePos * 8 + nbits;
+    public long bitLength() {
+        return bytePos * 8L + nbits;
     }
 
     public byte[] toByteArray() {
@@ -166,8 +166,16 @@ public final class BitWriter {
     }
 
     private void ensure(int extra) {
-        if (bytePos + extra > buf.length) {
-            buf = Arrays.copyOf(buf, Math.max(buf.length * 2, bytePos + extra));
+        long need = bytePos + (long) extra;
+        if (need > buf.length) {
+            long want = Math.max(2L * buf.length, need);
+            if (want > Integer.MAX_VALUE - 8) {
+                if (need > Integer.MAX_VALUE - 8) {
+                    throw new IllegalStateException("bitstream past 2^31 bytes");
+                }
+                want = Integer.MAX_VALUE - 8;
+            }
+            buf = Arrays.copyOf(buf, (int) want);
         }
     }
 }
