@@ -1,0 +1,61 @@
+name: publish
+
+# Manual only. Publishing is never something a push should trigger, and the
+# Halcyon repository does not accept re-deploying an existing release version,
+# so this stays a deliberate act.
+on: workflow_dispatch
+
+# Least privilege: this workflow only reads the repo. The Maven credentials come
+# from repository secrets, not from the GITHUB_TOKEN.
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: mvn deploy -> Halcyon Maven repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Must match <maven.compiler.release> in pom.xml (25). javac cannot target a
+      # release newer than the JDK running it.
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      # The server id MUST be `halcyon`: that is the id <distributionManagement>
+      # in pom.xml looks up to find these credentials. Requires MAVEN_NAME and
+      # MAVEN_SECRET to be set as secrets on THIS repository.
+      - name: Configure Maven settings
+        uses: s4u/maven-settings-action@v3.0.0
+        with:
+          servers: |
+            [{
+              "id": "halcyon",
+              "username": "${{ secrets.MAVEN_NAME }}",
+              "password": "${{ secrets.MAVEN_SECRET }}"
+            }]
+
+      # All four modules (jpeg2000, jpegxl, svs, ndpi) plus the parent pom are
+      # library artifacts that consumers resolve, so the whole reactor deploys —
+      # there is no demo/app module to exclude. Tests are NOT skipped: `deploy`
+      # runs the full lifecycle, so nothing reaches the repository that did not
+      # pass its tests first.
+      #
+      # Destination is decided purely by the version in pom.xml: 0.1.0-SNAPSHOT
+      # goes to /snapshots, 0.1.0 to /releases. See <distributionManagement>.
+      - name: Deploy
+        run: mvn -B -ntp deploy
+
+      - name: Upload surefire reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: '**/target/surefire-reports'
+          if-no-files-found: warn
