@@ -11,6 +11,10 @@
   </parent>
 
   <artifactId>svs</artifactId>
+
+  <properties>
+    <automatic.module.name>com.ebremer.cygnus.svs</automatic.module.name>
+  </properties>
   <packaging>jar</packaging>
 
   <name>Cygnus Aperio SVS Reader</name>

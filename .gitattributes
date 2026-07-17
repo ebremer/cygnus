@@ -1,0 +1,5 @@
+# Normalize line endings for text; keep the binary fixtures untouched.
+* text=auto
+*.bin -text
+*.compressed -text
+JPEGXL/src/test/resources/brotli/** -text

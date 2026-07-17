@@ -11,6 +11,10 @@
   </parent>
 
   <artifactId>ndpi</artifactId>
+
+  <properties>
+    <automatic.module.name>com.ebremer.cygnus.ndpi</automatic.module.name>
+  </properties>
   <packaging>jar</packaging>
 
   <name>Cygnus Hamamatsu NDPI Reader</name>

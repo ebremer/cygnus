@@ -45,6 +45,8 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>25</maven.compiler.release>
+    <!-- reproducible builds: archives are stamped with this instead of now() -->
+    <project.build.outputTimestamp>2026-07-17T00:00:00Z</project.build.outputTimestamp>
     <junit.version>5.13.1</junit.version>
     <twelvemonkeys.version>3.13.1</twelvemonkeys.version>
   </properties>
@@ -169,6 +171,15 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-jar-plugin</artifactId>
           <version>3.4.2</version>
+          <configuration>
+            <archive>
+              <manifestEntries>
+                <!-- each module names itself for the module path; set in the
+                     module pom, matching its root package -->
+                <Automatic-Module-Name>${automatic.module.name}</Automatic-Module-Name>
+              </manifestEntries>
+            </archive>
+          </configuration>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
@@ -177,5 +188,32 @@
         </plugin>
       </plugins>
     </pluginManagement>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-enforcer-plugin</artifactId>
+        <version>3.5.0</version>
+        <executions>
+          <execution>
+            <id>enforce-environment</id>
+            <goals>
+              <goal>enforce</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <!-- javac cannot target release 25 from an older JDK, and the
+                     build relies on Maven 3.9 behaviors; fail fast, clearly -->
+                <requireJavaVersion>
+                  <version>[25,)</version>
+                </requireJavaVersion>
+                <requireMavenVersion>
+                  <version>[3.9,)</version>
+                </requireMavenVersion>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
   </build>
 </project>

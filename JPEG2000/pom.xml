@@ -11,6 +11,11 @@
   </parent>
 
   <artifactId>jpeg2000</artifactId>
+
+  <properties>
+    <automatic.module.name>com.ebremer.cygnus.jpeg2000</automatic.module.name>
+  </properties>
+
   <packaging>jar</packaging>
 
   <name>Cygnus JPEG 2000 Codec</name>

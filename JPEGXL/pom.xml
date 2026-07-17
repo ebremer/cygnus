@@ -11,6 +11,10 @@
   </parent>
 
   <artifactId>jpegxl</artifactId>
+
+  <properties>
+    <automatic.module.name>com.ebremer.cygnus.jpegxl</automatic.module.name>
+  </properties>
   <packaging>jar</packaging>
 
   <name>JPEG XL Reader/Writer</name>
