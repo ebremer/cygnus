@@ -180,7 +180,7 @@ public final class JxlEncoder {
         return ec.planeHeight(height);
     }
 
-    /** Every plane present, the right size, and holding samples its depth can carry. */
+    /** Every plane present and exactly the size its channel asks for. */
     static void checkPlanes(int[][] planes, int width, int height, boolean grey,
             List<ExtraChannelInfo> extras) {
         int colour = grey ? 1 : 3;
@@ -1007,7 +1007,13 @@ public final class JxlEncoder {
         for (int i = 0; i < n; i++) {
             long key = 0;
             for (int c = 0; c < m; c++) {
-                key |= (long) input[c][i] << (16 * c);
+                int v = input[c][i];
+                // the key packs 16 bits per channel: a sample outside them
+                // would fold distinct tuples into one entry
+                if (v < 0 || v > 0xffff) {
+                    return false;
+                }
+                key |= (long) v << (16 * c);
             }
             if (colours.size() >= MAX_PALETTE && !colours.containsKey(key)) {
                 return false;

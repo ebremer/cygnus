@@ -119,6 +119,36 @@ class RoundTripTest {
         verifyRoundTrip(original, 64, 64, 16, true, false);
     }
 
+    /**
+     * Samples outside the declared depth are a caller bug; the decoder's
+     * integer output clamps them to the depth, and that clamp is the most a
+     * caller may lose. The palette's colour key packs 16 bits per channel, so
+     * it has to stand aside for such samples rather than fold colliding tuples
+     * into one entry — 65539 collides with 3 at 16 bits, a negative
+     * sign-extends into every other channel's key field, and either way whole
+     * pixels would come back as some other pixel's colour.
+     */
+    @Test
+    void outOfRangeSamplesDecodeAsTheirOwnClamp() throws IOException {
+        int w = 64;
+        int h = 64;
+        int[][] p = new int[3][w * h];
+        for (int i = 0; i < w * h; i++) {
+            p[0][i] = i % w >= w / 2 ? 65539 : 3;
+            p[1][i] = i % 3 == 0 ? -5 : 5;
+            p[2][i] = 9;
+        }
+        int[][] copies = {p[0].clone(), p[1].clone(), p[2].clone()};
+        byte[] jxl = JxlEncoder.encode(copies, w, h, 8, false, false, false);
+        int[][] back = JxlDecoder.decode(jxl).frames.get(0).channels;
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < w * h; i++) {
+                assertEquals(Math.max(0, Math.min(255, p[c][i])), back[c][i],
+                        "plane " + c + " sample " + i);
+            }
+        }
+    }
+
     @Test
     void containerWrapping() throws IOException {
         int[][] original = TestImages.mixed(50, 40, 3, 8, 1);
