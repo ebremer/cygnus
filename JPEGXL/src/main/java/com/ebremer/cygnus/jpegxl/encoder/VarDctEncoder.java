@@ -1696,6 +1696,11 @@ public final class VarDctEncoder {
                 throw new IllegalArgumentException("shifts must strictly decrease");
             }
         }
+        // the header carries a pass shift in two bits; strictly decreasing to
+        // zero from at most 3 also keeps num_passes inside its ceiling of 11
+        if (shifts[0] > 3) {
+            throw new IllegalArgumentException("pass shifts fit two bits: at most 3");
+        }
         BitDepth depth = BitDepth.of(bits);
         java.util.List<ExtraChannelInfo> extras = JxlEncoder.alphaOnly(depth, false, false);
         checkInput(planes, width, height, depth, grey, extras);

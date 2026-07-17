@@ -385,6 +385,26 @@ class VarDctEncoderTest {
         assertTrue(sum / (3.0 * w * h) < 2.0, "streamed smooth image decoded far off");
     }
 
+    /**
+     * The frame header carries each pass shift in two bits, so shift 4 would be
+     * masked to 0 and decode corrupted; refuse it instead. A 12-pass plan has
+     * to start above 3, so the same guard also keeps num_passes inside the
+     * header's ceiling of 11.
+     */
+    @Test
+    void progressiveShiftsBeyondTheHeaderAreRefused() {
+        int[][] rgb = photo(64, 48);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> VarDctEncoder.encodeProgressive(rgb, 64, 48, 8, false, 1f,
+                        new int[] {4, 0}));
+        int[] twelve = new int[12];
+        for (int i = 0; i < twelve.length; i++) {
+            twelve[i] = twelve.length - 1 - i;
+        }
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> VarDctEncoder.encodeProgressive(rgb, 64, 48, 8, false, 1f, twelve));
+    }
+
     /** A NaN or infinite distance is a caller bug: refuse it at the API. */
     @Test
     void nonFiniteDistancesAreRefused() {
