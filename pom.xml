@@ -137,14 +137,15 @@
   </profiles>
 
   <build>
-    <!-- every jar carries the license; the reactor-root reference keeps the
-         one LICENSE file the single source (module-standalone builds just
-         warn about the missing directory and skip it) -->
+    <!-- every jar carries the license and notice; the reactor-root reference
+         keeps the single files the source of truth (module-standalone builds
+         just warn about the missing directory and skip them) -->
     <resources>
       <resource>
         <directory>${maven.multiModuleProjectDirectory}</directory>
         <includes>
           <include>LICENSE</include>
+          <include>NOTICE</include>
         </includes>
         <targetPath>META-INF</targetPath>
       </resource>

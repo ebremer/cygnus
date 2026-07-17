@@ -1,0 +1,17 @@
+Cygnus — pure-Java image codecs
+Copyright (c) Erich Bremer
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------
+
+This product contains a Java port of the HTJ2K block decoder ht_dec.c,
+as distributed with OpenJPEG (https://github.com/uclouvain/openjpeg),
+released under the 2-Clause BSD license:
+
+  Copyright (c) 2021, Aous Naman
+  Copyright (c) 2021, Kakadu Software Pty Ltd, Australia
+  Copyright (c) 2021, The University of New South Wales, Australia
+
+The full license text, including its conditions and disclaimer, is
+retained in JPEG2000/src/main/java/com/ebremer/cygnus/jpeg2000/t1/HtBlockDecoder.java.
