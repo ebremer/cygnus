@@ -22,6 +22,47 @@ TIFF container and deliberately over-large level JPEGs.
 
 See each module's README for format coverage, usage, and API details.
 
+## Using from Maven
+
+Releases and snapshots are published to the Halcyon repository. Add it and
+whichever modules you need:
+
+```xml
+<repositories>
+  <repository>
+    <id>halcyon</id>
+    <url>https://cursus.bmi.stonybrookmedicine.edu/releases</url>
+  </repository>
+</repositories>
+
+<dependencies>
+  <dependency>
+    <groupId>com.ebremer</groupId>
+    <artifactId>jpeg2000</artifactId>
+    <version>0.1.0</version>
+  </dependency>
+  <dependency>
+    <groupId>com.ebremer</groupId>
+    <artifactId>jpegxl</artifactId>
+    <version>0.1.0</version>
+  </dependency>
+  <dependency>
+    <groupId>com.ebremer</groupId>
+    <artifactId>svs</artifactId>
+    <version>0.1.0</version>
+  </dependency>
+  <dependency>
+    <groupId>com.ebremer</groupId>
+    <artifactId>ndpi</artifactId>
+    <version>0.1.0</version>
+  </dependency>
+</dependencies>
+```
+
+Snapshot builds live at `https://cursus.bmi.stonybrookmedicine.edu/snapshots`.
+Each module registers its ImageIO plug-ins via `META-INF/services`, so having a
+jar on the classpath is all `ImageIO.read` needs.
+
 ## Build
 
 Requires JDK 25 and Maven. From the repo root:
