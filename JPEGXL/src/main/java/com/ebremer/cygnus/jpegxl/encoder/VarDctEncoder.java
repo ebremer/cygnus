@@ -137,12 +137,18 @@ public final class VarDctEncoder {
     private static final double SMALL_GAIN = 0.80;
     /**
      * How much cheaper a rectangular transform must estimate before it replaces
-     * the four 8x8s it covers. Like {@link #DCT32_GAIN}, below 1 by a margin: the
-     * rate estimate is blind to the DC image a bigger block rearranges, so a
+     * the four 8x8s it covers. Like {@link #SQUARE_GAIN}, below 1 by a margin:
+     * the rate estimate is blind to the DC image a bigger block rearranges, so a
      * rectangular block is taken only where it clearly pays — content smooth
      * along one axis and detailed across the other, a horizon or a wall's edge.
      */
     private static final double RECT_GAIN = 0.90;
+    /**
+     * How much cheaper one 16x16 must estimate before it replaces its four
+     * 8x8s. The slimmest of the margins: the DC image a 16x16 rearranges is
+     * only four entries, so a modest win already pays.
+     */
+    private static final double DCT16_GAIN = 0.94;
     /** Count of rectangular blocks committed, for tests to confirm the path fires. */
     public static final java.util.concurrent.atomic.AtomicLong RECT_BLOCKS =
             new java.util.concurrent.atomic.AtomicLong();
@@ -191,11 +197,6 @@ public final class VarDctEncoder {
     private float[] noiseLut;      // 8-point photon-noise strengths, or null for no noise
     private Splines splines;       // additive curves, or null for none
     private JxlEncoder.FrameParams frameParams; // compositing header, or null for the simple path
-    private boolean animated;      // this frame is one of an animation (carries a duration)
-    private long animDuration;     // ticks this frame shows for
-    private boolean animLast = true; // whether this is the animation's final frame
-    private boolean animTimecodes; // the animation carries per-frame timecodes
-    private long animTimecode;     // this frame's SMPTE-packed timecode
     private final int globalScale;
     private final float distance;   // the requested distance, gates the largest blocks
     private int hfMul;
@@ -1172,7 +1173,7 @@ public final class VarDctEncoder {
                     dc16[c][i] = Math.round(s.dcT[i] / scaledDequant[c]);
                 }
             }
-            if (cost16 < 0.94 * cost8) {
+            if (cost16 < DCT16_GAIN * cost8) {
                 for (int i = 0; i < 4; i++) {
                     int k = cells[i];
                     blockType[k] = (byte) (i == 0 ? DCT16.type : -2);
@@ -2752,10 +2753,6 @@ public final class VarDctEncoder {
         }
     }
 
-    static void writeFrameHeader(BitWriter out, boolean alpha) {
-        writeFrameHeader(out, alpha ? 1 : 0, 128);
-    }
-
     static void writeFrameHeader(BitWriter out, int numExtra) {
         writeFrameHeader(out, numExtra, 128);
     }
@@ -2765,22 +2762,12 @@ public final class VarDctEncoder {
     }
 
     /**
-     * {@code shifts} non-null and longer than one selects progressive: {@code shifts.length}
-     * passes (the last shift zero, not written) with no downsampling.
+     * The full-frame single-REPLACE-still header. {@code shifts} non-null and
+     * longer than one selects progressive: {@code shifts.length} passes (the
+     * last shift zero, not written) with no downsampling. Animated and
+     * compositing frames carry a {@link JxlEncoder.FrameParams} instead.
      */
     static void writeFrameHeader(BitWriter out, int numExtra, long flags, int[] shifts) {
-        writeFrameHeader(out, numExtra, flags, shifts, false, 0, true, false, 0);
-    }
-
-    /**
-     * The full-frame REPLACE header, still or animated. Animated frames carry a
-     * {@code duration} and a real {@code isLast}; a still frame is the {@code
-     * animated=false, isLast=true} case, which writes exactly the bits the still
-     * path always did. When {@code haveTimecodes}, a 32-bit {@code timecode}
-     * follows the duration.
-     */
-    static void writeFrameHeader(BitWriter out, int numExtra, long flags, int[] shifts,
-            boolean animated, long duration, boolean isLast, boolean haveTimecodes, long timecode) {
         out.zeroPadToByte();
         out.writeBool(false);        // !all_default
         out.write(0, 2);             // frame_type: regular
@@ -2799,23 +2786,7 @@ public final class VarDctEncoder {
         for (int i = 0; i < blendEntries; i++) {
             out.write(0, 2);         // blend mode: replace (full frame -> no source)
         }
-        if (animated) {
-            writeDuration(out, duration);
-            if (haveTimecodes) {
-                out.write((int) timecode, 32);
-            }
-        }
-        out.writeBool(isLast);
-        // full-frame REPLACE frames are independent — none is kept as a reference,
-        // so save_as_reference is 0 (written for every non-last frame). The
-        // before-colour-transform copy is coded only for a frame that could be kept,
-        // which a positive-duration REPLACE frame with save_as_reference 0 is not.
-        if (!isLast) {
-            out.write(0, 2);         // save_as_reference = 0
-        }
-        if (!isLast && duration == 0) {
-            out.writeBool(false);    // save_before_colour_transform
-        }
+        out.writeBool(true);         // is_last: the one frame there is
         out.write(0, 2);             // name length
         if (NO_FILTERS) {
             out.writeBool(false);    // RestorationFilter not all_default
@@ -2928,8 +2899,7 @@ public final class VarDctEncoder {
             writeFrameHeader(out, frameParams);
         } else {
             writeFrameHeader(out, extras.size(),
-                    128 | (noiseLut != null ? 1 : 0) | (splines != null ? 16 : 0), null,
-                    animated, animDuration, animLast, animTimecodes, animTimecode);
+                    128 | (noiseLut != null ? 1 : 0) | (splines != null ? 16 : 0), null);
         }
     }
 
