@@ -25,7 +25,13 @@
     -->
     <dependency>
       <groupId>com.twelvemonkeys.imageio</groupId>
+      <artifactId>imageio-core</artifactId>
+    </dependency>
+    <!-- only reached through the ImageIO SPI, never compiled against -->
+    <dependency>
+      <groupId>com.twelvemonkeys.imageio</groupId>
       <artifactId>imageio-jpeg</artifactId>
+      <scope>runtime</scope>
     </dependency>
 
     <dependency>

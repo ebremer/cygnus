@@ -25,7 +25,13 @@
     <!-- Preferred over the JDK JPEG reader for the JPEG-in-TIFF tiles. -->
     <dependency>
       <groupId>com.twelvemonkeys.imageio</groupId>
+      <artifactId>imageio-metadata</artifactId>
+    </dependency>
+    <!-- only reached through the ImageIO SPI, never compiled against -->
+    <dependency>
+      <groupId>com.twelvemonkeys.imageio</groupId>
       <artifactId>imageio-jpeg</artifactId>
+      <scope>runtime</scope>
     </dependency>
     <!-- Aperio's JPEG 2000 tile compressions (33003/33005), which TIFF readers do not cover. -->
     <dependency>

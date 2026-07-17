@@ -11,6 +11,29 @@
 
   <name>Cygnus</name>
   <description>Pure-Java image codecs with Java ImageIO plug-ins</description>
+  <url>https://github.com/ebremer/cygnus</url>
+
+  <licenses>
+    <license>
+      <name>Apache-2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>ebremer</id>
+      <name>Erich Bremer</name>
+      <email>erich@ebremer.com</email>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:https://github.com/ebremer/cygnus.git</connection>
+    <developerConnection>scm:git:git@github.com:ebremer/cygnus.git</developerConnection>
+    <url>https://github.com/ebremer/cygnus</url>
+  </scm>
 
   <modules>
     <module>JPEG2000</module>
@@ -41,6 +64,16 @@
       <dependency>
         <groupId>com.twelvemonkeys.imageio</groupId>
         <artifactId>imageio-jpeg</artifactId>
+        <version>${twelvemonkeys.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.twelvemonkeys.imageio</groupId>
+        <artifactId>imageio-core</artifactId>
+        <version>${twelvemonkeys.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.twelvemonkeys.imageio</groupId>
+        <artifactId>imageio-metadata</artifactId>
         <version>${twelvemonkeys.version}</version>
       </dependency>
     </dependencies>
@@ -104,6 +137,21 @@
   </profiles>
 
   <build>
+    <!-- every jar carries the license; the reactor-root reference keeps the
+         one LICENSE file the single source (module-standalone builds just
+         warn about the missing directory and skip it) -->
+    <resources>
+      <resource>
+        <directory>${maven.multiModuleProjectDirectory}</directory>
+        <includes>
+          <include>LICENSE</include>
+        </includes>
+        <targetPath>META-INF</targetPath>
+      </resource>
+      <resource>
+        <directory>src/main/resources</directory>
+      </resource>
+    </resources>
     <pluginManagement>
       <plugins>
         <plugin>
