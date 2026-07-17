@@ -190,6 +190,18 @@ class JXLImageReaderContractTest {
                 "an aborted read must not also report complete");
     }
 
+    /** Iterating by index has to stop at end-of-images, per the contract. */
+    @Test
+    void sizeAndTypeQueriesValidateTheImageIndex() throws Exception {
+        ImageReader reader = readerFor(rgb(32, 24));
+        assertEquals(32, reader.getWidth(0));
+        assertEquals(24, reader.getHeight(0));
+        assertThrows(IndexOutOfBoundsException.class, () -> reader.getWidth(-1));
+        assertThrows(IndexOutOfBoundsException.class, () -> reader.getWidth(1));
+        assertThrows(IndexOutOfBoundsException.class, () -> reader.getHeight(1));
+        assertThrows(IndexOutOfBoundsException.class, () -> reader.getImageTypes(1));
+    }
+
     @Test
     void mismatchedBandCountsAreRefused() throws Exception {
         ImageReader reader = readerFor(rgb(32, 24));

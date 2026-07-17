@@ -73,6 +73,18 @@ public final class JXLImageReader extends ImageReader {
         }
     }
 
+    /**
+     * Validates an image index without decoding when it can: a negative index
+     * is always out of range and index zero always in it — a readable stream
+     * has at least one frame — so only an index past zero needs the decoded
+     * frame count.
+     */
+    private void checkIndexLight(int imageIndex) throws IOException {
+        if (imageIndex < 0 || (imageIndex > 0 && imageIndex >= image().frames.size())) {
+            throw new IndexOutOfBoundsException("image index " + imageIndex);
+        }
+    }
+
     @Override
     public int getNumImages(boolean allowSearch) throws IOException {
         if (!allowSearch && decoded == null) {
@@ -83,16 +95,19 @@ public final class JXLImageReader extends ImageReader {
 
     @Override
     public int getWidth(int imageIndex) throws IOException {
+        checkIndexLight(imageIndex);
         return info().orientedWidth();
     }
 
     @Override
     public int getHeight(int imageIndex) throws IOException {
+        checkIndexLight(imageIndex);
         return info().orientedHeight();
     }
 
     @Override
     public Iterator<ImageTypeSpecifier> getImageTypes(int imageIndex) throws IOException {
+        checkIndexLight(imageIndex);
         ImageMetadata meta = info().metadata();
         boolean grey = meta.colourEncoding.isGrey();
         boolean alpha = meta.alphaChannelIndex() >= 0;
