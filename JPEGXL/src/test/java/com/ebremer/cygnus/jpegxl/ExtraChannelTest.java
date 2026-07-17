@@ -164,6 +164,48 @@ class ExtraChannelTest {
         }
     }
 
+    /**
+     * A reduced-resolution channel in an image wide enough for several groups,
+     * with content chosen so a self-contained per-group section beats the
+     * global code: the left group's samples are all multiples of eight, a
+     * saving only a local tree's residual multiplier can reach. The local
+     * section has to slice the shifted channel exactly as the decoder will, or
+     * the group desyncs — caught here by the full-resolution channel coded
+     * behind the shifted one, which then comes back as noise.
+     */
+    @Test
+    void dimShiftSurvivesLocalGroupSections() throws Exception {
+        int w = 512;
+        int h = 256;
+        ExtraChannelInfo mask = ExtraChannelInfo.of(
+                ExtraChannelInfo.TYPE_SELECTION_MASK, BitDepth.of(8), "mask");
+        mask.dimShift = 1;
+        ExtraChannelInfo id = ExtraChannelInfo.of(
+                ExtraChannelInfo.TYPE_OPTIONAL, BitDepth.of(8), "id");
+        List<ExtraChannelInfo> ex = List.of(mask, id);
+        int[][] planes = new int[5][];
+        Random rnd = new Random(7);
+        for (int c = 0; c < 3; c++) {
+            planes[c] = new int[w * h];
+            for (int i = 0; i < w * h; i++) {
+                planes[c][i] = i % w < 256 ? 8 * rnd.nextInt(32) : rnd.nextInt(256);
+            }
+        }
+        int ew = mask.planeWidth(w);
+        planes[3] = new int[ew * mask.planeHeight(h)];
+        for (int i = 0; i < planes[3].length; i++) {
+            planes[3][i] = (i % ew ^ i / ew) & 1;
+        }
+        planes[4] = ramp(w, h, 255, 99);
+        byte[] jxl = JxlEncoder.encode(planes, w, h, 8, false, ex);
+        int[][] back = JxlDecoder.decode(jxl).frames.get(0).channels;
+        for (int c = 0; c < 3; c++) {
+            assertArrayEquals(planes[c], back[c], "colour plane " + c);
+        }
+        assertEquals(w * h, back[3].length, "the mask comes back upsampled to full size");
+        assertArrayEquals(planes[4], back[4], "the full-resolution channel behind the mask");
+    }
+
     /** A spot colour is an ink: the decoder mixes it onto the picture. */
     @Test
     void spotColourIsComposited() throws Exception {

@@ -2966,19 +2966,25 @@ public final class JxlEncoder {
         if (globalBits < 12_000) {
             return null; // too small for a private code spec to pay off
         }
-        int gx = (g % groupColumns) * GROUP_DIM;
-        int gy = (g / groupColumns) * GROUP_DIM;
+        // Slice every channel the way the decoder does: origin and size
+        // shifted by the channel's hshift/vshift. A group where some channel
+        // has nothing inside is left to the global path — the decoder omits
+        // such a channel and renumbers the rest, which only the global
+        // subtrees are prepared for (the ragged brackets in writeFrame).
+        int[] gr = groupRect(g, groupColumns);
+        int[][] rects = new int[groupChans.size()][];
+        for (int k = 0; k < groupChans.size(); k++) {
+            rects[k] = slice(groupChans.get(k), gr[0], gr[1], gr[2], gr[3]);
+            if (rects[k][2] <= 0 || rects[k][3] <= 0) {
+                return null;
+            }
+        }
         Map<Chan, TNode> localSubs = new HashMap<>();
         for (int k = 0; k < groupChans.size(); k++) {
             Chan c = groupChans.get(k);
-            int w = Math.min(GROUP_DIM, c.w - gx);
-            int h = Math.min(GROUP_DIM, c.h - gy);
-            List<int[]> rect = w > 0 && h > 0
-                    ? List.of(new int[] {gx, gy, w, h}) : List.of();
+            List<int[]> rect = List.of(rects[k]);
             TNode sub = learnTree(c, refPlane(refOf, numGlobal + k), rect, 1 << 13, 3);
-            if (!rect.isEmpty()) {
-                refineLeaves(c, sub, refPlane(refOf, numGlobal + k), rect);
-            }
+            refineLeaves(c, sub, refPlane(refOf, numGlobal + k), rect);
             localSubs.put(c, sub);
         }
         TNode localTree = chainNode(groupChans, groupChans.size() - 1, localSubs);
@@ -2986,8 +2992,8 @@ public final class JxlEncoder {
         TokenBuf buf = new TokenBuf();
         for (int k = 0; k < groupChans.size(); k++) {
             Chan c = groupChans.get(k);
-            tokenizeRect(c, localSubs.get(c), refPlane(refOf, numGlobal + k), gx, gy,
-                    Math.min(GROUP_DIM, c.w - gx), Math.min(GROUP_DIM, c.h - gy), buf);
+            tokenizeRect(c, localSubs.get(c), refPlane(refOf, numGlobal + k),
+                    rects[k][0], rects[k][1], rects[k][2], rects[k][3], buf);
         }
         EntropyEncoder localLit = new EntropyEncoder(numCtxLocal, true, true);
         countLiterals(buf, localLit);
