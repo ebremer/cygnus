@@ -169,6 +169,11 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         if (distance > 0 && !depth.floatingPoint && depth.bitsPerSample > 16) {
             throw new IllegalArgumentException("lossy integer samples must be 1..16 bits");
         }
+        if ((long) width * JxlEncoder.GROUP_DIM > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("width " + width + " exceeds "
+                    + Integer.MAX_VALUE / JxlEncoder.GROUP_DIM
+                    + ": one band of rows must fit a single array");
+        }
         this.out = out;
         this.width = width;
         this.height = height;
@@ -187,7 +192,12 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         this.rateControl = rateControl;
         this.groupColumns = JxlEncoder.ceilDiv(width, JxlEncoder.GROUP_DIM);
         int groupRows = JxlEncoder.ceilDiv(height, JxlEncoder.GROUP_DIM);
-        if (groupColumns * groupRows == 1) {
+        long numGroups = (long) groupColumns * groupRows;
+        if (numGroups > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(width + "x" + height + " is " + numGroups
+                    + " groups; the section table must fit a single array");
+        }
+        if (numGroups == 1) {
             // a single-group image is a single-section frame with a global
             // stream; collect it and delegate to the whole-image encoder
             this.whole = new int[numInput][width * height];
@@ -203,7 +213,7 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         } else {
             this.whole = null;
             this.band = new int[numInput][width * Math.min(JxlEncoder.GROUP_DIM, height)];
-            this.sections = new byte[groupColumns * groupRows][];
+            this.sections = new byte[(int) numGroups][];
             this.lossy = null;
         }
     }
@@ -222,12 +232,18 @@ public final class JxlStreamingEncoder implements AutoCloseable {
             throw new IllegalArgumentException("expected " + numInput + " planes, got "
                     + rows.length);
         }
-        int[][] packed = new int[numInput][rowCount * width];
+        if (rowCount <= 0) {
+            throw new IllegalArgumentException("rowCount " + rowCount);
+        }
+        long samples = (long) rowCount * width; // a valid call's rows fit one array
         for (int c = 0; c < numInput; c++) {
-            if (rows[c].length < rowCount * width) {
+            if (rows[c].length < samples) {
                 throw new IllegalArgumentException("plane " + c + " holds fewer than "
                         + rowCount + " rows");
             }
+        }
+        int[][] packed = new int[numInput][(int) samples];
+        for (int c = 0; c < numInput; c++) {
             for (int i = 0; i < packed[c].length; i++) {
                 packed[c][i] = depth.floatToSample(rows[c][i]);
             }
@@ -254,7 +270,7 @@ public final class JxlStreamingEncoder implements AutoCloseable {
             throw new IllegalArgumentException("rows exceed the image height");
         }
         for (int c = 0; c < numInput; c++) {
-            if (rows[c].length < rowCount * width) {
+            if (rows[c].length < (long) rowCount * width) {
                 throw new IllegalArgumentException("plane " + c + " holds fewer than "
                         + rowCount + " rows");
             }

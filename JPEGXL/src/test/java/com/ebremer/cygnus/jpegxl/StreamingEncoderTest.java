@@ -180,6 +180,22 @@ class StreamingEncoderTest {
         }
     }
 
+    /**
+     * Geometries whose internal products pass 2^31 are refused up front with a
+     * clear message. A width of 2^24 used to wrap the band size to zero and
+     * die as an opaque AIOOBE on the first rows; 164096 x 1715306752 wraps the
+     * group count to exactly one (641 * 6700417 = 2^32 + 1) and used to slip
+     * onto the single-group path.
+     */
+    @Test
+    void impossibleGeometriesAreRefusedUpFront() {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        assertThrows(IllegalArgumentException.class, () ->
+                new JxlStreamingEncoder(out, 1 << 24, 300, 8, false, false, false, 0f));
+        assertThrows(IllegalArgumentException.class, () ->
+                new JxlStreamingEncoder(out, 164096, 1715306752, 8, false, false, false, 0f));
+    }
+
     private static boolean ffmpegAvailable() {
         try {
             Process p = new ProcessBuilder("ffmpeg", "-hide_banner", "-encoders")
