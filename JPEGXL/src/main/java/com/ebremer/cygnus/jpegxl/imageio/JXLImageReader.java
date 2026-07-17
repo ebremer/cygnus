@@ -13,7 +13,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
-import javax.imageio.IIOException;
 import javax.imageio.ImageReadParam;
 import javax.imageio.ImageReader;
 import javax.imageio.ImageTypeSpecifier;
@@ -111,6 +110,8 @@ public final class JXLImageReader extends ImageReader {
         ImageMetadata meta = info().metadata();
         boolean grey = meta.colourEncoding.isGrey();
         boolean alpha = meta.alphaChannelIndex() >= 0;
+        boolean premultiplied = alpha
+                && meta.extraChannels.get(meta.alphaChannelIndex()).alphaAssociated;
         boolean deep = meta.bitDepth.bitsPerSample > 8;
         List<ImageTypeSpecifier> types = new ArrayList<>();
         // a demosaiced CFA mosaic comes out as eight-bit RGB, not the grey it is coded as
@@ -124,7 +125,9 @@ public final class JXLImageReader extends ImageReader {
                     deep ? BufferedImage.TYPE_USHORT_GRAY : BufferedImage.TYPE_BYTE_GRAY));
         } else if (!deep) {
             types.add(ImageTypeSpecifier.createFromBufferedImageType(
-                    alpha ? BufferedImage.TYPE_INT_ARGB : BufferedImage.TYPE_INT_RGB));
+                    alpha ? (premultiplied ? BufferedImage.TYPE_INT_ARGB_PRE
+                                           : BufferedImage.TYPE_INT_ARGB)
+                          : BufferedImage.TYPE_INT_RGB));
         } else {
             java.awt.color.ColorSpace cs = java.awt.color.ColorSpace.getInstance(
                     grey ? java.awt.color.ColorSpace.CS_GRAY : java.awt.color.ColorSpace.CS_sRGB);
@@ -134,7 +137,7 @@ public final class JXLImageReader extends ImageReader {
                 offsets[i] = i;
             }
             types.add(ImageTypeSpecifier.createInterleaved(cs, offsets,
-                    java.awt.image.DataBuffer.TYPE_USHORT, alpha, false));
+                    java.awt.image.DataBuffer.TYPE_USHORT, alpha, premultiplied));
         }
         return types.iterator();
     }
@@ -382,8 +385,15 @@ public final class JXLImageReader extends ImageReader {
         if (bpp > 8) {
             return toDeepImage(meta, frame, numColour, alphaIdx);
         }
+        // associated alpha stays premultiplied: the samples go into a
+        // premultiplied model as they are, rather than darkening a straight one
+        boolean premultiplied = alphaIdx >= 0
+                && meta.extraChannels.get(alphaIdx).alphaAssociated;
         BufferedImage img = new BufferedImage(w, h,
-                alphaIdx >= 0 ? BufferedImage.TYPE_INT_ARGB : BufferedImage.TYPE_INT_RGB);
+                alphaIdx >= 0
+                        ? (premultiplied ? BufferedImage.TYPE_INT_ARGB_PRE
+                                         : BufferedImage.TYPE_INT_ARGB)
+                        : BufferedImage.TYPE_INT_RGB);
         int scale = bpp == 8 ? 1 : 0;
         int max = (1 << bpp) - 1;
         int[] argb = new int[w * h];
@@ -402,7 +412,8 @@ public final class JXLImageReader extends ImageReader {
             int a = alphaPlane != null ? scaleTo8(alphaPlane[i], bpp, max, scale) : 0xff;
             argb[i] = (a << 24) | (r << 16) | (g << 8) | b;
         }
-        img.setRGB(0, 0, w, h, argb, 0, w);
+        // raw stores, so a premultiplied image is not premultiplied a second time
+        img.getRaster().setDataElements(0, 0, w, h, argb);
         return img;
     }
 
@@ -528,11 +539,13 @@ public final class JXLImageReader extends ImageReader {
         int h = frame.height;
         boolean grey = numColour == 1;
         boolean hasAlpha = alphaIdx >= 0;
+        boolean premultiplied = hasAlpha
+                && meta.extraChannels.get(alphaIdx).alphaAssociated;
         int bands = numColour + (hasAlpha ? 1 : 0);
         java.awt.color.ColorSpace cs = java.awt.color.ColorSpace.getInstance(
                 grey ? java.awt.color.ColorSpace.CS_GRAY : java.awt.color.ColorSpace.CS_sRGB);
         java.awt.image.ComponentColorModel cm = new java.awt.image.ComponentColorModel(
-                cs, hasAlpha, false,
+                cs, hasAlpha, premultiplied,
                 hasAlpha ? java.awt.Transparency.TRANSLUCENT : java.awt.Transparency.OPAQUE,
                 java.awt.image.DataBuffer.TYPE_FLOAT);
         WritableRaster raster = cm.createCompatibleWritableRaster(w, h);
@@ -552,7 +565,7 @@ public final class JXLImageReader extends ImageReader {
                 raster.setSamples(0, y, w, 1, b, row);
             }
         }
-        return new BufferedImage(cm, raster, false, null);
+        return new BufferedImage(cm, raster, premultiplied, null);
     }
 
     /** 16-bit output via a ushort component raster. */
@@ -562,12 +575,14 @@ public final class JXLImageReader extends ImageReader {
         int h = frame.height;
         int bpp = meta.bitDepth.bitsPerSample;
         boolean hasAlpha = alphaIdx >= 0;
+        boolean premultiplied = hasAlpha
+                && meta.extraChannels.get(alphaIdx).alphaAssociated;
         boolean grey = numColour == 1;
         int bands = numColour + (hasAlpha ? 1 : 0);
         java.awt.color.ColorSpace cs = java.awt.color.ColorSpace.getInstance(
                 grey ? java.awt.color.ColorSpace.CS_GRAY : java.awt.color.ColorSpace.CS_sRGB);
         java.awt.image.ComponentColorModel cm = new java.awt.image.ComponentColorModel(
-                cs, hasAlpha, false,
+                cs, hasAlpha, premultiplied,
                 hasAlpha ? java.awt.Transparency.TRANSLUCENT : java.awt.Transparency.OPAQUE,
                 java.awt.image.DataBuffer.TYPE_USHORT);
         WritableRaster raster = cm.createCompatibleWritableRaster(w, h);
@@ -590,12 +605,7 @@ public final class JXLImageReader extends ImageReader {
                 raster.setSamples(0, y, w, 1, b, row);
             }
         }
-        boolean premultiplied = hasAlpha && alphaIdx >= 0
-                && meta.extraChannels.get(alphaIdx).alphaAssociated;
-        if (premultiplied) {
-            throw new IIOException("premultiplied alpha is not supported yet");
-        }
-        return new BufferedImage(cm, raster, false, null);
+        return new BufferedImage(cm, raster, premultiplied, null);
     }
 
     @Override

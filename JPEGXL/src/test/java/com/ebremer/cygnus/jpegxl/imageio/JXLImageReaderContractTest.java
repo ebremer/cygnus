@@ -190,6 +190,77 @@ class JXLImageReaderContractTest {
                 "an aborted read must not also report complete");
     }
 
+    /**
+     * Associated (premultiplied) alpha stays premultiplied, at every depth:
+     * the model says so and the samples pass through untouched — no silent
+     * darkening in a straight-alpha model, no double multiplication, and no
+     * refusal at sixteen bits.
+     */
+    @Test
+    void associatedAlphaComesBackPremultipliedAtEveryDepth() throws Exception {
+        int w = 16;
+        int h = 12;
+        java.util.Random rnd = new java.util.Random(3);
+
+        int[][] p8 = new int[4][w * h];
+        for (int i = 0; i < w * h; i++) {
+            p8[3][i] = rnd.nextInt(256);
+            for (int c = 0; c < 3; c++) {
+                p8[c][i] = rnd.nextInt(p8[3][i] + 1); // premultiplied: colour <= alpha
+            }
+        }
+        byte[] jxl8 = JxlEncoder.encode(p8, w, h, 8, false, true, true);
+        ImageReader reader8 = readerFor(jxl8);
+        org.junit.jupiter.api.Assertions.assertTrue(
+                reader8.getImageTypes(0).next().getColorModel().isAlphaPremultiplied(),
+                "the declared 8-bit type must be premultiplied too");
+        BufferedImage img8 = reader8.read(0, null);
+        org.junit.jupiter.api.Assertions.assertTrue(img8.isAlphaPremultiplied(), "8-bit model");
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                assertEquals(p8[0][i], img8.getRaster().getSample(x, y, 0), "8-bit R " + i);
+                assertEquals(p8[3][i], img8.getRaster().getSample(x, y, 3), "8-bit A " + i);
+            }
+        }
+
+        int[][] p16 = new int[4][w * h];
+        for (int i = 0; i < w * h; i++) {
+            p16[3][i] = rnd.nextInt(1 << 16);
+            for (int c = 0; c < 3; c++) {
+                p16[c][i] = rnd.nextInt(p16[3][i] + 1);
+            }
+        }
+        byte[] jxl16 = JxlEncoder.encode(p16, w, h, 16, false, true, true);
+        BufferedImage img16 = readerFor(jxl16).read(0, null);
+        org.junit.jupiter.api.Assertions.assertTrue(img16.isAlphaPremultiplied(), "16-bit model");
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int i = y * w + x;
+                assertEquals(p16[0][i], img16.getRaster().getSample(x, y, 0), "16-bit R " + i);
+                assertEquals(p16[3][i], img16.getRaster().getSample(x, y, 3), "16-bit A " + i);
+            }
+        }
+
+        float[][] pf = new float[4][w * h];
+        for (int i = 0; i < w * h; i++) {
+            pf[3][i] = rnd.nextFloat();
+            for (int c = 0; c < 3; c++) {
+                pf[c][i] = pf[3][i] * rnd.nextFloat();
+            }
+        }
+        byte[] jxlF = JxlEncoder.encodeFloat(pf, w, h,
+                com.ebremer.cygnus.jpegxl.codestream.BitDepth.float32(), false,
+                java.util.List.of(com.ebremer.cygnus.jpegxl.codestream.ExtraChannelInfo.alpha(
+                        com.ebremer.cygnus.jpegxl.codestream.BitDepth.float32(), true)));
+        BufferedImage imgF = readerFor(jxlF).read(0, null);
+        org.junit.jupiter.api.Assertions.assertTrue(imgF.isAlphaPremultiplied(), "float model");
+        for (int i = 0; i < w * h; i++) {
+            assertEquals(pf[0][i], imgF.getRaster().getSampleFloat(i % w, i / w, 0),
+                    0f, "float R " + i);
+        }
+    }
+
     /** Iterating by index has to stop at end-of-images, per the contract. */
     @Test
     void sizeAndTypeQueriesValidateTheImageIndex() throws Exception {
