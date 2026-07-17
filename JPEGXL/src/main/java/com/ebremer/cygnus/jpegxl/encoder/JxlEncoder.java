@@ -1495,9 +1495,7 @@ public final class JxlEncoder {
                 continue;
             }
             BitWriter gw = new BitWriter();
-            gw.writeBool(true); // use_global_tree
-            gw.writeBool(true); // default wp
-            gw.write(0, 2);     // nb_transforms = 0
+            writeGlobalGroupHeader(gw);
             emitBuffer(bufs[s], gw, dataEnc, dist[s]);
             dataEnc.finishSection(gw);
             gw.zeroPadToByte();
@@ -1820,6 +1818,25 @@ public final class JxlEncoder {
         } else {
             throw new IllegalArgumentException("unsupported pass count " + p.numPasses);
         }
+        writeFrameCompositing(out, p);
+        out.write(0, 2);             // name length (U32 selector 0)
+        out.writeBool(false);        // RestorationFilter not all_default
+        out.writeBool(false);        // gaborish off
+        out.write(0, 2);             // epf iterations = 0
+        out.writeU64(0);             // restoration filter extensions
+        out.writeU64(0);             // frame header extensions
+    }
+
+    /**
+     * The frame-header middle every encoding writes identically — crop,
+     * per-channel blending, animation, {@code is_last} and the reference-frame
+     * bookkeeping. The encoding-specific head (modular vs VarDCT: flags,
+     * passes, group shift or quant scales) and tail (the restoration filter)
+     * stay with the caller. One copy, shared with the VarDCT header, because
+     * the two drifting apart is exactly the desync class that has bitten this
+     * encoder before.
+     */
+    static void writeFrameCompositing(BitWriter out, FrameParams p) {
         boolean fullFrame;
         if (p.haveCrop) {
             out.writeBool(true);     // have_crop
@@ -1861,19 +1878,13 @@ public final class JxlEncoder {
             out.write(p.saveAsReference, 2);
         }
         // save_before_colour_transform is only coded for the frames that could
-        // be kept; we never keep before-transform (there is no colour transform),
-        // so a false here matches what the decoder derives for the rest
+        // be kept; neither encoder keeps a before-transform copy except where
+        // FrameParams says so, matching what the decoder derives for the rest
         boolean codesSaveBefore = p.frameType == 2 || (fullFrame && p.blendMode == BLEND_REPLACE
                 && (p.duration == 0 || p.saveAsReference != 0) && !p.isLast);
         if (codesSaveBefore) {
             out.writeBool(p.saveBeforeCT);
         }
-        out.write(0, 2);             // name length (U32 selector 0)
-        out.writeBool(false);        // RestorationFilter not all_default
-        out.writeBool(false);        // gaborish off
-        out.write(0, 2);             // epf iterations = 0
-        out.writeU64(0);             // restoration filter extensions
-        out.writeU64(0);             // frame header extensions
     }
 
     /** duration: sel 0 -> 0, sel 1 -> 1, sel 2 -> u(8), sel 3 -> u(32). */
@@ -2020,6 +2031,49 @@ public final class JxlEncoder {
         }
         s.distMult = Math.min(widest, 1 << 21);
         return s;
+    }
+
+    /**
+     * Writes one fully self-contained modular section — its own learned tree
+     * and entropy code behind the standalone GroupHeader. Every stand-alone
+     * section any encoder emits (a local pass group, a streamed group, the
+     * VarDCT extras) comes through here, so the header and the paired
+     * spec-then-emit passes cannot drift apart per path — the divergence that
+     * once let a local section disagree with the decoder.
+     *
+     * @param rct an RCT type to declare as the section's one transform, or -1
+     */
+    static void writeStandaloneSection(BitWriter gw, TNode tree, int numCtx, TokenBuf buf,
+            int distMult, int rct) {
+        gw.writeBool(false); // use_global_tree = false: the section is standalone
+        gw.writeBool(true);  // default weighted-predictor parameters
+        if (rct >= 0) {
+            gw.write(1, 2);  // nb_transforms = 1
+            writeRctTransform(gw, rct);
+        } else {
+            gw.write(0, 2);  // nb_transforms = 0
+        }
+        EntropyEncoder treeEnc = new EntropyEncoder(6, false, false, true);
+        emitTree(tree, null, treeEnc);
+        treeEnc.writeSpec(gw);
+        emitTree(tree, gw, treeEnc);
+        treeEnc.finishSection(gw);
+        EntropyEncoder lit = new EntropyEncoder(numCtx, true, true);
+        countLiterals(buf, lit);
+        lit.prepareCosts();
+        findMatches(buf, distMult, Boolean.getBoolean("jxl.enc.lz77legacy") ? null : lit);
+        EntropyEncoder dataEnc = new EntropyEncoder(numCtx, true, true, true);
+        emitBuffer(buf, null, dataEnc, distMult);
+        dataEnc.writeSpec(gw);
+        emitBuffer(buf, gw, dataEnc, distMult);
+        dataEnc.finishSection(gw);
+    }
+
+    /** The GroupHeader of a section coded against the global tree and code. */
+    static void writeGlobalGroupHeader(BitWriter gw) {
+        gw.writeBool(true); // use_global_tree
+        gw.writeBool(true); // default weighted-predictor parameters
+        gw.write(0, 2);     // nb_transforms = 0
     }
 
     /** Assigns leaf contexts in the decoder's BFS order; returns the leaf count. */
@@ -3007,24 +3061,8 @@ public final class JxlEncoder {
             tokenizeRect(c, localSubs.get(c), refPlane(refOf, numGlobal + k),
                     rects[k][0], rects[k][1], rects[k][2], rects[k][3], buf);
         }
-        EntropyEncoder localLit = new EntropyEncoder(numCtxLocal, true, true);
-        countLiterals(buf, localLit);
-        localLit.prepareCosts();
-        findMatches(buf, distMult, Boolean.getBoolean("jxl.enc.lz77legacy") ? null : localLit);
         BitWriter gw = new BitWriter();
-        gw.writeBool(false); // use_global_tree = false: a local tree follows
-        gw.writeBool(true);  // default wp
-        gw.write(0, 2);      // nb_transforms = 0
-        EntropyEncoder treeEnc = new EntropyEncoder(6, false, false, true);
-        emitTree(localTree, null, treeEnc);
-        treeEnc.writeSpec(gw);
-        emitTree(localTree, gw, treeEnc);
-        treeEnc.finishSection(gw);
-        EntropyEncoder dataEnc = new EntropyEncoder(numCtxLocal, true, true, true);
-        emitBuffer(buf, null, dataEnc, distMult);
-        dataEnc.writeSpec(gw);
-        emitBuffer(buf, gw, dataEnc, distMult);
-        dataEnc.finishSection(gw);
+        writeStandaloneSection(gw, localTree, numCtxLocal, buf, distMult, -1);
         gw.zeroPadToByte();
         byte[] bytes = gw.toByteArray();
         return bytes.length * 8L + 128 < globalBits ? bytes : null;

@@ -2526,9 +2526,7 @@ public final class VarDctEncoder {
             JxlEncoder.emitTree(s.tree, w, treeEnc);
             treeEnc.finishSection(w);
             dataEnc.writeSpec(w);
-            w.writeBool(true);  // use_global_tree
-            w.writeBool(true);  // default weighted-predictor parameters
-            w.write(0, 2);      // nb_transforms = 0
+            JxlEncoder.writeGlobalGroupHeader(w);
             JxlEncoder.emitBuffer(s.buf, w, dataEnc, s.distMult);
             dataEnc.finishSection(w);
         } else {
@@ -2542,9 +2540,7 @@ public final class VarDctEncoder {
             JxlEncoder.emitTree(leaf, w, treeEnc);
             EntropyEncoder dataEnc = new EntropyEncoder(1, true, true);
             dataEnc.writeSpec(w); // nothing is coded against it
-            w.writeBool(true);  // use_global_tree
-            w.writeBool(true);  // default weighted-predictor parameters
-            w.write(0, 2);      // nb_transforms = 0
+            JxlEncoder.writeGlobalGroupHeader(w);
         }
     }
 
@@ -2593,23 +2589,7 @@ public final class VarDctEncoder {
             return; // a stream with no channels reads no header at all
         }
         JxlEncoder.SubStream s = JxlEncoder.buildSubStream(crops);
-        gw.writeBool(false); // use_global_tree = false: the section is standalone
-        gw.writeBool(true);  // default weighted-predictor parameters
-        gw.write(0, 2);      // nb_transforms = 0
-        EntropyEncoder treeEnc = new EntropyEncoder(6, false, false, true);
-        JxlEncoder.emitTree(s.tree, null, treeEnc);
-        treeEnc.writeSpec(gw);
-        JxlEncoder.emitTree(s.tree, gw, treeEnc);
-        treeEnc.finishSection(gw);
-        EntropyEncoder litProbe = new EntropyEncoder(s.numCtx, true, true);
-        JxlEncoder.countLiterals(s.buf, litProbe);
-        litProbe.prepareCosts();
-        JxlEncoder.findMatches(s.buf, s.distMult, litProbe);
-        EntropyEncoder dataEnc = new EntropyEncoder(s.numCtx, true, true, true);
-        JxlEncoder.emitBuffer(s.buf, null, dataEnc, s.distMult);
-        dataEnc.writeSpec(gw);
-        JxlEncoder.emitBuffer(s.buf, gw, dataEnc, s.distMult);
-        dataEnc.finishSection(gw);
+        JxlEncoder.writeStandaloneSection(gw, s.tree, s.numCtx, s.buf, s.distMult, -1);
     }
 
     /** Writes LF group {@code gg}; {@code cells} must hold its rows. */
@@ -2801,21 +2781,6 @@ public final class VarDctEncoder {
         out.writeU64(0);             // frame header extensions
     }
 
-    /** duration: sel 0 -> 0, sel 1 -> 1, sel 2 -> u(8), sel 3 -> u(32). */
-    private static void writeDuration(BitWriter out, long duration) {
-        if (duration == 0) {
-            out.write(0, 2);
-        } else if (duration == 1) {
-            out.write(1, 2);
-        } else if (duration < 256) {
-            out.write(2, 2);
-            out.write((int) duration, 8);
-        } else {
-            out.write(3, 2);
-            out.write((int) duration, 32);
-        }
-    }
-
     /**
      * A VarDCT frame header from a {@link JxlEncoder.FrameParams} — the compositing
      * animation path (crop and blend frames, reference slots). It is the modular
@@ -2842,47 +2807,7 @@ public final class VarDctEncoder {
         if (p.frameType != 2) {
             out.write(0, 2);         // num_passes = 1 (compositing is single-pass)
         }
-        boolean fullFrame;
-        if (p.haveCrop) {
-            out.writeBool(true);     // have_crop
-            out.writeU32Auto(packSigned(p.x0), 0, 8, 256, 11, 2304, 14, 18688, 30);
-            out.writeU32Auto(packSigned(p.y0), 0, 8, 256, 11, 2304, 14, 18688, 30);
-            out.writeU32Auto(p.frameWidth, 0, 8, 256, 11, 2304, 14, 18688, 30);
-            out.writeU32Auto(p.frameHeight, 0, 8, 256, 11, 2304, 14, 18688, 30);
-            fullFrame = p.x0 <= 0 && p.y0 <= 0
-                    && p.frameWidth + p.x0 >= p.canvasWidth
-                    && p.frameHeight + p.y0 >= p.canvasHeight;
-        } else {
-            out.writeBool(false);    // have_crop
-            fullFrame = true;
-        }
-        if (p.frameType == 0 || p.frameType == 3) {
-            for (int i = -1; i < p.numExtra; i++) {
-                out.writeU32Auto(p.blendMode, 0, 0, 1, 0, 2, 0, 3, 2);
-                if (p.numExtra > 0 && p.blendMode == JxlEncoder.BLEND_BLEND) {
-                    out.writeU32Auto(p.blendAlphaChannel, 0, 0, 1, 0, 2, 0, 3, 3);
-                    out.write(0, 1); // clamp = false
-                }
-                if (!fullFrame || p.blendMode != JxlEncoder.BLEND_REPLACE) {
-                    out.write(p.blendSource, 2);
-                }
-            }
-            if (p.haveAnimation) {
-                writeDuration(out, p.duration);
-                if (p.haveTimecodes) {
-                    out.write((int) p.timecode, 32);
-                }
-            }
-            out.writeBool(p.isLast);
-        }
-        if (!p.isLast) {
-            out.write(p.saveAsReference, 2);
-        }
-        boolean codesSaveBefore = p.frameType == 2 || (fullFrame && p.blendMode == JxlEncoder.BLEND_REPLACE
-                && (p.duration == 0 || p.saveAsReference != 0) && !p.isLast);
-        if (codesSaveBefore) {
-            out.writeBool(p.saveBeforeCT);
-        }
+        JxlEncoder.writeFrameCompositing(out, p);
         out.write(0, 2);             // name length
         if (NO_FILTERS) {
             out.writeBool(false);

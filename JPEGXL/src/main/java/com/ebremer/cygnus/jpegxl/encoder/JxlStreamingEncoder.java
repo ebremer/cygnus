@@ -401,28 +401,7 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         }
 
         BitWriter gw = new BitWriter();
-        gw.writeBool(false); // use_global_tree = false: the group is standalone
-        gw.writeBool(true);  // default weighted-predictor parameters
-        if (rct >= 0) {
-            gw.write(1, 2);  // nb_transforms = 1
-            JxlEncoder.writeRctTransform(gw, rct);
-        } else {
-            gw.write(0, 2);  // nb_transforms = 0
-        }
-        EntropyEncoder treeEnc = new EntropyEncoder(6, false, false, true);
-        JxlEncoder.emitTree(tree, null, treeEnc);
-        treeEnc.writeSpec(gw);
-        JxlEncoder.emitTree(tree, gw, treeEnc);
-        treeEnc.finishSection(gw);
-        EntropyEncoder litProbe = new EntropyEncoder(numCtx, true, true);
-        JxlEncoder.countLiterals(buf, litProbe);
-        litProbe.prepareCosts();
-        JxlEncoder.findMatches(buf, w, litProbe);
-        EntropyEncoder dataEnc = new EntropyEncoder(numCtx, true, true, true);
-        JxlEncoder.emitBuffer(buf, null, dataEnc, w);
-        dataEnc.writeSpec(gw);
-        JxlEncoder.emitBuffer(buf, gw, dataEnc, w);
-        dataEnc.finishSection(gw);
+        JxlEncoder.writeStandaloneSection(gw, tree, numCtx, buf, w, rct);
         gw.zeroPadToByte();
         return gw.toByteArray();
     }
