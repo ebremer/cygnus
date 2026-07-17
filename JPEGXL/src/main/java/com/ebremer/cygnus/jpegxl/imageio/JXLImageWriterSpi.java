@@ -17,8 +17,8 @@ public final class JXLImageWriterSpi extends ImageWriterSpi {
 
     public JXLImageWriterSpi() {
         super(
-                "Erich Bremer",
-                "0.1",
+                "ebremer.com",
+                "0.1.0",
                 NAMES,
                 SUFFIXES,
                 MIME_TYPES,

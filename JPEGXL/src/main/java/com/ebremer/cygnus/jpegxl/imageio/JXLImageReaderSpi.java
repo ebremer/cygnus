@@ -15,8 +15,8 @@ public final class JXLImageReaderSpi extends ImageReaderSpi {
 
     public JXLImageReaderSpi() {
         super(
-                "Erich Bremer",
-                "0.1",
+                "ebremer.com",
+                "0.1.0",
                 NAMES,
                 SUFFIXES,
                 MIME_TYPES,
