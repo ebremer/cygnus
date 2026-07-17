@@ -23,8 +23,12 @@ public final class JXLImageReaderSpi extends ImageReaderSpi {
                 JXLImageReader.class.getName(),
                 new Class<?>[] {ImageInputStream.class},
                 new String[] {JXLImageWriterSpi.class.getName()},
-                false, null, null, null, null,
-                false, null, null, null, null);
+                // the reader serves JXLMetadata for both the stream and each
+                // image, and it speaks the standard format as well as its own
+                true, JXLMetadata.NATIVE_FORMAT,
+                JXLMetadataFormat.class.getName(), null, null,
+                true, JXLMetadata.NATIVE_FORMAT,
+                JXLMetadataFormat.class.getName(), null, null);
     }
 
     @Override

@@ -261,6 +261,29 @@ class JXLImageReaderContractTest {
         }
     }
 
+    /**
+     * The SPI has to advertise the metadata the reader actually serves, or a
+     * capability-probing host never asks for the animation and frame tree.
+     */
+    @Test
+    void spiDeclaresTheMetadataFormatsTheReaderReturns() throws Exception {
+        JXLImageReaderSpi spi = new JXLImageReaderSpi();
+        org.junit.jupiter.api.Assertions.assertTrue(
+                spi.isStandardImageMetadataFormatSupported(), "standard image metadata");
+        assertEquals(JXLMetadata.NATIVE_FORMAT, spi.getNativeImageMetadataFormatName());
+        org.junit.jupiter.api.Assertions.assertTrue(
+                spi.isStandardStreamMetadataFormatSupported(), "standard stream metadata");
+        assertEquals(JXLMetadata.NATIVE_FORMAT, spi.getNativeStreamMetadataFormatName());
+        // and the trees those names promise are actually served
+        ImageReader reader = readerFor(rgb(32, 24));
+        assertEquals(javax.imageio.metadata.IIOMetadataFormatImpl.standardMetadataFormatName,
+                reader.getImageMetadata(0).getAsTree(
+                        javax.imageio.metadata.IIOMetadataFormatImpl.standardMetadataFormatName)
+                        .getNodeName());
+        assertEquals(JXLMetadata.NATIVE_FORMAT,
+                reader.getStreamMetadata().getAsTree(JXLMetadata.NATIVE_FORMAT).getNodeName());
+    }
+
     /** Iterating by index has to stop at end-of-images, per the contract. */
     @Test
     void sizeAndTypeQueriesValidateTheImageIndex() throws Exception {
