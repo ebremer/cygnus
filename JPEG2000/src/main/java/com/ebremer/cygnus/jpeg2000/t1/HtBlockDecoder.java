@@ -525,8 +525,10 @@ public final class HtBlockDecoder {
             warnings.add("ROI is not supported in HT code-blocks");
             return;
         }
-        if (band.numBps > 30) {
-            warnings.add("HT code-block with more than 30 bit-planes not supported");
+        // 29, not 30: the decoded word carries its sign in bit 31, and the
+        // magnitude (vN+2) << (p-1) of a 30-plane block can reach that bit
+        if (band.numBps > 29) {
+            warnings.add("HT code-block with more than 29 bit-planes not supported");
             return;
         }
         int zeroBplanes = cb.zeroBitplanes;
