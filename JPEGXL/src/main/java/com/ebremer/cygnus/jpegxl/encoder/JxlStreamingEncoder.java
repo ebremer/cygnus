@@ -118,8 +118,8 @@ public final class JxlStreamingEncoder implements AutoCloseable {
     /** {@link #targetingQuality} with any number of extra channels. */
     public static JxlStreamingEncoder targetingQuality(OutputStream out, int width, int height,
             int bits, boolean grey, java.util.List<ExtraChannelInfo> extras, float distance) {
-        if (distance <= 0) {
-            throw new IllegalArgumentException("rate control needs a positive distance");
+        if (!(distance > 0) || !Float.isFinite(distance)) {
+            throw new IllegalArgumentException("rate control needs a positive finite distance");
         }
         return new JxlStreamingEncoder(out, width, height, BitDepth.of(bits), grey, extras,
                 distance, true);
@@ -163,8 +163,8 @@ public final class JxlStreamingEncoder implements AutoCloseable {
         if (!depth.floatingPoint && (depth.bitsPerSample < 1 || depth.bitsPerSample > 31)) {
             throw new IllegalArgumentException("bits per sample must be in 1..31");
         }
-        if (distance < 0) {
-            throw new IllegalArgumentException("distance must not be negative");
+        if (distance < 0 || !Float.isFinite(distance)) {
+            throw new IllegalArgumentException("distance must be finite and non-negative");
         }
         if (distance > 0 && !depth.floatingPoint && depth.bitsPerSample > 16) {
             throw new IllegalArgumentException("lossy integer samples must be 1..16 bits");

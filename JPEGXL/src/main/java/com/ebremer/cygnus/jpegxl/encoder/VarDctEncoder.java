@@ -294,6 +294,9 @@ public final class VarDctEncoder {
         this.maxVal = depth.floatingPoint ? 1 : (1 << depth.bitsPerSample) - 1;
         this.grey = grey;
         this.extras = java.util.List.copyOf(extras);
+        if (!Float.isFinite(distance)) {
+            throw new IllegalArgumentException("distance must be finite, got " + distance);
+        }
         float d = Math.max(0.1f, distance);
         this.distance = d;
         this.globalScale = Math.max(1, Math.min(65535, Math.round(4096f / d)));
@@ -1997,7 +2000,9 @@ public final class VarDctEncoder {
                     ? measurePerceptual(planes, width, height, depth, grey, jxl)
                     : measureError(planes, width, height, depth, grey, jxl);
             double miss = Math.abs(Math.log(Math.max(err, 1e-3) / target));
-            if (miss < bestMiss) {
+            // round 0 unconditionally: a NaN measurement (NaN samples) never
+            // compares below anything, and null is a caller NPE waiting
+            if (best == null || miss < bestMiss) {
                 bestMiss = miss;
                 best = jxl;
             }
@@ -2005,7 +2010,7 @@ public final class VarDctEncoder {
                 break; // close enough
             }
             float next = nextDistance(tryD, err, target, d);
-            if (Math.abs(next - tryD) < 0.01f) {
+            if (!Float.isFinite(next) || Math.abs(next - tryD) < 0.01f) {
                 break;
             }
             tryD = next;

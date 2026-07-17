@@ -384,4 +384,37 @@ class VarDctEncoderTest {
         }
         assertTrue(sum / (3.0 * w * h) < 2.0, "streamed smooth image decoded far off");
     }
+
+    /** A NaN or infinite distance is a caller bug: refuse it at the API. */
+    @Test
+    void nonFiniteDistancesAreRefused() {
+        int[][] rgb = photo(64, 48);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> VarDctEncoder.encode(rgb, 64, 48, Float.NaN));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> VarDctEncoder.encodeToTarget(rgb, 64, 48, Float.NaN));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> VarDctEncoder.encodeToTarget(rgb, 64, 48, Float.POSITIVE_INFINITY));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> com.ebremer.cygnus.jpegxl.encoder.JxlStreamingEncoder.targetingQuality(
+                        new java.io.ByteArrayOutputStream(), 64, 48, 8,
+                        false, false, false, Float.NaN));
+    }
+
+    /**
+     * NaN samples make every quality measurement NaN, so no round ever beats
+     * the first — the loop has to keep round zero rather than return null and
+     * turn into a caller NPE far from the cause.
+     */
+    @Test
+    void nanPlanesDoNotNullOutTheTargetLoop() throws Exception {
+        float[][] planes = new float[3][32 * 32];
+        for (float[] p : planes) {
+            java.util.Arrays.fill(p, Float.NaN);
+        }
+        byte[] jxl = VarDctEncoder.encodeFloatToTarget(planes, 32, 32,
+                com.ebremer.cygnus.jpegxl.codestream.BitDepth.float32(),
+                false, false, false, 1.5f);
+        org.junit.jupiter.api.Assertions.assertNotNull(jxl);
+    }
 }
