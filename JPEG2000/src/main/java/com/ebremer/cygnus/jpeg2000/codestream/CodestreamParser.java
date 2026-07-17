@@ -349,6 +349,9 @@ public final class CodestreamParser {
                 cen = cs.siz.numComponents; // 0 means 256/16384 per spec
             }
             int prog = u8();
+            if (prog > 4) {
+                throw new IIOException("Invalid progression order " + prog);
+            }
             out.add(new Poc(rs, csn, lye, re, Math.min(cen, cs.siz.numComponents), prog));
         }
     }
