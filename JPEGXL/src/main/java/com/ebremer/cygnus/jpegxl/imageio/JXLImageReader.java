@@ -161,6 +161,18 @@ public final class JXLImageReader extends ImageReader {
 
     @Override
     public BufferedImage read(int imageIndex, ImageReadParam param) throws IOException {
+        clearAbortRequest();
+        processImageStarted(imageIndex);
+        BufferedImage image = readImage(imageIndex, param);
+        if (abortRequested()) {
+            processReadAborted();
+        } else {
+            processImageComplete();
+        }
+        return image;
+    }
+
+    private BufferedImage readImage(int imageIndex, ImageReadParam param) throws IOException {
         int width = info().orientedWidth();
         int height = info().orientedHeight();
         java.awt.Rectangle srcRegion = new java.awt.Rectangle();
@@ -206,8 +218,11 @@ public final class JXLImageReader extends ImageReader {
         return dest;
     }
 
-    /** Copies the subsampled source region into the destination, band-mapped. */
-    private static void copyRegion(BufferedImage src, int baseX, int baseY, BufferedImage dest,
+    /**
+     * Copies the subsampled source region into the destination, band-mapped,
+     * reporting progress per row and stopping early when a listener aborts.
+     */
+    private void copyRegion(BufferedImage src, int baseX, int baseY, BufferedImage dest,
             java.awt.Rectangle destRegion, int sx, int sy, int[] srcBands, int[] dstBands) {
         java.awt.image.Raster in = src.getRaster();
         WritableRaster out = dest.getRaster();
@@ -215,6 +230,10 @@ public final class JXLImageReader extends ImageReader {
         boolean floats = in.getTransferType() == java.awt.image.DataBuffer.TYPE_FLOAT
                 || out.getTransferType() == java.awt.image.DataBuffer.TYPE_FLOAT;
         for (int y = 0; y < destRegion.height; y++) {
+            if (abortRequested()) {
+                return;
+            }
+            processImageProgress(100f * y / destRegion.height);
             int rowY = baseY + y * sy;
             for (int x = 0; x < destRegion.width; x++) {
                 int colX = baseX + x * sx;

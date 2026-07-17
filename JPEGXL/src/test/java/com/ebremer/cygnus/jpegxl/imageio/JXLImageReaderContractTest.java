@@ -116,6 +116,80 @@ class JXLImageReaderContractTest {
         }
     }
 
+    /** Collects progress events; subclasses hook the ones they care about. */
+    static class Progress implements javax.imageio.event.IIOReadProgressListener {
+        final java.util.List<String> events = new java.util.ArrayList<>();
+
+        @Override
+        public void imageStarted(ImageReader source, int imageIndex) {
+            events.add("started " + imageIndex);
+        }
+
+        @Override
+        public void imageProgress(ImageReader source, float percentageDone) {
+            events.add("progress");
+        }
+
+        @Override
+        public void imageComplete(ImageReader source) {
+            events.add("complete");
+        }
+
+        @Override
+        public void readAborted(ImageReader source) {
+            events.add("aborted");
+        }
+
+        @Override
+        public void sequenceStarted(ImageReader source, int minIndex) {
+        }
+
+        @Override
+        public void sequenceComplete(ImageReader source) {
+        }
+
+        @Override
+        public void thumbnailStarted(ImageReader source, int imageIndex, int thumbnailIndex) {
+        }
+
+        @Override
+        public void thumbnailProgress(ImageReader source, float percentageDone) {
+        }
+
+        @Override
+        public void thumbnailComplete(ImageReader source) {
+        }
+    }
+
+    @Test
+    void listenersSeeStartedAndComplete() throws Exception {
+        ImageReader reader = readerFor(rgb(64, 48));
+        Progress listener = new Progress();
+        reader.addIIOReadProgressListener(listener);
+        reader.read(0, null);
+        assertEquals("started 0", listener.events.get(0));
+        assertEquals("complete", listener.events.get(listener.events.size() - 1));
+    }
+
+    @Test
+    void abortFromAListenerEndsTheReadAsAborted() throws Exception {
+        ImageReader reader = readerFor(rgb(64, 48));
+        Progress listener = new Progress() {
+            @Override
+            public void imageStarted(ImageReader source, int imageIndex) {
+                source.abort();
+            }
+        };
+        reader.addIIOReadProgressListener(listener);
+        ImageReadParam param = reader.getDefaultReadParam();
+        param.setSourceSubsampling(2, 2, 0, 0); // takes the pixel-copy path
+        reader.read(0, param);
+        org.junit.jupiter.api.Assertions.assertTrue(listener.events.contains("aborted"),
+                "aborted reads report readAborted, got " + listener.events);
+        org.junit.jupiter.api.Assertions.assertFalse(listener.events.contains("complete"),
+                "an aborted read must not also report complete");
+    }
+
     @Test
     void mismatchedBandCountsAreRefused() throws Exception {
         ImageReader reader = readerFor(rgb(32, 24));
