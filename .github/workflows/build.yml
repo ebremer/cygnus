@@ -1,0 +1,85 @@
+name: build
+
+on:
+  push:
+    branches: [master, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: mvn verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Must match <maven.compiler.release> in pom.xml (25).
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      # The JPEG2000 conformance tests download the uclouvain/openjpeg-data
+      # corpus into test-data/ on first run (and skip when offline); the cache
+      # keeps every later run from re-downloading it.
+      - name: Cache JPEG2000 test corpora
+        uses: actions/cache@v4
+        with:
+          path: JPEG2000/test-data
+          key: jpeg2000-test-data-v1
+
+      # cjxl/djxl and an ffmpeg built with libjxl unlock the interop suites;
+      # every tool-gated test skips cleanly where they are missing (Windows).
+      - name: Install libjxl tools and ffmpeg
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libjxl-tools ffmpeg
+
+      - name: Cache JXL conformance corpus
+        if: runner.os == 'Linux'
+        id: jxl-corpus
+        uses: actions/cache@v4
+        with:
+          path: jxl-conformance
+          key: jxl-conformance-v1
+
+      # The corpus repo keeps its binaries in GCS; download_and_symlink.sh
+      # materializes them (gsutil is preinstalled on the runner). Failure here
+      # only costs coverage: OfficialConformanceTest skips without a corpus.
+      - name: Fetch JXL conformance corpus
+        if: runner.os == 'Linux' && steps.jxl-corpus.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/libjxl/conformance jxl-conformance
+          cd jxl-conformance
+          ./scripts/download_and_symlink.sh
+
+      - name: Point the suite at the corpus
+        if: runner.os == 'Linux'
+        run: echo "JXL_CONFORMANCE_DIR=$GITHUB_WORKSPACE/jxl-conformance/testcases" >> "$GITHUB_ENV"
+
+      - name: Build and test
+        run: mvn -B -ntp verify
+
+      - name: Upload surefire reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-${{ matrix.os }}
+          path: '**/target/surefire-reports'
+          if-no-files-found: warn
