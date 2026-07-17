@@ -50,7 +50,7 @@ jobs:
       # Destination is decided purely by the version in pom.xml: 0.1.0-SNAPSHOT
       # goes to /snapshots, 0.1.0 to /releases. See <distributionManagement>.
       - name: Deploy
-        run: mvn -B -ntp deploy
+        run: mvn -B -ntp -Prelease deploy
 
       - name: Upload surefire reports
         if: failure()
