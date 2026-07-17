@@ -171,6 +171,13 @@ public final class CodestreamParser {
             int ssiz = u8();
             signed[c] = (ssiz & 0x80) != 0;
             prec[c] = (ssiz & 0x7F) + 1;
+            // the integer pipeline carries at most 31 magnitude bit-planes,
+            // so the format's 38-bit extremes are rejected here, not wrapped
+            // somewhere deep in dequantisation
+            if (prec[c] > 31) {
+                throw new IIOException("Component " + c + " precision " + prec[c]
+                        + " exceeds the supported 31 bits");
+            }
             xr[c] = u8();
             yr[c] = u8();
             if (xr[c] < 1 || yr[c] < 1) {
