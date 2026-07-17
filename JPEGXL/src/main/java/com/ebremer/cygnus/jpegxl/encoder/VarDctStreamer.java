@@ -131,6 +131,11 @@ final class VarDctStreamer {
         this.groupColumns = VarDctEncoder.ceilDiv(width, VarDctEncoder.GROUP_DIM);
         this.numBands = VarDctEncoder.ceilDiv(height, VarDctEncoder.GROUP_DIM);
         this.numGroups = groupColumns * numBands;
+        if (numGroups == 1) {
+            throw new IllegalArgumentException("a one-group frame needs the single-entry"
+                    + " TOC the buffered path writes; this streamer always writes a"
+                    + " multi-section one");
+        }
         int lfDim = VarDctEncoder.GROUP_DIM * 8;
         this.lfColumns = VarDctEncoder.ceilDiv(width, lfDim);
         this.numLfGroups = lfColumns * VarDctEncoder.ceilDiv(height, lfDim);
