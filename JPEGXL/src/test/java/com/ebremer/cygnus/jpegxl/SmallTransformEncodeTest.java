@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.ebremer.cygnus.jpegxl.decoder.JxlDecoder;
 import com.ebremer.cygnus.jpegxl.decoder.JxlImage;
 import com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -12,6 +14,16 @@ import org.junit.jupiter.api.Test;
  * hard edge between two flat regions, a text stroke — where a plain DCT8 rings.
  */
 class SmallTransformEncodeTest {
+
+    @BeforeAll
+    static void enableStats() {
+        System.setProperty("jxl.enc.stats", "true");
+    }
+
+    @AfterAll
+    static void disableStats() {
+        System.clearProperty("jxl.enc.stats");
+    }
 
     /** Large flat regions with hard step edges off the 8-pixel grid: the edge blocks are piecewise-flat. */
     private static int[][] stepEdges(int w, int h) {

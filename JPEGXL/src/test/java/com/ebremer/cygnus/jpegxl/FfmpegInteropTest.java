@@ -37,6 +37,7 @@ class FfmpegInteropTest {
 
     @BeforeAll
     static void checkFfmpeg() {
+        System.setProperty("jxl.enc.stats", "true");
         try {
             Process p = new ProcessBuilder("ffmpeg", "-hide_banner", "-encoders")
                     .redirectErrorStream(true).start();
@@ -47,6 +48,11 @@ class FfmpegInteropTest {
             ffmpegAvailable = false;
         }
         assumeTrue(ffmpegAvailable, "ffmpeg with libjxl not available");
+    }
+
+    @org.junit.jupiter.api.AfterAll
+    static void disableStats() {
+        System.clearProperty("jxl.enc.stats");
     }
 
     static Stream<Arguments> formats() {

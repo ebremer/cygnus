@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.ebremer.cygnus.jpegxl.decoder.JxlDecoder;
 import com.ebremer.cygnus.jpegxl.decoder.JxlImage;
 import com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -23,6 +25,16 @@ import org.junit.jupiter.api.Test;
  * 64-scale to the coarser quantisers where it plainly pays.
  */
 class Dct64Test {
+
+    @BeforeAll
+    static void enableStats() {
+        System.setProperty("jxl.enc.stats", "true");
+    }
+
+    @AfterAll
+    static void disableStats() {
+        System.clearProperty("jxl.enc.stats");
+    }
 
     /** A big, smooth gradient — a very large low-frequency expanse the 64-scale suits. */
     private static int[][] smoothGradient(int w, int h) {

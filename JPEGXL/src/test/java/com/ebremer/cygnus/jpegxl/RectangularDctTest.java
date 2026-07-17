@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.ebremer.cygnus.jpegxl.decoder.JxlDecoder;
 import com.ebremer.cygnus.jpegxl.decoder.JxlImage;
 import com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -14,6 +16,16 @@ import org.junit.jupiter.api.Test;
  * DC on every 8x8 of the smooth run.
  */
 class RectangularDctTest {
+
+    @BeforeAll
+    static void enableStats() {
+        System.setProperty("jxl.enc.stats", "true");
+    }
+
+    @AfterAll
+    static void disableStats() {
+        System.clearProperty("jxl.enc.stats");
+    }
 
     /**
      * Strongly directional: the left half varies only down the image (bands that

@@ -725,19 +725,21 @@ public final class VarDctEncoder {
             postPassSmall();
         }
         chooseSharpness();
-        // count the rectangular blocks (any of the six types, 6..11) that survived
-        // into the final layout — a committed one can still be overwritten by a
-        // larger block; tests read this.
-        long rect = 0;
-        for (byte t : blockType) {
-            if (t >= 0) {
-                TYPE_HIST.incrementAndGet(t);
-                if (t >= DCT16_8.type && t <= DCT16_32.type) {
-                    rect++;
+        // count the committed block types for the tests that check which paths
+        // fire; -Djxl.enc.stats keeps the shared counters quiet otherwise, so
+        // concurrent production encodes never touch (or contend on) them
+        if (Boolean.getBoolean("jxl.enc.stats")) {
+            long rect = 0;
+            for (byte t : blockType) {
+                if (t >= 0) {
+                    TYPE_HIST.incrementAndGet(t);
+                    if (t >= DCT16_8.type && t <= DCT16_32.type) {
+                        rect++;
+                    }
                 }
             }
+            RECT_BLOCKS.addAndGet(rect);
         }
-        RECT_BLOCKS.addAndGet(rect);
     }
 
     private static final int[] Y_FIRST = {1, 0, 2};

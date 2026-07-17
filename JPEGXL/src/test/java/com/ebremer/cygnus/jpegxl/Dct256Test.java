@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import com.ebremer.cygnus.jpegxl.decoder.JxlDecoder;
 import com.ebremer.cygnus.jpegxl.encoder.VarDctEncoder;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -17,6 +19,16 @@ import org.junit.jupiter.api.Test;
  * them on for anyone wiring a better estimate.
  */
 class Dct256Test {
+
+    @BeforeAll
+    static void enableStats() {
+        System.setProperty("jxl.enc.stats", "true");
+    }
+
+    @AfterAll
+    static void disableStats() {
+        System.clearProperty("jxl.enc.stats");
+    }
 
     private static int[][] smoothGradient(int w, int h) {
         int[][] p = new int[3][w * h];
