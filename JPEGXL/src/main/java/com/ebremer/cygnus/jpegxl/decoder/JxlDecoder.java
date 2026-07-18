@@ -14,6 +14,7 @@ import com.ebremer.cygnus.jpegxl.features.PatchesDictionary;
 import com.ebremer.cygnus.jpegxl.features.Splines;
 import com.ebremer.cygnus.jpegxl.features.Upsampler;
 import com.ebremer.cygnus.jpegxl.io.Bits;
+import com.ebremer.cygnus.jpegxl.io.Bounds;
 import com.ebremer.cygnus.jpegxl.io.CodestreamSource;
 import com.ebremer.cygnus.jpegxl.io.RegionUnsupportedException;
 import com.ebremer.cygnus.jpegxl.modular.MaTree;
@@ -51,6 +52,7 @@ public final class JxlDecoder {
                 throw new IOException("not a JPEG XL codestream");
             }
             SizeHeader size = SizeHeader.read(in);
+            Bounds.checkImage(size.width, size.height);
             ImageMetadata meta = ImageMetadata.read(in);
             boolean transposed = meta.orientation > 4;
             return new Info(meta, size.width, size.height,
@@ -227,6 +229,9 @@ public final class JxlDecoder {
                 throw new IOException("not a JPEG XL codestream");
             }
             SizeHeader size = SizeHeader.read(in);
+            // the ceiling holds for bare codestreams too: a level is a
+            // container's promise, checked elsewhere; this is a resource bound
+            Bounds.checkImage(size.width, size.height);
             ImageMetadata meta = ImageMetadata.read(in);
             if (meta.colourEncoding.wantIcc) {
                 byte[] encoded = IccStream.readEncoded(in);
