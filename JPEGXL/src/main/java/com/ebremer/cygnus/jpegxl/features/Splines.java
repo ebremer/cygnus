@@ -99,14 +99,31 @@ public final class Splines {
 
     /** Renders every spline additively onto the XYB colour planes. */
     public void render(float[][] planes, int width, int height,
-            float baseCorrelationX, float baseCorrelationB) {
+            float baseCorrelationX, float baseCorrelationB) throws IOException {
         for (int i = 0; i < numSplines; i++) {
             renderOne(i, planes, width, height, baseCorrelationX, baseCorrelationB);
         }
     }
 
     private void renderOne(int id, float[][] planes, int width, int height,
-            float baseCorrelationX, float baseCorrelationB) {
+            float baseCorrelationX, float baseCorrelationB) throws IOException {
+        // Control points are cumulative sums of stream-controlled deltas and
+        // the arc loop below appends one entry per unit of polyline length,
+        // however far from the frame that polyline runs — so points are held
+        // to a frame margin, and the arc count and the drawn area to
+        // frame-derived budgets, before they become time and memory.
+        long margin = 2L * Math.max(width, height) + 1024;
+        for (int j = 0; j < controlX[id].length; j++) {
+            int px = controlX[id][j];
+            int py = controlY[id][j];
+            if (px < -margin || px > width + margin || py < -margin || py > height + margin) {
+                throw new IOException("spline control point (" + px + "," + py
+                        + ") outside the frame margin");
+            }
+        }
+        int arcCap = (int) Math.min(1 << 21, Math.max(4096, (long) width * height));
+        long drawBudget = 1024L * width * height + (1 << 20);
+        long drawn = 0;
         float quantAdj = quantAdjust / 8f;
         float invQa = quantAdj >= 0 ? 1f / (1f + quantAdj) : 1f - quantAdj;
         float[] cX = new float[32];
@@ -132,6 +149,9 @@ public final class Splines {
         int nextId = 0;
         arcs.add(new float[] {currentY, currentX, renderDistance});
         while (nextId < upY.length) {
+            if (arcs.size() > arcCap) {
+                throw new IOException("spline arc length exceeds the frame budget");
+            }
             float prevY = currentY;
             float prevX = currentX;
             float fromPrevious = 0f;
@@ -177,6 +197,10 @@ public final class Splines {
             int xEnd = Math.min(width - 1, Math.round(arc[1] + maxDist));
             int yBegin = Math.max(0, Math.round(arc[0] - maxDist));
             int yEnd = Math.min(height - 1, Math.round(arc[0] + maxDist));
+            drawn += Math.max(0, (long) xEnd - xBegin + 1) * Math.max(0, (long) yEnd - yBegin + 1);
+            if (drawn > drawBudget) {
+                throw new IOException("spline draw area exceeds the frame budget");
+            }
             for (int c = 0; c < 3; c++) {
                 float[] plane = planes[c];
                 for (int y = yBegin; y <= yEnd; y++) {

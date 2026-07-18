@@ -102,6 +102,65 @@ class HostileInputTest {
         assertTrue(e.getMessage().contains("spline"), e.getMessage());
     }
 
+    // ---- CRIT-3: spline rendering is bounded
+
+    private static com.ebremer.cygnus.jpegxl.features.Splines spline(int[] xs, int[] ys,
+            int sigmaCoeff, int yCoeff) {
+        var s = new com.ebremer.cygnus.jpegxl.features.Splines();
+        s.numSplines = 1;
+        s.quantAdjust = 0;
+        s.controlX = new int[][] {xs};
+        s.controlY = new int[][] {ys};
+        s.coeffX = new int[1][32];
+        s.coeffY = new int[1][32];
+        s.coeffB = new int[1][32];
+        s.coeffSigma = new int[1][32];
+        s.coeffY[0][0] = yCoeff;
+        s.coeffSigma[0][0] = sigmaCoeff;
+        return s;
+    }
+
+    @Test
+    void farOffFrameSplineControlPointsAreRejected() {
+        // (0,0) -> (2^29,0) would resample into half a billion arcs
+        var s = spline(new int[] {0, 1 << 29}, new int[] {0, 0}, 10, 50);
+        IOException e = assertThrows(IOException.class,
+                () -> s.render(new float[3][100 * 100], 100, 100, 0f, 1f));
+        assertTrue(e.getMessage().contains("margin"), e.getMessage());
+    }
+
+    @Test
+    void splineArcLengthIsBounded() {
+        // 200 in-margin points zigzagging across the frame: a polyline ~28k
+        // units long on a 100x100 frame, well past its arc budget
+        int[] xs = new int[200];
+        int[] ys = new int[200];
+        for (int i = 0; i < 200; i++) {
+            xs[i] = (i % 2) * 99;
+            ys[i] = (i % 2) * 99;
+        }
+        var s = spline(xs, ys, 10, 50);
+        IOException e = assertThrows(IOException.class,
+                () -> s.render(new float[3][100 * 100], 100, 100, 0f, 1f));
+        assertTrue(e.getMessage().contains("arc"), e.getMessage());
+    }
+
+    @Test
+    void hugeSigmaSplineDrawAreaIsBounded() {
+        // a modest path whose absurd sigma makes every arc cover the whole
+        // frame: the accumulated draw area must hit the frame budget
+        int[] xs = new int[40];
+        int[] ys = new int[40];
+        for (int i = 0; i < 40; i++) {
+            xs[i] = (i % 2) * 90 + 5;
+            ys[i] = i * 2;
+        }
+        var s = spline(xs, ys, 1 << 24, 1 << 20);
+        IOException e = assertThrows(IOException.class,
+                () -> s.render(new float[3][100 * 100], 100, 100, 0f, 1f));
+        assertTrue(e.getMessage().contains("draw area"), e.getMessage());
+    }
+
     // ---- CRIT-1: patch dictionary counts drive allocations
 
     @Test
