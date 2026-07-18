@@ -102,6 +102,24 @@ class HostileInputTest {
         assertTrue(e.getMessage().contains("spline"), e.getMessage());
     }
 
+    // ---- CRIT-4: LZ77 distances are unsigned
+
+    @Test
+    void lz77DistanceWithBit31DoesNotIndexTheSpecialTable() throws IOException {
+        // a copy whose distance value has bit 31 set: the signed compare used
+        // to fall through to SPECIAL_DISTANCES[negative]
+        byte[] s = HostileStreams.lz77CopyStream(5, 0x80000000);
+        Bits in = new Bits(s);
+        com.ebremer.cygnus.jpegxl.entropy.EntropyDecoder dec =
+                com.ebremer.cygnus.jpegxl.entropy.EntropyDecoder.read(in, 1, true);
+        assertEquals(5, dec.readSymbol(in, 0, 64));
+        org.junit.jupiter.api.Assertions.assertDoesNotThrow(() -> {
+            for (int i = 0; i < 3; i++) {
+                dec.readSymbol(in, 0, 64); // the copy: garbage values, no crash
+            }
+        });
+    }
+
     // ---- CRIT-3: spline rendering is bounded
 
     private static com.ebremer.cygnus.jpegxl.features.Splines spline(int[] xs, int[] ys,

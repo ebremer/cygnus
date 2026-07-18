@@ -206,15 +206,21 @@ public final class EntropyDecoder {
                         "[trace] ctx=%d cluster=%d token=%d LZ77 num=%d distToken=%d rawDist=%d distMult=%d numDecoded=%d%n",
                         ctx, cluster, token, num, distToken, distance, distMult, numDecoded);
             }
+            // the distance is a full 32-bit pattern: compare and clamp it as
+            // unsigned, or bit 31 indexes the special table negative / rides a
+            // signed min into a negative copy offset (libjxl is unsigned here)
             if (distMult == 0) {
                 distance++;
-            } else if (distance >= 120) {
+            } else if (Integer.compareUnsigned(distance, 120) >= 0) {
                 distance -= 119;
             } else {
                 int special = SPECIAL_DISTANCES[distance];
                 distance = Math.max(1, ((special >> 4) - 7) + distMult * (special & 7));
             }
-            distance = Math.min(Math.min(distance, numDecoded), WINDOW_SIZE);
+            if (Integer.compareUnsigned(distance, WINDOW_SIZE) > 0) {
+                distance = WINDOW_SIZE;
+            }
+            distance = Math.min(distance, numDecoded);
             if (window == null) {
                 window = new int[WINDOW_SIZE];
             }
