@@ -6,8 +6,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.ebremer.cygnus.jpegxl.codestream.SizeHeader;
 import com.ebremer.cygnus.jpegxl.decoder.JxlDecoder;
+import com.ebremer.cygnus.jpegxl.encoder.HostileStreams;
 import com.ebremer.cygnus.jpegxl.encoder.JxlEncoder;
+import com.ebremer.cygnus.jpegxl.features.PatchesDictionary;
 import com.ebremer.cygnus.jpegxl.io.BitWriter;
+import com.ebremer.cygnus.jpegxl.io.Bits;
 import com.ebremer.cygnus.jpegxl.io.Bounds;
 import java.io.IOException;
 import org.junit.jupiter.api.Test;
@@ -74,6 +77,45 @@ class HostileInputTest {
             System.clearProperty(Bounds.MAX_PIXELS_PROPERTY);
         }
         assertEquals(1200, JxlDecoder.decode(cs).width);
+    }
+
+    // ---- CRIT-1: patch dictionary counts drive allocations
+
+    @Test
+    void patchPositionCountWithBit31IsRejected() {
+        // one patch whose position count decodes to 1 + 0x7fffffff: the int
+        // wraps negative and used to reach new int[count][2]
+        byte[] s = HostileStreams.symbolStream(10,
+                new int[] {0, 1},                   // numPatches
+                new int[] {1, 0},                   // ref
+                new int[] {3, 0}, new int[] {3, 0}, // x0, y0
+                new int[] {2, 0}, new int[] {2, 0}, // width-1, height-1
+                new int[] {7, Integer.MAX_VALUE});  // positions - 1
+        assertThrows(IOException.class,
+                () -> PatchesDictionary.read(new Bits(s), 0, 0, 100 * 100));
+    }
+
+    @Test
+    void negativePatchCountIsRejected() {
+        // numPatches with bit 31 set: as a signed loop bound it used to skip
+        // the loop and return an empty dictionary as if the stream were fine
+        byte[] s = HostileStreams.symbolStream(10, new int[] {0, 0xfffffff5});
+        assertThrows(IOException.class,
+                () -> PatchesDictionary.read(new Bits(s), 0, 0, 100 * 100));
+    }
+
+    @Test
+    void patchPositionsBeyondTheFrameBudgetAreRejected() {
+        // a 100x100 frame cannot need 2^20 patch positions
+        byte[] s = HostileStreams.symbolStream(10,
+                new int[] {0, 1},
+                new int[] {1, 0},
+                new int[] {3, 0}, new int[] {3, 0},
+                new int[] {2, 0}, new int[] {2, 0},
+                new int[] {7, (1 << 20) - 1});
+        IOException e = assertThrows(IOException.class,
+                () -> PatchesDictionary.read(new Bits(s), 0, 0, 100 * 100));
+        assertTrue(e.getMessage().contains("patch"), e.getMessage());
     }
 
     @Test

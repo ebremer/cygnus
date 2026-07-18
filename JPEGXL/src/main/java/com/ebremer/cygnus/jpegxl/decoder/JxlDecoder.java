@@ -864,14 +864,18 @@ public final class JxlDecoder {
                 // may copy from anywhere in it
                 throw new RegionUnsupportedException("patch from a region-limited snapshot");
             }
-            if (patch.y0() + patch.height() > ref.height || patch.x0() + patch.width() > ref.width) {
+            // long sums: origins and sizes are stream-controlled and an int
+            // sum can wrap past these range checks
+            if ((long) patch.y0() + patch.height() > ref.height
+                    || (long) patch.x0() + patch.width() > ref.width) {
                 throw new IOException("patch does not fit its reference frame");
             }
             for (int j = 0; j < patch.positions().length; j++) {
                 int px = patch.positions()[j][0];
                 int py = patch.positions()[j][1];
                 if (px < 0 || py < 0
-                        || py + patch.height() > r.height || px + patch.width() > r.width) {
+                        || (long) py + patch.height() > r.height
+                        || (long) px + patch.width() > r.width) {
                     throw new IOException("patch position out of bounds");
                 }
                 for (int d = 0; d < r.planes.length; d++) {
@@ -1326,7 +1330,8 @@ public final class JxlDecoder {
                     numAlpha++;
                 }
             }
-            state.patches = PatchesDictionary.read(in, meta.numExtraChannels(), numAlpha);
+            state.patches = PatchesDictionary.read(in, meta.numExtraChannels(), numAlpha,
+                    (long) fh.width * fh.height);
         }
         if (fh.hasFlag(FrameHeader.FLAG_SPLINES)) {
             if (meta.colourChannelCount() < 3 && !meta.xybEncoded) {

@@ -24,7 +24,7 @@ class PatchDictWriterTest {
         w.zeroPadToByte();
         byte[] bytes = w.toByteArray();
 
-        PatchesDictionary dict = PatchesDictionary.read(new Bits(bytes), 0, 0);
+        PatchesDictionary dict = PatchesDictionary.read(new Bits(bytes), 0, 0, 256 * 256);
         assertEquals(2, dict.patches.size());
 
         PatchesDictionary.Patch a = dict.patches.get(0);

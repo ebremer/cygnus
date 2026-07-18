@@ -2,6 +2,7 @@ package com.ebremer.cygnus.jpegxl.features;
 
 import com.ebremer.cygnus.jpegxl.entropy.EntropyDecoder;
 import com.ebremer.cygnus.jpegxl.io.Bits;
+import com.ebremer.cygnus.jpegxl.io.Bounds;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -28,18 +29,41 @@ public final class PatchesDictionary {
 
     public final List<Patch> patches = new ArrayList<>();
 
-    public static PatchesDictionary read(Bits in, int numExtraChannels, int numAlphaChannels)
-            throws IOException {
+    public static PatchesDictionary read(Bits in, int numExtraChannels, int numAlphaChannels,
+            long framePixels) throws IOException {
         PatchesDictionary dict = new PatchesDictionary();
         EntropyDecoder stream = EntropyDecoder.read(in, 10, true);
-        int numPatches = stream.readSymbol(in, 0);
+        // Every count here is a hybrid-uint that can reach 2^31 from a few
+        // bytes, and each one sizes an allocation. A patch stamps at least one
+        // pixel per position, so the dictionary cannot meaningfully name more
+        // positions than the frame has pixels (1 << 24 is libjxl's absolute
+        // kMaxPatches); the blending table multiplies positions by the extra
+        // channels and gets its own ceiling.
+        long cap = Math.min(1 << 24, Math.max(1024, framePixels));
+        int numPatches = Bounds.count(stream.readSymbol(in, 0), cap, "patch");
+        long totalPositions = 0;
         for (int i = 0; i < numPatches; i++) {
             int ref = stream.readSymbol(in, 1);
+            if (ref < 0 || ref > 3) {
+                throw new IOException("patch reference frame out of range");
+            }
             int x0 = stream.readSymbol(in, 3);
             int y0 = stream.readSymbol(in, 3);
+            if ((x0 | y0) < 0) {
+                throw new IOException("negative patch origin");
+            }
             int width = 1 + stream.readSymbol(in, 2);
             int height = 1 + stream.readSymbol(in, 2);
-            int count = 1 + stream.readSymbol(in, 7);
+            if (width <= 0 || height <= 0) {
+                throw new IOException("bad patch size");
+            }
+            int count = 1 + Bounds.count(stream.readSymbol(in, 7), cap - 1, "patch position");
+            totalPositions += count;
+            if (totalPositions > cap
+                    || totalPositions * (numExtraChannels + 1L) > (1 << 24)) {
+                throw new IOException("too many patch positions (" + totalPositions
+                        + " for " + framePixels + " frame pixels)");
+            }
             int[][] positions = new int[count][2];
             Blending[][] blendings = new Blending[count][numExtraChannels + 1];
             for (int j = 0; j < count; j++) {
@@ -77,10 +101,10 @@ public final class PatchesDictionary {
         }
         stream.finish(in);
         if (Boolean.getBoolean("jxl.debug")) {
-            int totalPositions = 0;
+            int positionCount = 0;
             StringBuilder sb = new StringBuilder();
             for (PatchesDictionary.Patch p : dict.patches) {
-                totalPositions += p.positions.length;
+                positionCount += p.positions.length;
             }
             for (int k = 0; k <= numExtraChannels; k++) {
                 int[] modes = new int[8];
@@ -92,7 +116,7 @@ public final class PatchesDictionary {
                 sb.append(" ch").append(k).append('=').append(java.util.Arrays.toString(modes));
             }
             System.err.println("[jxl] patches: " + dict.patches.size() + " entries, "
-                    + totalPositions + " positions, per-channel modes:" + sb);
+                    + positionCount + " positions, per-channel modes:" + sb);
         }
         return dict;
     }
