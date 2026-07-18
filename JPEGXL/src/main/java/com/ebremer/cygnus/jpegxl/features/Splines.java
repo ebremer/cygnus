@@ -2,6 +2,7 @@ package com.ebremer.cygnus.jpegxl.features;
 
 import com.ebremer.cygnus.jpegxl.entropy.EntropyDecoder;
 import com.ebremer.cygnus.jpegxl.io.Bits;
+import com.ebremer.cygnus.jpegxl.io.Bounds;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -18,10 +19,16 @@ public final class Splines {
     public int[][] coeffB;
     public int[][] coeffSigma;
 
-    public static Splines read(Bits in) throws IOException {
+    public static Splines read(Bits in, long framePixels) throws IOException {
         Splines s = new Splines();
         EntropyDecoder stream = EntropyDecoder.read(in, 6, true);
-        s.numSplines = 1 + stream.readSymbol(in, 2);
+        // Both counts are hybrid-uints that can carry any 32-bit pattern and
+        // both size arrays before a pixel is drawn: each spline costs four
+        // int[32] coefficient rows up front, each control point four ints.
+        // Hold them to caps derived from the frame area (the control-point
+        // ceiling of 1 << 20 matches libjxl's kMaxNumControlPoints).
+        long splineCap = Math.min(1 << 18, Math.max(64, framePixels / 4));
+        s.numSplines = 1 + Bounds.count(stream.readSymbol(in, 2), splineCap - 1, "spline");
         int[] posX = new int[s.numSplines];
         int[] posY = new int[s.numSplines];
         for (int i = 0; i < s.numSplines; i++) {
@@ -41,8 +48,16 @@ public final class Splines {
         s.coeffY = new int[s.numSplines][32];
         s.coeffB = new int[s.numSplines][32];
         s.coeffSigma = new int[s.numSplines][32];
+        long pointCap = Math.min(1 << 20, Math.max(1024, framePixels));
+        long totalPoints = 0;
         for (int i = 0; i < s.numSplines; i++) {
-            int count = 1 + stream.readSymbol(in, 3);
+            int count = 1 + Bounds.count(stream.readSymbol(in, 3), pointCap - 1,
+                    "spline control point");
+            totalPoints += count;
+            if (totalPoints > pointCap) {
+                throw new IOException("too many spline control points (" + totalPoints
+                        + " for " + framePixels + " frame pixels)");
+            }
             s.controlY[i] = new int[count];
             s.controlX[i] = new int[count];
             s.controlY[i][0] = posY[i];

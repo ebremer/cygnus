@@ -40,7 +40,7 @@ class SplineWriterTest {
         BitWriter w = new BitWriter();
         SplineWriter.write(w, s);
         w.zeroPadToByte();
-        Splines back = Splines.read(new Bits(w.toByteArray()));
+        Splines back = Splines.read(new Bits(w.toByteArray()), 256 * 256);
 
         assertEquals(s.numSplines, back.numSplines);
         assertEquals(s.quantAdjust, back.quantAdjust);
@@ -71,7 +71,7 @@ class SplineWriterTest {
         BitWriter w = new BitWriter();
         SplineWriter.write(w, s);
         w.zeroPadToByte();
-        Splines back = Splines.read(new Bits(w.toByteArray()));
+        Splines back = Splines.read(new Bits(w.toByteArray()), 256 * 256);
         assertEquals(1, back.numSplines);
         assertArrayEquals(s.controlX[0], back.controlX[0]);
         assertArrayEquals(s.coeffSigma[0], back.coeffSigma[0]);

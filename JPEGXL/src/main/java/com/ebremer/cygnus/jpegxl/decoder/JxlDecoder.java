@@ -1337,7 +1337,7 @@ public final class JxlDecoder {
             if (meta.colourChannelCount() < 3 && !meta.xybEncoded) {
                 throw new IOException("splines require colour images");
             }
-            state.splines = Splines.read(in);
+            state.splines = Splines.read(in, (long) fh.width * fh.height);
         }
         if (fh.hasFlag(FrameHeader.FLAG_NOISE)) {
             if (meta.colourChannelCount() < 3 && !meta.xybEncoded) {

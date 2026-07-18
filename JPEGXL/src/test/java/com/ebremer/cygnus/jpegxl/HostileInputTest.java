@@ -79,6 +79,29 @@ class HostileInputTest {
         assertEquals(1200, JxlDecoder.decode(cs).width);
     }
 
+    // ---- CRIT-2: spline counts drive allocations
+
+    @Test
+    void splineCountWithBit31IsRejected() {
+        // numSplines decodes to 1 + 0x7fffffff, wrapping negative before it
+        // sizes six arrays (four of them int[numSplines][32])
+        byte[] s = HostileStreams.symbolStream(6, new int[] {2, Integer.MAX_VALUE});
+        assertThrows(IOException.class,
+                () -> com.ebremer.cygnus.jpegxl.features.Splines.read(new Bits(s), 100 * 100));
+    }
+
+    @Test
+    void splineControlPointCountIsBounded() {
+        byte[] s = HostileStreams.symbolStream(6,
+                new int[] {2, 0},                  // numSplines = 1
+                new int[] {1, 4}, new int[] {1, 4}, // start position
+                new int[] {0, 0},                  // quantAdjust
+                new int[] {3, Integer.MAX_VALUE}); // control points - 1
+        IOException e = assertThrows(IOException.class,
+                () -> com.ebremer.cygnus.jpegxl.features.Splines.read(new Bits(s), 100 * 100));
+        assertTrue(e.getMessage().contains("spline"), e.getMessage());
+    }
+
     // ---- CRIT-1: patch dictionary counts drive allocations
 
     @Test
