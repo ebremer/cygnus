@@ -106,6 +106,50 @@ public final class NiftiBuilder {
         return VoxelCodec.encode(samples, type, order, voxels);
     }
 
+    /**
+     * The value a coordinate-encoding volume holds at {@code coords}: one
+     * decimal digit per dimension, {@code i} in the units place. A voxel at
+     * (3, 1, 4) holds 413, so a read that came back off by a stride says so on
+     * sight rather than merely being unequal.
+     */
+    public static double coordinateValue(long... coords) {
+        double value = 0;
+        double place = 1;
+        for (long c : coords) {
+            value += c * place;
+            place *= 10;
+        }
+        return value;
+    }
+
+    /**
+     * A whole voxel array of {@link #coordinateValue}s, in NIfTI storage order
+     * — {@code i} fastest. Single-component types only; the point is one
+     * number per voxel.
+     */
+    public static byte[] coordinateVoxels(com.ebremer.cygnus.nifti.NiftiDataType type,
+                                          ByteOrder order, long... shape) throws IOException {
+        if (type.components != 1) {
+            throw new IllegalArgumentException(type + " has more than one component per voxel");
+        }
+        int voxels = 1;
+        for (long s : shape) {
+            voxels = Math.multiplyExact(voxels, Math.toIntExact(s));
+        }
+        Object samples = VoxelCodec.allocate(type, voxels);
+        long[] coords = new long[shape.length];
+        for (int n = 0; n < voxels; n++) {
+            VoxelCodec.fromDouble(samples, n, coordinateValue(coords), type);
+            for (int d = 0; d < shape.length; d++) {
+                if (++coords[d] < shape[d]) {
+                    break;
+                }
+                coords[d] = 0;
+            }
+        }
+        return VoxelCodec.encode(samples, type, order, voxels);
+    }
+
     /** {@code data} gzipped, as {@code .nii.gz} holds it. */
     public static byte[] gzip(byte[] data) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();

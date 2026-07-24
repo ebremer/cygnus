@@ -35,7 +35,52 @@ public final class Bounds {
     /** System property naming the ceiling on the voxels one read may ask for. */
     public static final String MAX_VOXELS_PROPERTY = "nifti.maxVoxels";
 
+    /** System property naming the ceiling on the bytes of extensions read into memory. */
+    public static final String MAX_EXTENSION_BYTES_PROPERTY = "nifti.maxExtensionBytes";
+
+    /** The default for {@value #MAX_EXTENSION_BYTES_PROPERTY}: 64 MiB. */
+    public static final long DEFAULT_MAX_EXTENSION_BYTES = 64L << 20;
+
     private Bounds() {
+    }
+
+    /**
+     * The ceiling on the extension region held in memory: the
+     * {@value #MAX_EXTENSION_BYTES_PROPERTY} system property, clamped to
+     * {@code [0, Integer.MAX_VALUE]}.
+     *
+     * <p>Unlike the voxel array, extensions are read whole and up front —
+     * a caller asking for a header expects its extensions with it. The
+     * region's size comes from {@code vox_offset}, which a file is free to
+     * put anywhere inside itself, so a 4 GB file may legitimately claim 4 GB
+     * of extensions. The largest anything real carries is a CIFTI XML
+     * document in the low megabytes.</p>
+     */
+    public static long maxExtensionBytes() {
+        Long v = Long.getLong(MAX_EXTENSION_BYTES_PROPERTY);
+        if (v == null) {
+            return DEFAULT_MAX_EXTENSION_BYTES;
+        }
+        return Math.clamp(v, 0, Integer.MAX_VALUE);
+    }
+
+    /**
+     * How many bytes of extension chain lie between the end of a header and
+     * {@code limit} — {@code vox_offset} in a single file, the file's length
+     * in a {@code .hdr} — checked against {@link #maxExtensionBytes}.
+     */
+    public static int extensionRegion(int headerSize, long limit) throws IOException {
+        if (limit <= headerSize) {
+            return 0;
+        }
+        long bytes = limit - headerSize;
+        long cap = maxExtensionBytes();
+        if (bytes > cap) {
+            throw new IOException("the header claims " + bytes
+                    + " bytes of extensions before the voxels, past the " + cap
+                    + "-byte ceiling (-D" + MAX_EXTENSION_BYTES_PROPERTY + " raises it)");
+        }
+        return (int) bytes;
     }
 
     /**
