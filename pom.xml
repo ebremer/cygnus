@@ -40,6 +40,7 @@
     <module>JPEGXL</module>
     <module>SVS</module>
     <module>NDPI</module>
+    <module>NIfTI</module>
   </modules>
 
   <properties>
